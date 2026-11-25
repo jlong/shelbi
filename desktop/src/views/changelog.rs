@@ -1018,7 +1018,7 @@ impl ChangelogView {
     }
 
     fn render_footer(&self, theme: &Theme) -> impl IntoElement {
-        let hints = "\u{2191}/\u{2193} scroll   space page   j/k or \u{2325}\u{2193}/\u{2325}\u{2191} next/previous entry   home/end top/bottom   \u{2318}F search   esc clear";
+        let hints = footer_hints();
         div()
             .flex()
             .flex_row()
@@ -1032,6 +1032,20 @@ impl ChangelogView {
             .text_color(theme.muted)
             .child(div().flex_1().truncate().child(hints))
     }
+}
+
+/// The footer's key hints, each chord as this platform writes it: ⌥↓ and
+/// ⌘F on macOS, Alt+Down and Ctrl+Shift+F on Linux.
+fn footer_hints() -> String {
+    let label = |spec: &str| {
+        crate::keys::chord_label(&shelbi_state::keymap::KeyChord::parse(spec).expect("a footer chord"))
+    };
+    format!(
+        "\u{2191}/\u{2193} scroll   space page   j/k or {}/{} next/previous entry   home/end top/bottom   {} search   esc clear",
+        label("alt-down"),
+        label("alt-up"),
+        crate::keys::app_label("super-f"),
+    )
 }
 
 /// A link kind's chip icon: the Issues view's stack for an issue, the
@@ -1203,6 +1217,17 @@ mod tests {
 
     fn nav(spec: &str) -> Option<Nav> {
         nav_for(&Keystroke::parse(&crate::keys::test_keys::app_spec(spec)).unwrap())
+    }
+
+    #[test]
+    fn the_footer_names_this_platforms_chords() {
+        let hints = footer_hints();
+        if crate::keys::MAC {
+            assert!(hints.contains("⌥↓/⌥↑") && hints.contains("⌘F search"), "{hints}");
+        } else {
+            assert!(hints.contains("Alt+Down/Alt+Up") && hints.contains("Ctrl+Shift+F search"), "{hints}");
+            assert!(!hints.contains('⌘') && !hints.contains('⌥'), "no Mac glyphs on Linux: {hints}");
+        }
     }
 
     #[test]

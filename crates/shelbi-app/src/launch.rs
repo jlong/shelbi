@@ -46,13 +46,17 @@ pub use remote::FakeRemote;
 /// The left panel's title.
 pub const WELCOME_TITLE: &str = "Welcome to Shelbi";
 /// The line under the title.
-pub const WELCOME_INTRO: &str =
-    "Open a project on this Mac or connect to Shelbi on another machine.";
+pub const WELCOME_INTRO: &str = if cfg!(target_os = "macos") {
+    "Open a project on this Mac or connect to Shelbi on another machine."
+} else {
+    "Open a project on this computer or connect to Shelbi on another machine."
+};
 /// The left panel's buttons.
 pub const ADD_PROJECT_LABEL: &str = "Add project";
 pub const CONNECT_REMOTE_LABEL: &str = "Connect to remote";
 /// The right panel's section headings.
-pub const PROJECTS_HEADING: &str = "Projects on this Mac";
+pub const PROJECTS_HEADING: &str =
+    if cfg!(target_os = "macos") { "Projects on this Mac" } else { "Projects on this computer" };
 pub const REMOTES_HEADING: &str = "Recent remote sessions";
 /// Each recent remote session's button.
 pub const RECONNECT_LABEL: &str = "Connect";

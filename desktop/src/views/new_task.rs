@@ -609,7 +609,8 @@ impl NewTaskDialog {
                             .min_w_0()
                             .type_style(Type::XSmall)
                             .text_color(theme.muted)
-                            .child(model::CREATE_HINT),
+                            // Linux submits with Ctrl+Enter (`keys::is_submit`).
+                            .child(if crate::keys::MAC { model::CREATE_HINT } else { model::CREATE_HINT_TERMINAL }),
                     )
                     .child(cancel)
                     .child(create),

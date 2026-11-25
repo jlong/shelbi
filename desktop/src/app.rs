@@ -182,6 +182,9 @@ const DEFAULT_WIDTH: f32 = 1200.0;
 const DEFAULT_HEIGHT: f32 = 800.0;
 /// Shown while the project's orchestrator comes up.
 const STARTUP_STATUS: &str = "Starting the orchestrator…";
+/// The client's quit as the Linux palette lists it, apart from the
+/// registry's Quit Shelbi, which ends every session.
+const CLIENT_QUIT_LABEL: &str = "Quit (agents keep running)";
 /// How far a new window sits off the one it was opened from.
 const CASCADE: f32 = 28.0;
 /// How wide the column edge's grab room is: the column's last five points
@@ -2039,7 +2042,11 @@ impl ShelbiWindow {
     /// `shelbi` in a terminal.
     fn open_terminal_view(&mut self, cx: &mut Context<Self>) {
         let Some(remote) = self.remote() else {
-            let line = format!("{} is on this Mac: run shelbi in a terminal for its terminal view.", self.model.project_label);
+            let line = format!(
+                "{} is on {}: run shelbi in a terminal for its terminal view.",
+                self.model.project_label,
+                shelbi_app::settings::workspaces::LOCAL_PHRASE,
+            );
             self.flash(line, cx);
             return;
         };
@@ -5508,16 +5515,15 @@ impl ShelbiWindow {
     /// this window's only one.
     fn move_targets(&self, window: &Window, cx: &App) -> Vec<tab_bar::MoveTarget> {
         let me = window.window_handle().window_id();
-        let mut targets: Vec<tab_bar::MoveTarget> = shelbi_windows(cx)
+        let (windows, titles): (Vec<_>, Vec<String>) = shelbi_windows(cx)
             .into_iter()
             .filter(|h| h.window_id() != me)
-            .filter_map(|h| {
-                let label = h.read(cx).ok()?.window_title();
-                Some(tab_bar::MoveTarget {
-                    window: Some(h.window_id()),
-                    label: label.into(),
-                })
-            })
+            .filter_map(|h| Some((h.window_id(), h.read(cx).ok()?.window_title())))
+            .unzip();
+        let mut targets: Vec<tab_bar::MoveTarget> = windows
+            .into_iter()
+            .zip(tab_bar::distinct_labels(titles))
+            .map(|(window, label)| tab_bar::MoveTarget { window: Some(window), label: label.into() })
             .collect();
         if self.tabs.projects().len() > 1 {
             targets.push(tab_bar::MoveTarget::new_window());
@@ -6275,7 +6281,13 @@ impl ShelbiWindow {
             .into_iter()
             .map(|e| shelbi_palette::Entry {
                 id: e.command.id().to_string(),
-                label: e.title,
+                // The menu's "Quit Shelbi" is the client's quit; beside the
+                // registry's Quit Shelbi (which stops everything) the palette
+                // names what it leaves running.
+                label: match e.command {
+                    menus::tree::AppCommand::QuitClient => CLIENT_QUIT_LABEL.to_string(),
+                    _ => e.title,
+                },
                 kind: shelbi_palette::EntryKind::Action,
                 subtitle: None,
                 shortcut: e.shortcut,

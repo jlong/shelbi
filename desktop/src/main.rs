@@ -272,6 +272,11 @@ fn main() {
             // The name notifications go out under (mako's `app-name`) on
             // Linux; the bundle's on macOS.
             platform::os::set_identity(cx);
+            // Linux has no native alert: the window's confirmations (Close
+            // Project, Quit Shelbi) are the app's own dialog, not gpui's
+            // unstyled fallback.
+            #[cfg(not(target_os = "macos"))]
+            cx.set_prompt_builder(views::prompt::build);
             theme::init(cx);
             // `desktop.app_icon` in the Dock from the start.
             app_icon::init(cx);

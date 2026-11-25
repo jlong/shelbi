@@ -1,6 +1,7 @@
 # Shelbi desktop
 
-The native macOS client for Shelbi, built with [gpui](https://www.gpui.rs/).
+The native desktop client for Shelbi, on macOS and on Linux (Omarchy and
+other Wayland desktops), built with [gpui](https://www.gpui.rs/).
 It is a sibling of the TUI (`crates/shelbi-tui`) at feature parity: both
 render over `shelbi-app` (navigation, the command registry, view models,
 background refresh) and talk to the same daemon and sessions. The plan is
@@ -28,6 +29,23 @@ menus and system notifications. `scripts/bundle.sh` packages it as a signed,
 notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask; on
 Linux it ships as the `shelbi-desktop-bin` AUR package. Each
 piece's story is in its status doc (`docs/README.md` lists them).
+
+## Install
+
+- **macOS:** `brew install --cask shelbi-desktop` (it pulls in the `shelbi`
+  formula), or the release's `Shelbi-<version>-arm64.zip`.
+- **Linux (Arch, Omarchy), x86_64:** `yay -S shelbi-desktop-bin`. It depends
+  on `shelbi-bin` of the same version, so the CLI comes with it. Shelbi then
+  shows up in Walker and the Omarchy menu. Upgrade both with
+  `yay -Syu shelbi-desktop-bin shelbi-bin`. `packaging/aur/README.md` at the
+  repository root has the packages and how to build them by hand.
+
+On Linux the app finds the CLI on the login shell's `PATH` first, so a
+`shelbi` earlier on it (`~/bin`, `~/.cargo/bin`) wins over the package's
+`/usr/bin/shelbi`. Settings ▸ General shows the one in use; set
+`desktop.cli_path` in `~/.shelbi/config.yaml` to pin another.
+
+## The CLI on macOS
 
 The app is a client of the `shelbi` CLI. The cask depends on the formula,
 so a Homebrew install has it. Without it (the app's zip on its own, a
@@ -191,6 +209,14 @@ from the Mac sits behind `src/platform/os/` (`linux.rs`):
 - On Omarchy, with `theme: auto`, the colors come from the active Omarchy
   theme and the terminal font from Omarchy's monospace font, both followed
   live (`src/theme/omarchy.rs`; `docs/theme.md` has the mapping).
+- Confirmations (Close Project, Close All Other Projects, Quit Shelbi) are
+  the app's own dialog (`src/views/prompt.rs`), since Linux has no native
+  alert: Return takes the first button, Esc Cancel.
+- The tab bar starts at the window's edge (no traffic lights to make room
+  for), and the copy says "this computer" where the Mac says "this Mac".
+- Settings ▸ Terminal's font picker lists the installed monospaced families
+  from fontconfig (`fc-list`). It has no Option key setting: Alt is always
+  Meta.
 
 #### Keys, clipboard and drops on Linux
 
@@ -651,7 +677,9 @@ CLI too, and the app appears in Walker and the Omarchy menu.
 Once a day, off the UI thread, the app asks the GitHub releases API for the
 latest Shelbi release (`src/platform/update.rs`). When it is newer than the
 app, every project window shows a bar with the command that upgrades it,
-`brew upgrade --cask shelbi-desktop`; otherwise it shows nothing. There is no
+`brew upgrade --cask shelbi-desktop` on macOS and
+`yay -Syu shelbi-desktop-bin shelbi-bin` on Linux; otherwise it shows
+nothing. There is no
 in-app updater. The last answer is cached in `~/.shelbi/desktop-update-check.json`,
 so a relaunch inside the day shows the same notice without asking again.
 
@@ -710,4 +738,6 @@ CI: `.github/workflows/desktop-ci.yml` runs the three desktop commands on a
 - **Verification:** the commands run and their results, plus anything checked
   by hand in the running app.
 
-The umbrella's own record is `docs/status/desktop-app.md`.
+The umbrella's own record is `docs/status/desktop-app.md`; the Linux port's
+is `docs/status/desktop-linux.md`, and its parity walk on Omarchy is
+`docs/status/dl-parity.md`.

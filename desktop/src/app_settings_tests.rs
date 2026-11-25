@@ -172,8 +172,9 @@ fn each_page_shows_its_controls(cx: &mut TestAppContext) {
     assert!(
         s.drawn("settings-font-size")
             && s.drawn("settings-font-size-up")
-            && s.drawn("settings-option-Meta")
     );
+    // The Option key setting is macOS's: Linux's Alt is always Meta.
+    assert_eq!(s.drawn("settings-option-Meta"), crate::keys::MAC);
     assert!(!s.drawn("settings-open-keys") && !s.drawn("settings-theme-Auto"));
 
     s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
@@ -680,10 +681,10 @@ fn the_terminal_page_edits_colors_live_saves_them_and_resets(cx: &mut TestAppCon
         "settings-ansi-white-bold",
         "settings-ansi-reset",
         "settings-terminal-preview",
-        "settings-option-Meta",
     ] {
         assert!(s.drawn(selector), "{selector}");
     }
+    assert_eq!(s.drawn("settings-option-Meta"), crate::keys::MAC, "the Option key setting is macOS's");
     let default_red = s.read(|_, cx| cx.global::<crate::theme::Theme>().terminal.ansi[1]);
     let text = |s: &mut Settings, slot| s.read(|_, cx| view.read(cx).color_text(slot, cx));
     assert_eq!(text(&mut s, 1), crate::elements::terminal::colors::hex(default_red));

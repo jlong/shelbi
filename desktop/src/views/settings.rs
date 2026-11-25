@@ -127,6 +127,31 @@ use crate::theme::window::{self as translucency, Translucency, WindowLook, BLUR_
 use crate::theme::contrast::{self, CONTRAST_RANGE};
 use crate::theme::{rgb_hsla, Theme};
 
+/// General's App icon help: where the picked icon shows. macOS draws it in
+/// the Dock; Linux saves it into the user's icon theme, ahead of the
+/// package's own (`platform::dock_icon`).
+const APP_ICON_HELP: &str = if crate::keys::MAC {
+    "Shown in the Dock while Shelbi runs and in About. Finder, and the Dock before launch, show the app's \
+     own icon, Command Grille."
+} else {
+    "Shown in the app launcher, the window switcher and About, from your icon theme \
+     (~/.local/share/icons). Command Grille is the package's own."
+};
+
+/// General's Notifications help.
+const NOTIFICATIONS_HELP: &str = if crate::keys::MAC {
+    "Not shown for what’s already on screen in the front window. macOS asks for permission the first time."
+} else {
+    "Not shown for what’s already on screen in the front window. Sent to your notification daemon \
+     (mako on Omarchy)."
+};
+
+/// Terminal's Show scrollbar help: what Automatic follows.
+const SCROLLBAR_HELP: &str = if crate::keys::MAC {
+    "Automatic follows Show scroll bars in System Settings ▸ Appearance."
+} else {
+    "Automatic follows the desktop’s overlay scroll bars setting."
+};
 
 /// The terminal font size a fresh install uses, in whole points.
 const DEFAULT_SIZE: u16 = DEFAULT_FONT_SIZE as u16;
@@ -1912,11 +1937,7 @@ impl Render for SettingsView {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.set_app_icon(icon, cx)))
                     })),
-                    Some(
-                        "Shown in the Dock while Shelbi runs and in About. Finder, and the Dock before \
-                         launch, show the app's own icon, Command Grille."
-                            .into(),
-                    ),
+                    Some(APP_ICON_HELP.into()),
                     &theme,
                 ))
                 .child(controls::labeled_control(
@@ -1941,11 +1962,7 @@ impl Render for SettingsView {
                             Switch::OrchestratorWaiting,
                             cx,
                         )),
-                    Some(
-                        "Not shown for what’s already on screen in the front window. \
-                         macOS asks for permission the first time."
-                            .into(),
-                    ),
+                    Some(NOTIFICATIONS_HELP.into()),
                     &theme,
                 )),
             // The Keybindings frame (2252:28172): its own view, the list
@@ -1982,7 +1999,9 @@ impl Render for SettingsView {
                             .child(controls::labeled_control("Terminal font", self.font_family.clone(), None, &theme))
                             .child(controls::labeled_control("Terminal font size", stepper, None, &theme))
                             .child(self.render_ansi(&theme, window, cx))
-                            .child(
+                            // Linux has no Option key setting: Alt is always Meta
+                            // in a terminal (`option_as_meta` is macOS's).
+                            .when(crate::keys::MAC, |column| column.child(
                                 controls::labeled_control(
                                     "Option key in terminals",
                                     controls::segmented_track(&theme)
@@ -2016,7 +2035,7 @@ impl Render for SettingsView {
                                             &theme,
                                         )),
                                 ),
-                            )
+                            ))
                             .child(controls::labeled_control(
                                 "Show scrollbar",
                                 controls::segmented_track(&theme)
@@ -2025,10 +2044,7 @@ impl Render for SettingsView {
                                     .child(scrollbar_chip(TerminalScrollbar::Auto, cx))
                                     .child(scrollbar_chip(TerminalScrollbar::Scrolling, cx))
                                     .child(scrollbar_chip(TerminalScrollbar::Always, cx)),
-                                Some(
-                                    "Automatic follows Show scroll bars in System Settings ▸ Appearance."
-                                        .into(),
-                                ),
+                                Some(SCROLLBAR_HELP.into()),
                                 &theme,
                             )),
                     )

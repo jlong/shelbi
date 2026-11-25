@@ -197,15 +197,17 @@ tear-off, HiDPI scaling, and `cargo test` on Linux.
 
 Seen while running it; none of these block the build:
 
-- **Mac-specific copy and shortcuts.** "Projects on this Mac" on the launch
-  window, and `⌘` in the sidebar's shortcut hints.
-- **The traffic-light gap.** The tab bar leaves room on the left for macOS's
-  window buttons (`sidebar::traffic_light_position`); on Hyprland there are
-  none, so the gap is empty.
+- ~~**Mac-specific copy and shortcuts.**~~ Done: the hints in `dl-input`,
+  the copy ("this computer", the file manager, the Settings help lines) and
+  the last `⌘`/`⌥` hints in `dl-parity`.
+- ~~**The traffic-light gap.**~~ Done in `dl-parity`:
+  `sidebar::TRAFFIC_LIGHTS_RIGHT` is 0 off macOS, so the tabs and the
+  collapsed sidebar's toggle start at the window's edge.
 - ~~**No blur.**~~ Done in `dl-windowing` (below): Hyprland blurs.
 - **Fonts.** The bundled faces load through gpui (`assets::load_fonts`), but
-  the CoreText fallback registration and the installed-font list
-  (`terminal::fonts::installed`) are macOS-only, so the font picker shows only
+  the CoreText fallback registration is macOS-only. (The installed-font list,
+  `terminal::fonts::installed`, reads fontconfig on Linux since `dl-parity`,
+  so the picker lists Omarchy's font.) Before that the font picker showed only
   the bundled faces, and glyph fallback (Nerd symbols behind a configured
   family) is untested. gpui-kit logs that its default monospace face
   (`DejaVu Sans Mono`) isn't installed and uses `Noto Sans Mono`; the UI font
@@ -639,3 +641,18 @@ a shared hub at load average 50–90, so not comparable to the quiet-machine
 row above. Clean `gpui-pre` + `gpui-kit`: debug 618 s / 92 MB, release
 1307 s / 13.7 MB, warm debug rebuild after touching `element.rs` 18 s. The
 Zed-git comparison is in "The channel evaluation" above.
+
+#### Found in the parity walk (`dl-parity`, 2026-11-24)
+
+- **No native alert.** `window.prompt` falls back to gpui's own renderer on
+  Linux (`fallback_prompt_renderer`): a white box with unstyled text that
+  clips a long detail. `main` installs `views::prompt::build` with
+  `App::set_prompt_builder` off macOS, so the confirmations are the app's
+  dialog. The Mac keeps its `NSAlert` sheet.
+- **`visual-check` is macOS-only.** gpui-pre 0.3.9 exports
+  `VisualTestAppContext` only on macOS, so `--visual-check`, the Figma QA,
+  `--visual-figma-fixtures` and the `--bench-*` modes don't build on Linux
+  (filed: `desktop-the-visual-check-feature-doesn-t-build-on-linux`).
+- **Keysyms with Shift.** Hyprland and `wtype` deliver Ctrl+Shift+1 as the
+  keysym `exclam`, Ctrl+Shift+, as `less`; gpui maps them back, so the
+  Ctrl+Shift chords work from a real keyboard.

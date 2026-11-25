@@ -287,6 +287,21 @@ pub struct MoveTarget {
     pub label: SharedString,
 }
 
+/// Window titles as Move to Window's rows: a title another window already
+/// has gets its ordinal (`pa`, `pa (2)`), so two windows on one project
+/// (File ▸ New Window) are two different rows.
+pub fn distinct_labels(titles: Vec<String>) -> Vec<String> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    titles
+        .into_iter()
+        .map(|title| {
+            let n = seen.entry(title.clone()).or_insert(0);
+            *n += 1;
+            if *n == 1 { title } else { format!("{title} ({n})") }
+        })
+        .collect()
+}
+
 impl MoveTarget {
     /// The submenu's last row.
     pub fn new_window() -> MoveTarget {
@@ -1220,8 +1235,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn move_to_window_numbers_a_repeated_title() {
+        let titles = ["pa", "pb", "pa", "pa"].map(String::from).to_vec();
+        assert_eq!(distinct_labels(titles), ["pa", "pb", "pa (2)", "pa (3)"]);
+    }
+
+    #[test]
     fn the_tabs_keep_figmas_gap_past_the_lights() {
-        assert_eq!(LEAD_X, 96.0, "the real lights end at 79, Figma's 17pt past them");
+        if crate::keys::MAC {
+            assert_eq!(LEAD_X, 96.0, "the real lights end at 79, Figma's 17pt past them");
+        } else {
+            assert_eq!(LEAD_X, 17.0, "no lights on Linux: Figma's 17pt from the edge");
+        }
     }
 
     #[test]
