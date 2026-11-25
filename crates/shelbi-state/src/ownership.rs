@@ -235,7 +235,7 @@ impl fmt::Display for NotOwned {
                         f,
                         ". This is the project's agent rule \"Only work on issues assigned to me\" \
                          (`issue_tracker.agent_rules.assigned_only`); turn it off in Settings ▸ \
-                         Properties ▸ Issue tracker to let Shelbi start unassigned issues"
+                         Issues to let Shelbi start unassigned issues"
                     )?;
                 }
                 Ok(())
@@ -528,7 +528,7 @@ mod tests {
         refusal.assigned_only_rule = true;
         let text = refusal.to_string();
         assert!(text.contains("\"Only work on issues assigned to me\""), "{text}");
-        assert!(text.contains("Settings ▸ Properties ▸ Issue tracker"), "{text}");
+        assert!(text.contains("Settings ▸ Issues to let"), "{text}");
         assert!(text.contains("--take"), "the override still shows: {text}");
     }
 }

@@ -169,14 +169,16 @@ enum SettingsMsg {
     PropertiesLoaded(Ticket, Box<Result<WorkflowConfig, String>>),
     /// The Properties page's save: the config as now on disk.
     PropertiesSaved(Ticket, Box<Result<WorkflowConfig, String>>),
-    /// A piece of the Issue tracker section's work, for a project.
-    Tracker(String, Box<settings::properties::TrackerDone>),
+    /// The Issues page's read of its project's config.
+    IssuesLoaded(Ticket, Box<Result<WorkflowConfig, String>>),
+    /// A piece of the Issues page's work, for a project.
+    Tracker(String, Box<settings::issues::TrackerDone>),
     /// Workflows' Sync now, for a project.
     StatusesSynced(String, shelbi_app::tracker_connect::StatusSync),
 }
 
-/// The tracker service for a project (Settings ▸ Properties' Issue tracker,
-/// Workflows' Sync now): this machine's in production, a test's fake.
+/// The tracker service for a project (Settings ▸ Issues, Workflows' Sync
+/// now): this machine's in production, a test's fake.
 pub(crate) type TrackerServiceFor =
     Arc<dyn Fn(&str) -> shelbi_app::settings::tracker::TrackerService + Send + Sync>;
 
@@ -1601,7 +1603,7 @@ struct ShellState {
     /// Reads Settings ▸ Workflows' config (disk in production; in tests a
     /// refusal unless a test points it at its own `SHELBI_HOME`).
     workflows_reader: WorkflowsReader,
-    /// The Issue tracker section's and Sync now's service.
+    /// The Issues page's and Sync now's service.
     tracker_service: TrackerServiceFor,
     /// Detects General's installed tools (disk in production; a fixture in
     /// tests).
@@ -3453,6 +3455,17 @@ impl ShellState {
                         let _ = tx.send(SettingsMsg::ToolsDetected(tools(force)));
                     })
             }
+            settings::Load::Issues(sent, project) => {
+                // The project's `issue_tracker:`, as the workflow config
+                // carries it.
+                let reader = self.workflows_reader.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-shell-settings-issues".into())
+                    .spawn(move || {
+                        let config = reader(&project);
+                        let _ = tx.send(SettingsMsg::IssuesLoaded(sent, Box::new(config)));
+                    })
+            }
         };
         if let Err(e) = spawned {
             let why = format!("couldn't start the read: {e}");
@@ -3478,6 +3491,10 @@ impl ShellState {
                 }
                 settings::Load::Properties(ticket, _) => {
                     let action = self.settings.properties_loaded(&ticket, Err(why));
+                    self.apply_settings_action(action);
+                }
+                settings::Load::Issues(ticket, _) => {
+                    let action = self.settings.issues_loaded(&ticket, Err(why));
                     self.apply_settings_action(action);
                 }
             }
@@ -3752,7 +3769,7 @@ impl ShellState {
         }
     }
 
-    /// Start the Issue tracker section's waiting work (Linear reads, a
+    /// Start the Issues page's waiting work (Linear reads, a
     /// connection) off the UI thread, one thread each. Each result comes
     /// back under its project, so one for a project no longer shown is
     /// dropped.
@@ -3942,6 +3959,10 @@ impl ShellState {
                 }
                 SettingsMsg::PropertiesLoaded(ticket, config) => {
                     let action = self.settings.properties_loaded(&ticket, *config);
+                    self.apply_settings_action(action);
+                }
+                SettingsMsg::IssuesLoaded(ticket, config) => {
+                    let action = self.settings.issues_loaded(&ticket, *config);
                     self.apply_settings_action(action);
                 }
                 SettingsMsg::Tracker(project, done) => {
@@ -4716,9 +4737,9 @@ impl ShellState {
             Effect::Mutate(m @ Mutation::AddIssue { .. }) => self.spawn_mutation(m, "added", "add failed"),
             // New task, over whatever is showing, on the board's workflows.
             Effect::NewIssue { project } => self.open_new_task(&project),
-            // The desktop's guided flow is a dialog; here the Issue tracker
-            // section on Settings ▸ Properties connects GitHub or Linear.
-            Effect::ConnectTracker { .. } => self.open_settings_at(Some(SettingsPage::Properties)),
+            // The desktop's guided flow is a dialog; here Settings ▸ Issues
+            // connects GitHub or Linear.
+            Effect::ConnectTracker { .. } => self.open_settings_at(Some(SettingsPage::Issues)),
             Effect::Mutate(m @ Mutation::PrioritizeIssue { .. }) => {
                 self.spawn_mutation(m, "reordered", "reorder failed")
             }
@@ -11810,18 +11831,18 @@ mod tests {
     }
 
     #[test]
-    fn connect_tracker_opens_settings_on_the_properties_page() {
+    fn connect_tracker_opens_settings_on_the_issues_page() {
         let mut st = settings_state();
         st.dispatch_effect(Effect::ConnectTracker { project: "app".into() });
         assert!(st.settings_open());
-        assert_eq!(st.settings.page(), SettingsPage::Properties, "the Issue tracker section's page");
+        assert_eq!(st.settings.page(), SettingsPage::Issues, "the tracker's page");
         assert_eq!(st.settings.region(), settings::Region::Page, "the keys go to the page");
         // Already open on another page, it moves there.
         let mut st = settings_state();
         st.dispatch_effect(Effect::OpenSettings);
         assert_eq!(st.settings.page(), SettingsPage::General);
         st.dispatch_effect(Effect::ConnectTracker { project: "app".into() });
-        assert_eq!(st.settings.page(), SettingsPage::Properties);
+        assert_eq!(st.settings.page(), SettingsPage::Issues);
     }
 
     #[test]
@@ -13014,11 +13035,13 @@ mod tests {
             "Default workflow",
             "task",
             "▸ Advanced",
-            "Issue tracker",
-            "(•) Local board",
         ] {
             assert!(text.contains(want), "{want:?} on the page:\n{text}");
         }
+        assert!(
+            !text.contains("Where this project's issues live") && !text.contains("(•) Local board"),
+            "the issue tracker has its own page:\n{text}"
+        );
         assert!(!text.contains("Default ($EDITOR or vim)") && !text.contains("editor:"), "no Editor field:\n{text}");
 
         // Into the page; Enter types in Name, Enter saves it.
@@ -13066,7 +13089,7 @@ mod tests {
         drop(home);
     }
 
-    // --- Settings ▸ Properties ▸ Issue tracker (linear-settings-ui) ----------
+    // --- Settings ▸ Issues (linear-settings-ui, settings-issues-page) ----------
 
     /// A tracker service over canned Linear answers that records each
     /// connection and refuses the first (the board has issues).
@@ -13109,10 +13132,10 @@ mod tests {
         })
     }
 
-    /// Move the Properties page's cursor onto `item`.
-    fn cursor_to(st: &mut ShellState, item: settings::properties::Item) {
+    /// Move the Issues page's cursor onto `item`.
+    fn cursor_to(st: &mut ShellState, item: settings::issues::Item) {
         for _ in 0..40 {
-            let p = st.settings.properties();
+            let p = st.settings.issues();
             let at = p.items().iter().position(|i| *i == item).unwrap_or_else(|| panic!("{item:?} isn't a stop"));
             match at.cmp(&p.cursor()) {
                 std::cmp::Ordering::Equal => return,
@@ -13137,7 +13160,7 @@ mod tests {
 
     #[test]
     fn the_issue_tracker_section_connects_linear_from_the_keys_and_forces_a_refused_switch() {
-        use settings::properties::{Item, TrackerItem};
+        use settings::issues::Item;
         use shelbi_app::linear_setup::Filter;
         use shelbi_app::new_project::Tracker;
         let home = agents_home("tracker");
@@ -13146,33 +13169,34 @@ mod tests {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         st.tracker_service = recording_tracker(asked.clone());
         st.dispatch_effect(Effect::OpenSettings);
-        type_key(&mut st, '4');
-        settle_agents(&mut st, "the config loads", |st| st.settings.properties().tracker().loaded());
+        type_key(&mut st, '7');
+        settle_agents(&mut st, "the config loads", |st| st.settings.issues().tracker().loaded());
         press(&mut st, KeyCode::Tab);
 
         // →→ on the boards: GitHub, then Linear (the cursor follows).
-        cursor_to(&mut st, Item::Tracker(TrackerItem::Choice(Tracker::FileSystem)));
+        cursor_to(&mut st, Item::Choice(Tracker::FileSystem));
         press(&mut st, KeyCode::Right);
         press(&mut st, KeyCode::Right);
-        assert_eq!(st.settings.properties().tracker().tracker(), Tracker::Linear);
+        assert_eq!(st.settings.issues().tracker().tracker(), Tracker::Linear);
         settle_agents(&mut st, "the teams and the account load", |st| {
-            st.settings.properties().tracker().linear().account().is_some()
+            st.settings.issues().tracker().linear().account().is_some()
         });
 
         // The team with →, then Assignee → Me.
-        cursor_to(&mut st, Item::Tracker(TrackerItem::Team));
+        cursor_to(&mut st, Item::Team);
         press(&mut st, KeyCode::Right);
-        assert_eq!(st.settings.properties().tracker().linear().team(), "ENG");
+        assert_eq!(st.settings.issues().tracker().linear().team(), "ENG");
         settle_agents(&mut st, "the team's lists load", |st| {
-            st.settings.properties().items().contains(&Item::Tracker(TrackerItem::Filter(Filter::Assignee)))
-                && st.settings.properties().tracker().linear().filter_options(Filter::Assignee).loaded().is_some()
+            st.settings.issues().items().contains(&Item::Filter(Filter::Assignee))
+                && st.settings.issues().tracker().linear().filter_options(Filter::Assignee).loaded().is_some()
         });
-        cursor_to(&mut st, Item::Tracker(TrackerItem::Filter(Filter::Assignee)));
+        cursor_to(&mut st, Item::Filter(Filter::Assignee));
         press(&mut st, KeyCode::Right);
-        assert_eq!(st.settings.properties().tracker().linear().filter(Filter::Assignee), Some("me"));
+        assert_eq!(st.settings.issues().tracker().linear().filter(Filter::Assignee), Some("me"));
         let text = capture_screen(&mut st, "settings-tracker-linear");
         for want in [
-            "Issue tracker",
+            "Issues",
+            "Where this project's issues live",
             "(•) Linear",
             "Linear account  Ada Lovelace <ada@example.com>",
             "Change key…",
@@ -13187,24 +13211,24 @@ mod tests {
             assert!(text.contains(want), "{want:?} on the page:\n{text}");
         }
         // The rules toggle with Enter and ride with the connection.
-        cursor_to(&mut st, Item::Tracker(TrackerItem::RequireReview));
+        cursor_to(&mut st, Item::RequireReview);
         press(&mut st, KeyCode::Enter);
-        cursor_to(&mut st, Item::Tracker(TrackerItem::AssignedOnly));
+        cursor_to(&mut st, Item::AssignedOnly);
         press(&mut st, KeyCode::Enter);
         let text = capture_screen(&mut st, "settings-tracker-rules");
         assert!(text.contains("[x] Always require human review"), "{text}");
         assert!(text.contains("[ ] Only work on issues assigned to me"), "{text}");
 
         // Connect: refused, with the migrate hint and Switch anyway.
-        cursor_to(&mut st, Item::Tracker(TrackerItem::Primary));
+        cursor_to(&mut st, Item::Primary);
         press(&mut st, KeyCode::Enter);
-        settle_agents(&mut st, "the connection is refused", |st| st.settings.properties().tracker().offers_force());
+        settle_agents(&mut st, "the connection is refused", |st| st.settings.issues().tracker().offers_force());
         let text = capture_screen(&mut st, "settings-tracker-refused");
         assert!(text.contains("migrate --to linear") && text.contains("[ Switch anyway ]"), "{text}");
-        cursor_to(&mut st, Item::Tracker(TrackerItem::Force));
+        cursor_to(&mut st, Item::Force);
         press(&mut st, KeyCode::Enter);
         settle_agents(&mut st, "the forced connection lands", |st| {
-            st.settings.properties().tracker().last_connected().is_some()
+            st.settings.issues().tracker().last_connected().is_some()
         });
         let asked = asked.lock().unwrap().clone();
         assert_eq!(asked.len(), 2);
@@ -13220,7 +13244,7 @@ mod tests {
 
     #[test]
     fn the_tracker_sections_rules_name_the_github_account_and_hide_for_the_local_board() {
-        use settings::properties::{Item, TrackerItem};
+        use settings::issues::Item;
         use shelbi_app::new_project::Tracker;
         let home = agents_home("tracker-rules");
         let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
@@ -13228,15 +13252,15 @@ mod tests {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         st.tracker_service = recording_tracker(asked);
         st.dispatch_effect(Effect::OpenSettings);
-        type_key(&mut st, '4');
-        settle_agents(&mut st, "the config loads", |st| st.settings.properties().tracker().loaded());
+        type_key(&mut st, '7');
+        settle_agents(&mut st, "the config loads", |st| st.settings.issues().tracker().loaded());
         press(&mut st, KeyCode::Tab);
         // The local board has no rules to show.
-        assert!(!st.settings.properties().items().contains(&Item::Tracker(TrackerItem::AssignedOnly)));
-        cursor_to(&mut st, Item::Tracker(TrackerItem::Choice(Tracker::FileSystem)));
+        assert!(!st.settings.issues().items().contains(&Item::AssignedOnly));
+        cursor_to(&mut st, Item::Choice(Tracker::FileSystem));
         press(&mut st, KeyCode::Right);
-        assert_eq!(st.settings.properties().tracker().tracker(), Tracker::Github);
-        settle_agents(&mut st, "the gh login loads", |st| st.settings.properties().tracker().account().is_some());
+        assert_eq!(st.settings.issues().tracker().tracker(), Tracker::Github);
+        settle_agents(&mut st, "the gh login loads", |st| st.settings.issues().tracker().account().is_some());
         let text = capture_screen(&mut st, "settings-tracker-github-rules");
         assert!(text.contains("[x] Only work on issues assigned to me (octocat)"), "{text}");
         assert!(text.contains("[ ] Always require human review before beginning work"), "{text}");
@@ -13245,7 +13269,7 @@ mod tests {
 
     #[test]
     fn the_tracker_sections_key_field_masks_a_pasted_key_and_verifies_it() {
-        use settings::properties::{Item, TrackerItem};
+        use settings::issues::Item;
         use shelbi_app::new_project::Tracker;
         let home = agents_home("tracker-key");
         let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
@@ -13260,17 +13284,17 @@ mod tests {
             move_issues: Arc::new(shelbi_app::tracker_connect::fixture::moved),
         });
         st.dispatch_effect(Effect::OpenSettings);
-        type_key(&mut st, '4');
-        settle_agents(&mut st, "the config loads", |st| st.settings.properties().tracker().loaded());
+        type_key(&mut st, '7');
+        settle_agents(&mut st, "the config loads", |st| st.settings.issues().tracker().loaded());
         press(&mut st, KeyCode::Tab);
-        cursor_to(&mut st, Item::Tracker(TrackerItem::Choice(Tracker::Linear)));
+        cursor_to(&mut st, Item::Choice(Tracker::Linear));
         press(&mut st, KeyCode::Enter);
-        settle_agents(&mut st, "no key", |st| st.settings.properties().tracker().linear().needs_key());
+        settle_agents(&mut st, "no key", |st| st.settings.issues().tracker().linear().needs_key());
         let text = capture_screen(&mut st, "settings-tracker-no-key");
         for want in ["Not connected. Paste a personal API key.", "Linear API key", "Verify an API key first"] {
             assert!(text.contains(want), "{want:?} on the page:\n{text}");
         }
-        cursor_to(&mut st, Item::Tracker(TrackerItem::Key));
+        cursor_to(&mut st, Item::Key);
         press(&mut st, KeyCode::Enter);
         assert!(st.settings.paste("lin_api_secret"));
         let text = capture_screen(&mut st, "settings-tracker-key-typed");
@@ -13287,8 +13311,8 @@ mod tests {
         });
         press(&mut st, KeyCode::Enter);
         settle_agents(&mut st, "the key is stored and the teams load", |st| {
-            !st.settings.properties().tracker().linear().needs_key()
-                && st.settings.properties().tracker().linear().teams().loaded().is_some()
+            !st.settings.issues().tracker().linear().needs_key()
+                && st.settings.issues().tracker().linear().teams().loaded().is_some()
         });
         drop(home);
     }
@@ -13592,8 +13616,8 @@ workspaces:
         st.pool_service = shelbi_orchestrator::pool_admin::workspace_service_with(ops);
         st.dispatch_effect(Effect::OpenSettings);
         settle_settings(&mut st);
-        type_key(&mut st, '7');
-        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workspaces, "7 opens Workspaces");
+        type_key(&mut st, '9');
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workspaces, "9 opens Workspaces");
         assert!(
             wait_until(Duration::from_secs(5), || {
                 st.poll_settings();

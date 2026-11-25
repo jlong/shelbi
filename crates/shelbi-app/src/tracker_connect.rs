@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use shelbi_core::{AgentRules, GithubConnection, IssueTrackerBackend, IssueTrackerConfig, LinearConnection};
 
 /// The agent rules' copy (04-agent-rules), shared by the connection flow and
-/// Settings ▸ Properties ▸ Issue tracker.
+/// Settings ▸ Issues.
 pub mod rules_copy {
     /// "Always require human review before beginning work"
     /// ([`shelbi_core::AgentRules::require_review`]).

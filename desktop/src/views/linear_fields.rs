@@ -3,8 +3,7 @@
 //! Change key…, or the paste-and-verify key field while there's no working
 //! key), the Team picker (required), then the optional Project, Label and
 //! Assignee pickers and the sentence saying what the picks show. One control
-//! for Settings ▸ Properties' Issue tracker section
-//! (`views/tracker_section.rs`).
+//! for Settings ▸ Issues' tracker section (`views/tracker_section.rs`).
 //!
 //! ```text
 //!  Linear account

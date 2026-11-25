@@ -1,11 +1,10 @@
-//! Settings ▸ Properties' Issue tracker section (`linear-settings-ui`), over
-//! the shared [`TrackerForm`] the TUI's page draws too: the three boards as
+//! Settings ▸ Issues' tracker section (`linear-settings-ui`), over the
+//! shared [`TrackerForm`] the TUI's page draws too: the three boards as
 //! radios (one external integration at most: GitHub or Linear), the GitHub
-//! repo or the Linear fields ([`linear_fields`]), and Cancel / Connect.
+//! repo or the Linear fields ([`linear_fields`]), and Cancel / Connect. The
+//! page ([`super::issues_settings`]) draws its title and help over it.
 //!
 //! ```text
-//!  Issue tracker
-//!  Where this project's issues live. ...
 //!  (•) Local board   ( ) GitHub Issues   ( ) Linear
 //!  ...the chosen board's fields...
 //!  Shelbi shows and creates issues in ENG, assigned to you.
@@ -34,6 +33,7 @@ use shelbi_app::new_project::{self as np, Tracker};
 use shelbi_app::settings::tracker::{
     self as tr, choice_title, TrackerForm, TrackerService, CANCEL, CHOICES, SWITCH_ANYWAY,
 };
+use shelbi_app::source::ProjectHandle;
 use shelbi_app::tracker_connect::rules_copy;
 use shelbi_core::IssueTrackerConfig;
 
@@ -42,6 +42,16 @@ use super::linear_fields::{self, LinearUi, Pick};
 use crate::elements::controls;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
+
+/// The tracker service for `handle`'s project: this machine's, or its far
+/// daemon's.
+pub fn tracker_service(handle: &ProjectHandle) -> TrackerService {
+    if handle.link.is_remote() {
+        TrackerService::far(&handle.link)
+    } else {
+        shelbi_orchestrator::tracker_connect::local_service(handle.name())
+    }
+}
 
 /// What the section tells the page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +69,7 @@ pub fn choice_selector(tracker: Tracker) -> &'static str {
     }
 }
 
-/// The Issue tracker section.
+/// The tracker section.
 pub struct TrackerSection {
     form: TrackerForm,
     service: TrackerService,
@@ -399,14 +409,6 @@ impl Render for TrackerSection {
             .flex_col()
             .gap(px(16.0))
             .w_full()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).child(tr::TITLE))
-                    .child(div().type_style(Type::Small).text_color(theme.form_hint).child(tr::HELP)),
-            )
             .child(radios)
             .child(body)
             .children(rules)

@@ -150,7 +150,7 @@ pub fn show(handle: ProjectHandle, from: Option<WindowHandle<ShelbiWindow>>, cx:
             return;
         }
     }
-    let service = super::properties::tracker_service(&handle);
+    let service = super::tracker_section::tracker_service(&handle);
     let opened = cx.open_window(super::about::options(TITLE, SIZE, false, cx), |window, cx| {
         cx.new(|cx| TrackerConnectView::new(handle, service, from, window, cx))
     });
@@ -1313,7 +1313,7 @@ mod tests {
         let mut remote = crate::app::RemoteWindow::new(far.session(), far.listing(), far.link.clone(), far.remote.clone());
         let handle = remote.handle_for_test(crate::remote_fixture::PROJECT);
         assert!(handle.link.is_remote());
-        let service = super::super::properties::tracker_service(&handle);
+        let service = super::super::tracker_section::tracker_service(&handle);
         let mut r = rig(cx, handle, service);
         assert!(r.flow(|f| f.loaded()), "the far project's connection was read");
         assert!(r.drawn("tracker-connect-github"), "the far project is on its local board");

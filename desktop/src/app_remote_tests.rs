@@ -386,6 +386,7 @@ fn the_remote_window_opens_every_view_over_the_relay(cx: &mut TestAppContext) {
         SettingsPage::Agents,
         SettingsPage::Orchestrator,
         SettingsPage::Properties,
+        SettingsPage::Issues,
     ] {
         update(cx, handle, |w, window, cx| w.open_settings(Some(page), window, cx));
         draw(cx, handle);

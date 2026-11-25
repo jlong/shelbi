@@ -52,6 +52,8 @@ impl PageLook for SettingsPage {
             SettingsPage::Agents => icons::ROBOT,
             SettingsPage::Orchestrator => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
             SettingsPage::Properties => icons::LIST_BULLET,
+            // The sidebar's Issues view's stack.
+            SettingsPage::Issues => icons::RECTANGLE_STACK,
         }
     }
 
@@ -65,6 +67,7 @@ impl PageLook for SettingsPage {
             SettingsPage::Agents => "settings-nav-agents",
             SettingsPage::Orchestrator => "settings-nav-orchestrator",
             SettingsPage::Properties => "settings-nav-properties",
+            SettingsPage::Issues => "settings-nav-issues",
         }
     }
 }
@@ -281,15 +284,15 @@ mod tests {
         let icons: Vec<String> = all.iter().map(|p| format!("{:?}", p.icon())).collect();
         let distinct: std::collections::HashSet<_> = icons.iter().collect();
         assert_eq!(distinct.len(), all.len());
-        // This client offers every page, numbered ⌃1 to ⌃8 in sidebar order
-        // as the frame (2252:27532) numbers them.
+        // This client offers every page, numbered ⌃1 to ⌃9 in sidebar order.
         assert_eq!(SettingsNav::default().available(), shelbi_app::settings::PageSet::ALL);
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
         // The frame's icons: Properties' list, Agents' robot (John's drawing).
         assert_eq!(SettingsPage::Properties.icon(), icons::LIST_BULLET);
         assert_eq!(SettingsPage::Agents.icon(), icons::ROBOT);
         assert_eq!(SettingsPage::Orchestrator.icon(), icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS);
         assert_eq!(SettingsPage::Workspaces.icon(), icons::FOLDER);
         assert_eq!(SettingsPage::Workflows.icon(), icons::VIEW_COLUMNS);
+        assert_eq!(SettingsPage::Issues.icon(), icons::RECTANGLE_STACK);
     }
 }

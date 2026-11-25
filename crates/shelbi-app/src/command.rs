@@ -119,7 +119,7 @@ pub enum CommandKind {
     NewIssue,
     /// Connect the project to an issue tracker: the desktop's guided flow
     /// (the Issues header's ⋮ menu, [`crate::tracker_connect::flow`]); the
-    /// TUI opens Settings ▸ Properties, where its Issue tracker section is.
+    /// TUI opens Settings ▸ Issues.
     ConnectTracker,
     /// Reorder an issue within its column: land it at absolute slot
     /// `position` (0 is the top) of the column's priority order. The board

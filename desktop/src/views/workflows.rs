@@ -184,7 +184,7 @@ impl WorkflowsPage {
             reload: false,
             reload_on_return: false,
             statuses_anchor: Default::default(),
-            sync: super::properties::tracker_service(handle).sync_statuses,
+            sync: super::tracker_section::tracker_service(handle).sync_statuses,
             _subscriptions: subscriptions,
         };
         // A test's page never reads the real `~/.shelbi`.
