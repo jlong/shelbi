@@ -600,7 +600,11 @@ fn split_handle(p: &PaneSession, theme: &Theme, cx: &mut Context<IssuesView>) ->
         .border_color(theme.divider)
         .cursor(CursorStyle::ResizeUpDown)
         .focus(|s| s.bg(theme.background_hover))
-        .tooltip(style::tooltip("Drag to resize the session (⌥↑ ⌥↓)"))
+        .tooltip(style::tooltip(if crate::keys::MAC {
+            "Drag to resize the session (⌥↑ ⌥↓)"
+        } else {
+            "Drag to resize the session (Alt+↑ Alt+↓)"
+        }))
         .child(
             div()
                 .w(px(GRIP_W))
@@ -1115,7 +1119,7 @@ pub(super) fn action_hint(view: &IssuesView, action: PaneAction) -> String {
         PaneAction::EditDescription => "e".into(),
         PaneAction::OpenInEditor => "⇧E".into(),
         PaneAction::CopyBranch => String::new(),
-        PaneAction::Delete => "⌘⌫".into(),
+        PaneAction::Delete => crate::keys::app_label("super-backspace"),
     }
 }
 

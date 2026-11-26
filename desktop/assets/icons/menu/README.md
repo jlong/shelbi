@@ -22,3 +22,8 @@ it sits at 16pt beside the pill's X-Small label:
 
 - `arrow-down.svg`: the Heroicons arrow-down, drawn on the 16pt grid with a
   1.25pt stroke (the 24/outline path scaled by 2/3, as `plus.svg` is).
+
+A tab's context menu marks its Move to Window row, which opens a submenu:
+
+- `chevron-right.svg`: the Heroicons chevron-right, drawn on the 16pt grid
+  with a 1.25pt stroke (the 24/outline path scaled by 2/3).

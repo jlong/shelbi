@@ -1,6 +1,7 @@
 # Shelbi desktop
 
-The native macOS client for Shelbi, built with [gpui](https://www.gpui.rs/).
+The native desktop client for Shelbi, on macOS and on Linux (Omarchy and
+other Wayland desktops), built with [gpui](https://www.gpui.rs/).
 It is a sibling of the TUI (`crates/shelbi-tui`) at feature parity: both
 render over `shelbi-app` (navigation, the command registry, view models,
 background refresh) and talk to the same daemon and sessions. The plan is
@@ -25,8 +26,26 @@ checks); the startup requirements check (git, gh, a coding agent, brew),
 which shows only when a tool is missing;
 native
 menus and system notifications. `scripts/bundle.sh` packages it as a signed,
-notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask. Each
+notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask; on
+Linux it ships as the `shelbi-desktop-bin` AUR package. Each
 piece's story is in its status doc (`docs/README.md` lists them).
+
+## Install
+
+- **macOS:** `brew install --cask shelbi-desktop` (it pulls in the `shelbi`
+  formula), or the release's `Shelbi-<version>-arm64.zip`.
+- **Linux (Arch, Omarchy), x86_64:** `yay -S shelbi-desktop-bin`. It depends
+  on `shelbi-bin` of the same version, so the CLI comes with it. Shelbi then
+  shows up in Walker and the Omarchy menu. Upgrade both with
+  `yay -Syu shelbi-desktop-bin shelbi-bin`. `packaging/aur/README.md` at the
+  repository root has the packages and how to build them by hand.
+
+On Linux the app finds the CLI on the login shell's `PATH` first, so a
+`shelbi` earlier on it (`~/bin`, `~/.cargo/bin`) wins over the package's
+`/usr/bin/shelbi`. Settings ▸ General shows the one in use; set
+`desktop.cli_path` in `~/.shelbi/config.yaml` to pin another.
+
+## The CLI on macOS
 
 The app is a client of the `shelbi` CLI. The cask depends on the formula,
 so a Homebrew install has it. Without it (the app's zip on its own, a
@@ -138,7 +157,7 @@ you gave in `~/.shelbi/feedback.json`, and
 
 ## Build and run
 
-macOS on Apple silicon, macOS 15 or later.
+macOS on Apple silicon (macOS 15 or later), or Linux under Wayland.
 
 ```sh
 cd desktop
@@ -148,6 +167,126 @@ cargo run -- <project> # or a named one ($SHELBI_PROJECT works too)
 
 `rust-toolchain.toml` pins the toolchain, so rustup installs it on first use.
 Set `RUST_LOG` (default `warn`) to see more of the log on stderr.
+
+### On Linux
+
+The same commands build and run it on Linux under Wayland (the
+`desktop-linux` port; `docs/gpui.md` has the backend notes). What differs
+from the Mac sits behind `src/platform/os/` (`linux.rs`):
+
+- The `shelbi` CLI comes from the `shelbi-bin` package, which
+  `shelbi-desktop-bin` depends on: the app never downloads one. Discovery
+  searches the login shell's `PATH`, then `~/.local/bin`, `/usr/bin`,
+  `/usr/local/bin`, `~/.cargo/bin` and `~/bin`. A launcher (Walker) that
+  starts the app without `SHELL` gets the user's shell from `/etc/passwd`,
+  so the login-shell capture still runs. A missing CLI names `yay -S
+  shelbi-bin`; the update notice names `yay -Syu shelbi-desktop-bin
+  shelbi-bin`.
+- Links, files and folders open with `xdg-open`; a terminal editor runs in
+  the default terminal through `xdg-terminal-exec` (else `$TERMINAL -e`).
+- Settings' Browse… is the XDG Desktop Portal's file chooser, starting in
+  `/usr/bin`; Download Image… starts in the XDG download folder.
+- Notifications go to the freedesktop notification daemon (mako on
+  Omarchy) under the app name Shelbi; the clipboard is Wayland's.
+- Reduce Motion and the terminals' overlay scroll bars follow the desktop's
+  `enable-animations` and `overlay-scrolling` (the settings portal, else
+  GTK's `settings.ini`).
+- Relaunch re-runs the executable `/proc/self/exe` names, so an upgraded
+  package's new binary starts.
+- Windows report the Wayland app id `dev.shelbi.Desktop`, for Hyprland's
+  window rules, the desktop entry and the hicolor icons
+  (`packaging/linux/`). A translucent window is blurred by Hyprland's own
+  `decoration:blur` (so Settings has no blur slider), and is opaque when the
+  desktop asks for high contrast or the session isn't Wayland. The app icon
+  picked in Settings goes into `~/.local/share/icons/hicolor`.
+- File ▸ New Window is Ctrl+Shift+N. Dragging a tab off its bar opens it in
+  a new window, which Hyprland tiles; a tab moves into another window with
+  its tab menu's Move to Window (Wayland gives a drag no way to find another
+  window).
+- The Editor and Diff tool pickers list desktop apps (VS Code, Zed, Sublime,
+  the JetBrains IDEs, Meld, Sublime Merge...) by their desktop entries, with
+  their icons from the icon theme.
+- On Omarchy, with `theme: auto`, the colors come from the active Omarchy
+  theme and the terminal font from Omarchy's monospace font, both followed
+  live (`src/theme/omarchy.rs`; `docs/theme.md` has the mapping).
+- Confirmations (Close Project, Close All Other Projects, Quit Shelbi) are
+  the app's own dialog (`src/views/prompt.rs`), since Linux has no native
+  alert: Return takes the first button, Esc Cancel.
+- The tab bar starts at the window's edge (no traffic lights to make room
+  for), and the copy says "this computer" where the Mac says "this Mac".
+- Settings ▸ Terminal's font picker lists the installed monospaced families
+  from fontconfig (`fc-list`). It has no Option key setting: Alt is always
+  Meta.
+
+#### Keys, clipboard and drops on Linux
+
+Every app chord is **Ctrl+Shift+key** in every view, as in Alacritty,
+Ghostty and Kitty: where the Mac has ⌘, Linux has Ctrl+Shift
+(`crate::keys::platform_chord`). A terminal pane keeps every plain Ctrl key
+(Ctrl+C, Ctrl+L, Ctrl+W, Ctrl+P, Ctrl+Space reach the program), and Super
+stays with Hyprland: no app chord holds Super. The table is fixed in code
+(`src/keys.rs`, `src/menus/tree.rs`, `src/elements/terminal/keys.rs`);
+Settings ▸ Keybindings lists it read-only under App, and the `keys.yaml`
+stub the app writes lists it as comments. Making it rebindable in
+`keys.yaml` is a follow-up.
+
+| | macOS | Linux |
+|---|---|---|
+| Command palette | ⌘K | Ctrl+Shift+K |
+| Settings | ⌘, | Ctrl+Shift+, |
+| New window | ⇧⌘N | Ctrl+Shift+N |
+| Close window | ⌘W | Ctrl+Shift+W |
+| Quit (agents keep running) | ⌘Q | Ctrl+Shift+Q |
+| Sidebar | ⌃⌘S | Ctrl+Shift+S |
+| Focus the sidebar from a terminal | `keys.yaml`'s ⌃H | Ctrl+Shift+H |
+| Orchestrator, Issues, Changelog | ⌘O ⌘I ⌘L | Ctrl+Shift+O, I, L |
+| Project tabs | ⌘1 to ⌘9 | Ctrl+Shift+1 to 9 |
+| Sidebar rows | ⌃1 to ⌃9 | Alt+1 to Alt+9 |
+| Copy, paste, cut, select all | ⌘C ⌘V ⌘X ⌘A | Ctrl+Shift+C, V, X, A |
+| Find in a terminal | ⌘F | Ctrl+Shift+F |
+| Terminal font bigger, smaller, actual size | ⌘+ ⌘- ⌘0 | Ctrl+Shift+= - 0 |
+| Delete the open issue | ⌘⌫ | Ctrl+Shift+Backspace |
+| Submit a dialog | ⌘↵ | Ctrl+↵ (or Ctrl+Shift+↵) |
+
+- **Text fields** follow GTK's keys as well: plain Ctrl+C, V, X, A, Z (and
+  Ctrl+Shift+Z or Ctrl+Y to redo), Ctrl+B / I / E / K for formatting in the
+  issue editor, Ctrl+←/→ and Ctrl+Backspace by word, Ctrl+Home/End to the
+  ends. Ctrl+Shift+C, V, X, A work in them too, so the chord is the same as
+  in a terminal.
+- `keys.yaml`'s plain Ctrl chords (Ctrl+H and Ctrl+L focus, Ctrl+P and
+  Ctrl+Space for the palette) work everywhere but a focused terminal, which
+  keeps them; the Ctrl+Shift chords above stand in for them there.
+- Alt is always Meta in a terminal (`option_as_meta` is macOS's).
+  Ctrl+click opens a link (⌘-click on the Mac).
+- Linux has no global menu bar. Every client action from the Mac's menus
+  (Close Window, Copy, Bigger, Toggle Sidebar, Documentation ...) is in the
+  command palette, beside the registry's commands, which it lists already.
+  Hide, Hide Others, Show All, Minimize and Services are left out: those are
+  Hyprland's.
+- **Clipboard.** Ctrl+Shift+C / V copy and paste the Wayland clipboard. A
+  finished selection is the primary selection too, and a middle click in a
+  terminal pastes it. A clipboard holding an image and no text (a
+  screenshot) pastes into a terminal as a file: the image is written under
+  `$XDG_CACHE_HOME/shelbi-desktop/drops` and its path is pasted, as a
+  dropped file's is (the Mac does the same, under its Caches folder).
+- **Drops.** A file or image dragged from a file manager or a screenshot
+  tool (a `text/uri-list` of `file://` URIs) pastes its paths into the
+  terminal under the pointer. A drag that carries only image data or a web
+  URL (an image out of a browser) is refused inside gpui's Wayland backend
+  before the app sees it (`docs/gpui.md`); save it first, or copy it and
+  paste.
+- **Omarchy's Super+C / Super+V** send plain Ctrl+C / Ctrl+V to a window
+  that isn't tagged a terminal, and Ctrl+C in a terminal pane interrupts
+  its agent. Tag Shelbi a terminal so they send Ctrl+Shift+C / V instead,
+  in `~/.config/hypr/bindings.lua` (or any file Hyprland loads; the
+  window's class is `dev.shelbi.Desktop`):
+
+  ```lua
+  o.window("dev\\.shelbi\\.Desktop", { tag = "+terminal" })
+  ```
+
+`.github/workflows/desktop-linux-ci.yml` builds, lints and tests `desktop/`
+on Linux for every pull request that touches it or the shared crates.
 
 ## Its own workspace
 
@@ -232,6 +371,8 @@ desktop/
   macos/Info.plist     the unbundled binary's name (no CFBundleIdentifier: see the file)
   macos/Shelbi.app.plist  the .app bundle's Info.plist (bundle.sh fills in the version)
   scripts/bundle.sh    build, bundle, sign, notarize, staple, zip, sha256 (see Packaging)
+  scripts/linux-archive.sh  the Linux release archive the AUR package installs from (see Packaging)
+  packaging/linux/     the desktop entry and hicolor icons a Linux package installs
   scripts/app-icon.sh  compile the layered app icon and regenerate every picture cut from the icons (Xcode 26)
   assets/icon/         the app icons: Command Grille's layered source and compile, Retro's master, their renditions (see its README)
   assets/icons/        vendored Heroicons + their LICENSE
@@ -261,7 +402,8 @@ desktop/
   src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
   src/platform/        bootstrap: login env, CLI discovery, the CLI install (install.rs), daemon start,
-                       version check, relaunch; --print-version (print_version.rs), the daily release check (update.rs)
+                       version check, relaunch; --print-version (print_version.rs), the daily release check (update.rs);
+                       os/ is the per-OS interface (macos.rs, linux.rs): install dirs, package commands, openers
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette
   src/elements/        custom elements, chiefly the terminal (elements/terminal/)
   src/drops/           image and file-promise drops onto a terminal (AppKit hooks on gpui's window)
@@ -509,12 +651,35 @@ GitHub release and the `shelbi-desktop` cask in `jlong/homebrew-shelbi`. The
 secret names and the flow are in `docs/release.md` and
 `docs/release/homebrew-tap.md` at the repository root.
 
+### On Linux
+
+`scripts/linux-archive.sh` builds the release binary on x86_64 Linux and
+archives it with the desktop entry and the hicolor icons
+(`packaging/linux/`) as `target/dist/shelbi-desktop_Linux_x86_64.tar.gz`,
+plus a `.sha256`. It runs the binary's `--print-version` as a smoke check.
+
+```sh
+desktop/scripts/linux-archive.sh                 # cargo build --release --locked, then archive
+desktop/scripts/linux-archive.sh --binary PATH   # archive a binary you built
+```
+
+The release workflow's `desktop-linux-release` job runs it on Ubuntu 24.04
+and attaches the archive to the GitHub release. `aur-publish` then renders
+the `shelbi-bin` and `shelbi-desktop-bin` AUR packages from
+`packaging/aur/` at the repository root, builds and installs both in an Arch
+container, and pushes them to the AUR. `shelbi-desktop-bin` depends on
+`shelbi-bin` of its own version, so `yay -S shelbi-desktop-bin` installs the
+CLI too, and the app appears in Walker and the Omarchy menu.
+`packaging/aur/README.md` has the packages and how to build them by hand.
+
 ### Update notice
 
 Once a day, off the UI thread, the app asks the GitHub releases API for the
 latest Shelbi release (`src/platform/update.rs`). When it is newer than the
 app, every project window shows a bar with the command that upgrades it,
-`brew upgrade --cask shelbi-desktop`; otherwise it shows nothing. There is no
+`brew upgrade --cask shelbi-desktop` on macOS and
+`yay -Syu shelbi-desktop-bin shelbi-bin` on Linux; otherwise it shows
+nothing. There is no
 in-app updater. The last answer is cached in `~/.shelbi/desktop-update-check.json`,
 so a relaunch inside the day shows the same notice without asking again.
 
@@ -573,4 +738,6 @@ CI: `.github/workflows/desktop-ci.yml` runs the three desktop commands on a
 - **Verification:** the commands run and their results, plus anything checked
   by hand in the running app.
 
-The umbrella's own record is `docs/status/desktop-app.md`.
+The umbrella's own record is `docs/status/desktop-app.md`; the Linux port's
+is `docs/status/desktop-linux.md`, and its parity walk on Omarchy is
+`docs/status/dl-parity.md`.

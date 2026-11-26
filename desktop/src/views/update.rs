@@ -1,6 +1,7 @@
-//! The new-release notice: a bar along the foot of every project window's main area when
-//! `platform::update` found a newer Shelbi, naming the Homebrew command that
-//! upgrades the app. Dismissing it hides it in every window until the next
+//! The new-release notice: a bar along the foot of every project window's
+//! main area when `platform::update` found a newer Shelbi, naming the
+//! package manager's command that upgrades the app (Homebrew's on macOS,
+//! yay's on Linux). Dismissing it hides it in every window until the next
 //! launch (the check itself runs at most once a day).
 
 use gpui::{div, prelude::*, AnyElement, Global, IntoElement};

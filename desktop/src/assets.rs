@@ -484,6 +484,8 @@ heroicons! {
         X_MARK_MENU = "x-mark";
         /// The terminal's Jump to bottom pill, beside its X-Small label.
         ARROW_DOWN_MENU = "arrow-down";
+        /// A menu row that opens a submenu (a tab's Move to Window).
+        CHEVRON_RIGHT_MENU = "chevron-right";
     }
     @large {
         FOLDER_LARGE = "folder";

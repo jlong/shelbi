@@ -10,6 +10,8 @@
 //! `NSVisualEffectView` with one fixed radius, so it can't follow a slider.
 //! The symbol is looked up at run time: if a macOS release drops it, the
 //! window stays translucent and unblurred, and the app logs it once.
+//!
+//! On Linux the compositor blurs (see the Linux `imp`'s note).
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -99,18 +101,102 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod consts {
+    /// The app sets the blur's radius itself (Settings' Background blur).
+    #[cfg_attr(test, allow(dead_code))]
+    pub const RADIUS_ADJUSTABLE: bool = true;
+
+    /// Why the windows are opaque, while [`super::reduce_transparency`]
+    /// holds them so.
+    pub fn opaque_note() -> &'static str {
+        "Reduce Transparency is on (System Settings ▸ Accessibility ▸ Display), so windows are opaque."
+    }
+}
+
+/// Linux: the compositor blurs, not the app.
+///
+/// gpui's Linux renderer (`gpui-pre-wgpu`) asks the surface for
+/// premultiplied alpha and blends every primitive with premultiplied "over"
+/// on both color and alpha (`BlendState::PREMULTIPLIED_ALPHA_BLENDING`), so,
+/// unlike the Metal pipelines ([`super::metal_blend`]), a translucent
+/// window's alpha is right as drawn: a fill over the glass tints it, and
+/// the canvas keeps the window's opacity. Hyprland then blurs whatever shows
+/// through a translucent window by its own `decoration:blur` settings (on
+/// by default, and per window with `windowrule = noblur`), at a radius the
+/// app can't set: there is no Wayland protocol Hyprland implements for it
+/// (`org_kde_kwin_blur` is KWin's and asks for a blur, not a radius). So
+/// Settings shows no Background blur slider here.
+///
+/// Translucency needs a compositing Wayland session: under X11 (no
+/// `WAYLAND_DISPLAY`, gpui's X11 backend) nothing promises a compositor, so
+/// the windows stay opaque, as they do when the desktop asks for high
+/// contrast ([`super::desktop_settings`]).
 #[cfg(not(target_os = "macos"))]
 mod imp {
     pub fn set_blur_radius(_window: &gpui::Window, _radius: u8) {}
 
     pub fn reduce_transparency() -> bool {
-        false
+        !translucency_supported() || super::super::desktop_settings::values().high_contrast
+    }
+
+    /// A Wayland session: gpui picks its Wayland backend whenever
+    /// `WAYLAND_DISPLAY` is set.
+    pub fn translucency_supported() -> bool {
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty())
     }
 }
 
-/// Blur what shows through `window` by `radius` points (0 clears it).
+#[cfg(not(target_os = "macos"))]
+mod consts {
+    /// The compositor picks the blur's radius (Hyprland's `decoration:blur`).
+    #[cfg_attr(test, allow(dead_code))]
+    pub const RADIUS_ADJUSTABLE: bool = false;
+
+    /// Why the windows are opaque, while [`super::reduce_transparency`]
+    /// holds them so.
+    pub fn opaque_note() -> &'static str {
+        if super::imp::translucency_supported() {
+            "Your desktop asks for high contrast, so windows are opaque."
+        } else {
+            "Transparency needs a Wayland session, so windows are opaque."
+        }
+    }
+}
+
+/// Blur what shows through `window` by `radius` points (0 clears it). A
+/// no-op off macOS, where the compositor blurs.
 pub use imp::set_blur_radius;
 
-/// Whether the user asked macOS to reduce transparency (System Settings ▸
-/// Accessibility ▸ Display): every window is then opaque.
+/// Whether every window must be opaque: macOS's Reduce Transparency (System
+/// Settings ▸ Accessibility ▸ Display); on Linux the desktop's high-contrast
+/// setting, or a session that can't composite a translucent window.
 pub use imp::reduce_transparency;
+
+pub use consts::opaque_note;
+
+/// Whether the app sets the blur's radius (macOS) or the compositor does
+/// (Linux): Settings shows the Background blur slider only for the first.
+/// A test's app is the macOS one unless it says otherwise
+/// ([`test_radius_adjustable`]), so the views' tests read the same on both.
+pub fn radius_adjustable() -> bool {
+    #[cfg(test)]
+    {
+        TEST_ADJUSTABLE.with(|a| a.get())
+    }
+    #[cfg(not(test))]
+    {
+        consts::RADIUS_ADJUSTABLE
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ADJUSTABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Have [`radius_adjustable`] answer `adjustable` on this test's thread.
+#[cfg(test)]
+pub fn test_radius_adjustable(adjustable: bool) {
+    TEST_ADJUSTABLE.with(|a| a.set(adjustable));
+}

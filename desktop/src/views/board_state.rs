@@ -1689,8 +1689,9 @@ impl BoardState {
             }
             _ => {}
         }
-        // ⌘⌫: More ▸ Delete issue…'s key (the desktop's, outside the keymap).
-        if chord.code == Key::Backspace && chord.mods == Mods::SUPER {
+        // ⌘⌫ (Ctrl+Shift+Backspace on Linux): More ▸ Delete issue…'s key (the
+        // desktop's, outside the keymap).
+        if chord.code == Key::Backspace && chord.mods == crate::keys::app_mods() {
             return self.begin_delete(id);
         }
         if let Some(action) = self.keymaps.popover.dispatch(chord) {
@@ -3700,7 +3701,7 @@ pub(crate) mod tests {
         assert_eq!(ids_in(&b, "todo"), ["A", "B"]);
 
         // ⌘⌫ on the pane asks too; other keys go nowhere while it's up.
-        press(&mut b, "super-backspace");
+        press(&mut b, &crate::keys::app_chord("super-backspace").canonical());
         assert_eq!(b.mode, Mode::ConfirmDelete { id: "A".into() });
         assert!(press(&mut b, "j").is_empty());
         assert_eq!(b.mode, Mode::ConfirmDelete { id: "A".into() });
@@ -3767,7 +3768,7 @@ pub(crate) mod tests {
         assert!(ask_delete(&mut b, "W").is_empty());
         assert_eq!(b.mode, Mode::Detail { id: "W".into(), editing: false });
         assert_eq!(b.status.as_deref(), Some(why.as_str()));
-        press(&mut b, "super-backspace");
+        press(&mut b, &crate::keys::app_chord("super-backspace").canonical());
         assert_eq!(b.delete_confirm(), None);
 
         // An issue that went active while the confirm was up isn't sent.

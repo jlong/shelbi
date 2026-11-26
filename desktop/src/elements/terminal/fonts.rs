@@ -1,9 +1,10 @@
 //! The terminal fonts Settings offers: the bundled faces first, then the
 //! installed monospaced families.
 //!
-//! The installed families come from CoreText ([`installed`]): every family
-//! on the system, and which of them are fixed-pitch (`kCTFontMonoSpaceTrait`
-//! on any of the family's faces). Enumerating every face takes a moment, so
+//! The installed families come from CoreText on macOS ([`installed`]): every
+//! family on the system, and which of them are fixed-pitch
+//! (`kCTFontMonoSpaceTrait` on any of the family's faces); from fontconfig
+//! (`fc-list`) on Linux. Enumerating every face takes a moment, so
 //! it runs off the UI thread, once per process. Ordering and the search
 //! filter ([`choices`]) are plain functions, tested without CoreText.
 
@@ -203,11 +204,47 @@ mod coretext {
     }
 }
 
+/// Off macOS the families come from fontconfig (`fc-list`, the
+/// `fontconfig` package the Linux app depends on), one line per face:
+/// the family's first name and its spacing.
 #[cfg(not(target_os = "macos"))]
 mod coretext {
     pub fn installed() -> super::InstalledFonts {
-        super::InstalledFonts::default()
+        std::process::Command::new("fc-list")
+            .args(["--format", "%{family[0]}\t%{spacing}\n"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| super::parse_fc_list(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_default()
     }
+}
+
+/// `fc-list --format '%{family[0]}\t%{spacing}\n'`'s lines as families. A
+/// family is monospaced when any face says so: spacing 90 (dual), 100
+/// (mono) or 110 (charcell), or, for the variable faces that leave spacing
+/// out (Noto Sans Mono), "Mono" among the words of its name. An emoji
+/// family never is.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn parse_fc_list(text: &str) -> InstalledFonts {
+    let mut fonts = InstalledFonts::default();
+    for line in text.lines() {
+        let (family, spacing) = line.split_once('\t').unwrap_or((line, ""));
+        let family = family.trim();
+        if family.is_empty() {
+            continue;
+        }
+        let spaced = spacing.trim().parse::<u32>().is_ok_and(|s| s >= 90);
+        let named = family.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Mono");
+        // An emoji font (Noto Color Emoji) reports spacing 100 but draws no
+        // letters, so it's no terminal face.
+        let emoji = family.split(|c: char| !c.is_alphanumeric()).any(|word| word == "Emoji");
+        if (spaced || named) && !emoji {
+            fonts.monospace.insert(family.to_string());
+        }
+        fonts.all.insert(family.to_string());
+    }
+    fonts
 }
 
 #[cfg(test)]
@@ -226,6 +263,21 @@ mod tests {
                 Choice::Divider => "---".into(),
             })
             .collect()
+    }
+
+    #[test]
+    fn fc_list_lines_make_families_and_the_monospaced_ones() {
+        let text = "JetBrainsMono Nerd Font\t100\nJetBrainsMono Nerd Font\t100\nNoto Sans\t\n\
+                    Noto Sans Mono\t\nSarasa Gothic\t90\nAdwaita Sans\t0\nMonoid\t\n\t100\nNoto Color Emoji\t100\n";
+        let fonts = parse_fc_list(text);
+        assert_eq!(
+            fonts.monospace,
+            set(&["JetBrainsMono Nerd Font", "Noto Sans Mono", "Sarasa Gothic"]),
+            "spacing 90+, or Mono as a word of the name, and no emoji"
+        );
+        assert!(fonts.all.contains("Noto Sans") && fonts.all.contains("Monoid"));
+        assert!(fonts.has("JetBrainsMono Nerd Font"), "Omarchy's font is installed");
+        assert_eq!(fonts.all.len(), 7, "a face per line, one family each, blank names skipped");
     }
 
     #[test]

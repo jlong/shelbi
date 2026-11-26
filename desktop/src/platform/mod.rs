@@ -2,13 +2,19 @@
 //! can talk to Shelbi.
 //!
 //! The app is a client of the `shelbi` CLI package: it embeds neither the
-//! daemon nor the session process. Launched from Finder it has no shell
-//! `PATH`, so [`Bootstrap`] resolves the login-shell environment ([`env`]),
-//! finds `shelbi` ([`discovery`]) or, when there is none, installs the
-//! release matching the app ([`install`]), has it start the daemon ([`daemon`]),
-//! connects to the control socket and checks the versions match exactly
-//! ([`control`], [`version`]), and fails at the step that broke with what its
-//! screen needs to name the fix. `views::bootstrap` renders each state.
+//! daemon nor the session process. Launched from Finder (or Walker, on
+//! Linux) it may have no shell `PATH`, so [`Bootstrap`] resolves the
+//! login-shell environment ([`env`]), finds `shelbi` ([`discovery`]) or,
+//! when there is none on macOS, installs the release matching the app
+//! ([`install`]; on Linux the package provides it), has it start the daemon
+//! ([`daemon`]), connects to the control socket and checks the versions
+//! match exactly ([`control`], [`version`]), and fails at the step that
+//! broke with what its screen needs to name the fix. `views::bootstrap`
+//! renders each state.
+//!
+//! What differs between macOS and Linux (install locations, the package
+//! manager's commands, opening files and URLs, relaunching, the panels'
+//! start folders) sits behind [`os`], one sibling file per OS.
 //!
 //! `--print-version` ([`print_version`]) is bootstrap's headless check, and
 //! [`update`] the once-a-day new-release check. [`font_smoothing`] turns
@@ -23,16 +29,21 @@ pub mod blur;
 pub mod bootstrap;
 pub mod control;
 pub mod daemon;
+#[cfg(not(target_os = "macos"))]
+pub mod desktop_settings;
 pub mod discovery;
 pub mod dock_icon;
 pub mod env;
 pub mod feedback;
 pub mod font_smoothing;
+#[cfg(not(target_os = "macos"))]
+pub mod icon_theme;
 pub mod install;
 pub mod launch;
 pub mod metal_blend;
 pub mod motion;
 pub mod open_panel;
+pub mod os;
 pub mod print_version;
 pub mod relaunch;
 pub mod screen;

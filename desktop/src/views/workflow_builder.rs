@@ -266,7 +266,8 @@ impl WorkflowEditor {
         let delta = event.delta.pixel_delta(window.line_height());
         let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
         let v = &mut self.builder.viewport;
-        if event.modifiers.platform {
+        // ⌘-scroll zooms (Ctrl-scroll on Linux, as in every Linux app).
+        if crate::keys::text_mod(&event.modifiers) {
             let zoom = v.zoom * (1.0 + dy * SCROLL_ZOOM);
             v.zoom_at(zoom, at, canvas, (g.w, g.h));
         } else {

@@ -14,8 +14,12 @@ pub fn lock() -> MutexGuard<'static, ()> {
 /// main because a resolve runs from the first test on. A window's fixtures start
 /// the same background jobs a real window does, and those outlive the test that
 /// started them. A test about specific state still mounts its own under [`lock`].
+/// The constructor section is the object format's: Mach-O's `__mod_init_func`
+/// on macOS, ELF's `.init_array` on Linux (where the Mach-O name is just an
+/// unread section, and the home would never mount).
 #[used]
-#[link_section = "__DATA,__mod_init_func"]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
 static MOUNT_SHARED_HOME: extern "C" fn() = {
     extern "C" fn mount() {
         shelbi_state::mount_shared_test_home();

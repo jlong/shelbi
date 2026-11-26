@@ -141,7 +141,8 @@ pub fn nav_for(ks: &Keystroke) -> Option<Nav> {
     let bare = !m.control && !m.alt && !m.platform && !m.function;
     let plain = bare && !m.shift;
     let only_alt = m.alt && !m.control && !m.platform && !m.shift;
-    let only_cmd = m.platform && !m.control && !m.alt && !m.shift;
+    // The app modifier: ⌘, Ctrl+Shift on Linux.
+    let only_cmd = crate::keys::is_app(m);
     Some(match ks.key.as_str() {
         "down" if only_alt => Nav::NextEntry,
         "up" if only_alt => Nav::PreviousEntry,
@@ -1017,7 +1018,7 @@ impl ChangelogView {
     }
 
     fn render_footer(&self, theme: &Theme) -> impl IntoElement {
-        let hints = "\u{2191}/\u{2193} scroll   space page   j/k or \u{2325}\u{2193}/\u{2325}\u{2191} next/previous entry   home/end top/bottom   \u{2318}F search   esc clear";
+        let hints = footer_hints();
         div()
             .flex()
             .flex_row()
@@ -1031,6 +1032,20 @@ impl ChangelogView {
             .text_color(theme.muted)
             .child(div().flex_1().truncate().child(hints))
     }
+}
+
+/// The footer's key hints, each chord as this platform writes it: ⌥↓ and
+/// ⌘F on macOS, Alt+Down and Ctrl+Shift+F on Linux.
+fn footer_hints() -> String {
+    let label = |spec: &str| {
+        crate::keys::chord_label(&shelbi_state::keymap::KeyChord::parse(spec).expect("a footer chord"))
+    };
+    format!(
+        "\u{2191}/\u{2193} scroll   space page   j/k or {}/{} next/previous entry   home/end top/bottom   {} search   esc clear",
+        label("alt-down"),
+        label("alt-up"),
+        crate::keys::app_label("super-f"),
+    )
 }
 
 /// A link kind's chip icon: the Issues view's stack for an issue, the
@@ -1201,7 +1216,18 @@ mod tests {
     }
 
     fn nav(spec: &str) -> Option<Nav> {
-        nav_for(&Keystroke::parse(spec).unwrap())
+        nav_for(&Keystroke::parse(&crate::keys::test_keys::app_spec(spec)).unwrap())
+    }
+
+    #[test]
+    fn the_footer_names_this_platforms_chords() {
+        let hints = footer_hints();
+        if crate::keys::MAC {
+            assert!(hints.contains("⌥↓/⌥↑") && hints.contains("⌘F search"), "{hints}");
+        } else {
+            assert!(hints.contains("Alt+Down/Alt+Up") && hints.contains("Ctrl+Shift+F search"), "{hints}");
+            assert!(!hints.contains('⌘') && !hints.contains('⌥'), "no Mac glyphs on Linux: {hints}");
+        }
     }
 
     #[test]
@@ -1584,7 +1610,7 @@ mod tests {
         assert_eq!(model(&view, &vcx, |m| m.total()), 3, "the new entry appears live");
 
         // ⌘F, then a query: the entries narrow, the subtitle counts them.
-        vcx.simulate_keystrokes("cmd-f");
+        vcx.simulate_keystrokes(&crate::keys::test_keys::app_spec("cmd-f"));
         view.update_in(&mut vcx, |v, window, cx| {
             assert!(v.search_focused(window, cx), "⌘F puts the keyboard in the search");
             v.search_for("board", window, cx);

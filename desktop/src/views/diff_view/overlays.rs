@@ -171,11 +171,13 @@ impl DiffView {
             DraftTarget::Review { event } => review_title(*event),
         };
         let reviewing = matches!(draft.target, DraftTarget::Review { .. });
+        // ⌃J on macOS, Ctrl+J on Linux: the same key either way.
+        let new_line = if crate::keys::MAC { "⌃J" } else { "Ctrl+J" };
         let hint = match (reviewing, draft.inserting) {
-            (true, true) => "Tab verdict · ↵ submit · ⌃J new line · Esc motions",
-            (true, false) => "Tab verdict · ↵ submit · i insert · Esc cancel",
-            (false, true) => "↵ save · ⌃J new line · Esc motions",
-            (false, false) => "↵ save · i insert · Esc cancel",
+            (true, true) => format!("Tab verdict · ↵ submit · {new_line} new line · Esc motions"),
+            (true, false) => "Tab verdict · ↵ submit · i insert · Esc cancel".to_string(),
+            (false, true) => format!("↵ save · {new_line} new line · Esc motions"),
+            (false, false) => "↵ save · i insert · Esc cancel".to_string(),
         };
         Some(
             div()

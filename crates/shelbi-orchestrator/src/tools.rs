@@ -105,7 +105,7 @@ pub fn app_launch_argv(
     let wt = worktree.to_string_lossy().to_string();
     match role {
         ReviewContentRole::Editor => match shelbi_state::tools::editor_launch(cfg.editor.as_ref(), "") {
-            EditorLaunch::App(app) => Ok(vec!["open".into(), "-a".into(), app.to_string_lossy().into(), wt]),
+            EditorLaunch::App(app) => editor_app_argv(&app, wt),
             EditorLaunch::Pane(_) => Err(Error::Other("the editor setting isn't an app".into())),
         },
         ReviewContentRole::Diff => {
@@ -124,6 +124,16 @@ pub fn app_launch_argv(
             ])
         }
     }
+}
+
+/// The argv that opens the editor app `app` on `worktree`: `open -a` on
+/// macOS; on Linux the desktop entry's own `Exec` line with the worktree as
+/// its file.
+fn editor_app_argv(app: &Path, worktree: String) -> Result<Vec<String>> {
+    if cfg!(target_os = "macos") || !app.extension().is_some_and(|e| e == "desktop") {
+        return Ok(vec!["open".into(), "-a".into(), app.to_string_lossy().into(), worktree]);
+    }
+    shelbi_state::tools::desktop_exec_argv(app, &[worktree]).map_err(Error::Other)
 }
 
 /// The name of `role`'s tool in `cfg`, for a status line or a refusal.

@@ -10,7 +10,11 @@
 //!
 //! Off macOS, and for gpui's test windows (they have no native window),
 //! screen space falls back to the window's own gpui bounds: right for one
-//! display, which is all a test has.
+//! display, which is all a test has. On Linux that fallback means nothing
+//! across windows: Wayland tells a window neither where it is nor where any
+//! other is, and won't place one (every window reports its origin as 0,0).
+//! [`global_positions`] says which kind of platform this is, and the drag
+//! keeps to its own window where there are none.
 //!
 //! A [`NativeWindow`] moves a window by its top-left corner. AppKit tells
 //! gpui of a move as it happens, and gpui's handler needs the app, so a move
@@ -18,6 +22,33 @@
 //! caller runs it from a foreground task ([`NativeWindow::place_later`]).
 
 use gpui::{point, size, App, Bounds, Point, Window};
+
+/// Whether windows share one screen space the app can read and place
+/// windows in: macOS's. Wayland has none (X11 does, but the app runs native
+/// Wayland under Hyprland, and treats Linux alike). A test's app answers as
+/// macOS does unless it says otherwise ([`test_global_positions`]), so the
+/// cross-window drag tests run on both.
+pub fn global_positions() -> bool {
+    #[cfg(test)]
+    {
+        TEST_GLOBAL.with(|g| g.get())
+    }
+    #[cfg(not(test))]
+    {
+        cfg!(target_os = "macos")
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GLOBAL: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Have [`global_positions`] answer `global` on this test's thread.
+#[cfg(test)]
+pub fn test_global_positions(global: bool) {
+    TEST_GLOBAL.with(|g| g.set(global));
+}
 
 /// `window`'s content, in screen space.
 pub fn content_frame(window: &Window) -> Bounds<f32> {
@@ -75,6 +106,7 @@ impl NativeWindow {
 /// `primary_h` tall. No display's edge clamps it: a point above the primary
 /// display (the menu bar's row, or a display arranged above it) is simply
 /// past its top.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the macOS code only
 pub fn appkit_point(at: Point<f32>, primary_h: f64) -> (f64, f64) {
     (f64::from(at.x), primary_h - f64::from(at.y))
 }
@@ -260,7 +292,9 @@ mod imp {
 mod imp {
     use gpui::{Bounds, Point, Window};
 
-    pub type Handle = ();
+    /// No native window to hold off macOS.
+    #[derive(Clone)]
+    pub struct Handle;
 
     pub fn content_frame(_window: &Window) -> Option<Bounds<f32>> {
         None

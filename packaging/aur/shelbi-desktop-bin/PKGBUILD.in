@@ -1,0 +1,56 @@
+# Maintainer: John W. Long <john at johnwlong dot com>
+#
+# Template: scripts/release/render-aur-package.sh fills @PKGVER@ and @SHA256@
+# and writes the PKGBUILD and .SRCINFO the release workflow pushes to the AUR.
+
+pkgname=shelbi-desktop-bin
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Desktop app for Shelbi, the open-source agent orchestrator (prebuilt)'
+arch=('x86_64')
+url='https://github.com/jlong/shelbi'
+license=('MIT')
+# The app runs only against a CLI of its own version (a mismatch stops it at
+# the version check), so the pin keeps the two upgrading together. The rest is
+# what the binary links or loads: X11 and Wayland clients, xkbcommon, Vulkan
+# (wgpu), fontconfig (fc-match, for Omarchy's font), curl (the update check)
+# and git.
+depends=(
+  "shelbi-bin=${pkgver}"
+  'curl'
+  'fontconfig'
+  'gcc-libs'
+  'git'
+  'glibc'
+  'hicolor-icon-theme'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'vulkan-driver'
+  'vulkan-icd-loader'
+  'wayland'
+)
+optdepends=(
+  'xdg-desktop-portal: the folder picker and the desktop appearance settings'
+  'xdg-terminal-exec: open a terminal editor in the default terminal'
+  'xdg-utils: open links, files and folders'
+)
+provides=('shelbi-desktop')
+conflicts=('shelbi-desktop')
+options=('!strip' '!debug')
+source_x86_64=("shelbi-desktop-${pkgver}-x86_64.tar.gz::${url}/releases/download/v${pkgver}/shelbi-desktop_Linux_x86_64.tar.gz")
+sha256sums_x86_64=('@SHA256@')
+
+package() {
+  install -Dm755 shelbi-desktop "${pkgdir}/usr/bin/shelbi-desktop"
+  install -Dm644 dev.shelbi.Desktop.desktop \
+    "${pkgdir}/usr/share/applications/dev.shelbi.Desktop.desktop"
+
+  local size
+  for size in 16 24 32 48 64 128 256 512; do
+    install -Dm644 "icons/hicolor/${size}x${size}/apps/dev.shelbi.Desktop.png" \
+      "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/dev.shelbi.Desktop.png"
+  done
+
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

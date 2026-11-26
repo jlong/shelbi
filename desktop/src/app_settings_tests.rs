@@ -163,20 +163,21 @@ fn each_page_shows_its_controls(cx: &mut TestAppContext) {
     );
     assert!(!s.drawn("settings-font-size") && !s.drawn("settings-open-keys"));
 
-    s.key("ctrl-2");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     assert!(s.drawn("settings-page-keybindings") && s.drawn("settings-open-keys"));
     assert!(!s.drawn("settings-cli-path") && !s.drawn("settings-font-size"));
 
-    s.key("ctrl-3");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     assert!(s.drawn("settings-page-terminal"));
     assert!(
         s.drawn("settings-font-size")
             && s.drawn("settings-font-size-up")
-            && s.drawn("settings-option-Meta")
     );
+    // The Option key setting is macOS's: Linux's Alt is always Meta.
+    assert_eq!(s.drawn("settings-option-Meta"), crate::keys::MAC);
     assert!(!s.drawn("settings-open-keys") && !s.drawn("settings-theme-Auto"));
 
-    s.key("ctrl-8");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
     assert!(s.drawn("settings-page-workflows") && s.drawn("settings-workflows"));
     assert!(s.drawn("workflows-new") && s.drawn("statuses-new") && s.drawn("statuses-edit-yaml"));
     assert!(s.drawn("status-categories"));
@@ -187,12 +188,12 @@ fn each_page_shows_its_controls(cx: &mut TestAppContext) {
 fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("ctrl-3");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     assert_eq!(
         (s.page(), s.selected_row()),
         (Some(SettingsPage::Terminal), Some(SettingsPage::Terminal))
     );
-    s.key("ctrl-2");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
     // ⌃4 to ⌃9 are the project's pages in sidebar order.
     for (key, page) in [
@@ -203,16 +204,16 @@ fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext
         ("ctrl-8", SettingsPage::Workflows),
         ("ctrl-9", SettingsPage::Workspaces),
     ] {
-        s.key(key);
+        s.key(&crate::keys::test_keys::row_spec(key));
         assert_eq!(s.page(), Some(page), "{key}");
     }
-    s.key("ctrl-2");
-    s.key("ctrl-0");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-2"));
+    s.key(&crate::keys::test_keys::row_spec("ctrl-0"));
     assert_eq!(s.page(), Some(SettingsPage::Keybindings), "no page is ⌃0");
     assert!(s.h.take_calls().is_empty(), "no sidebar row opened");
 
     // ⌘N stays the tabs': it opens no page.
-    s.key("cmd-1");
+    s.key(&crate::keys::test_keys::app_spec("cmd-1"));
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
     assert!(s.h.take_calls().is_empty());
 
@@ -220,9 +221,9 @@ fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext
     // to switch to) and ⌃1 the sidebar's first numbered row.
     s.key("escape");
     s.h.take_calls();
-    s.key("cmd-1");
+    s.key(&crate::keys::test_keys::app_spec("cmd-1"));
     assert!(s.h.take_calls().is_empty(), "already on the first tab");
-    s.key("ctrl-1");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-1"));
     let mut calls = Vec::new();
     commands::dispatch_command(
         &CommandKind::FocusWorkspace {
@@ -352,7 +353,7 @@ fn back_and_esc_return_to_the_view_with_its_sidebar_row_selected(cx: &mut TestAp
 fn settings_reopens_on_the_page_last_used(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("ctrl-3");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     s.key("escape");
     s.open_settings();
     assert_eq!(
@@ -414,7 +415,7 @@ fn toggle_sidebar_collapses_the_settings_sidebar(cx: &mut TestAppContext) {
 fn a_typed_letter_in_a_field_stays_the_fields(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("ctrl-3");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     s.click("settings-font-size");
     assert!(!s.window_focused(), "the field has focus");
     s.key("j");
@@ -657,7 +658,7 @@ fn browse_saves_an_app_and_refuses_what_isnt_a_tool(cx: &mut TestAppContext) {
 
 /// The Terminal page's view, with `config.yaml` "read" as `cfg`.
 fn terminal_page(s: &mut Settings, cfg: shelbi_state::UserConfig) -> Entity<SettingsView> {
-    s.key("ctrl-3");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     let view = s.read(|w, _| match &w.route {
         Route::Settings(view) => view.clone(),
         _ => panic!("settings is open"),
@@ -682,10 +683,10 @@ fn the_terminal_page_edits_colors_live_saves_them_and_resets(cx: &mut TestAppCon
         "settings-ansi-white-bold",
         "settings-ansi-reset",
         "settings-terminal-preview",
-        "settings-option-Meta",
     ] {
         assert!(s.drawn(selector), "{selector}");
     }
+    assert_eq!(s.drawn("settings-option-Meta"), crate::keys::MAC, "the Option key setting is macOS's");
     let default_red = s.read(|_, cx| cx.global::<crate::theme::Theme>().terminal.ansi[1]);
     let text = |s: &mut Settings, slot| s.read(|_, cx| view.read(cx).color_text(slot, cx));
     assert_eq!(text(&mut s, 1), crate::elements::terminal::colors::hex(default_red));
@@ -812,7 +813,7 @@ impl Settings {
     fn open_keybindings(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("ctrl-2");
+        s.key(&crate::keys::test_keys::row_spec("ctrl-2"));
         s
     }
 
@@ -891,24 +892,24 @@ fn a_capture_takes_the_windows_own_chords_and_esc_only_cancels(cx: &mut TestAppC
 
     // ⌃1, the General page's chord, is the capture's while it is open.
     s.click("keybinding-sidebar-nav_up-key-0");
-    s.key("ctrl-1");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-1"));
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
     let nav_up = shelbi_state::keymap::Action::Sidebar(SidebarAction::NavUp);
     let chords: Vec<String> = s.page_read(|p| p.state().chords(nav_up).iter().map(|c| c.canonical()).collect());
-    assert_eq!(chords, ["ctrl-1", "up"]);
+    assert_eq!(chords, [crate::keys::test_keys::row_spec("ctrl-1").as_str(), "up"]);
     // Closed again, ⌃1 is the user's now (a bound row chord stays theirs);
     // an unbound one is a page chord once more.
-    s.key("ctrl-1");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-1"));
     assert_eq!(s.page(), Some(SettingsPage::Keybindings), "⌃1 is Move up's now");
-    s.key("ctrl-3");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     assert_eq!(s.page(), Some(SettingsPage::Terminal));
 
     // A capture left open by a click on another page's row ends with it.
-    s.key("ctrl-2");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     s.click("keybinding-sidebar-nav_up-key-0");
     s.click("settings-nav-terminal");
     assert!(s.page_read(|p| p.state().capture().is_none()));
-    s.key("ctrl-2");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     assert_eq!(s.page(), Some(SettingsPage::Keybindings), "⌃2 reaches the window");
 }
 
@@ -990,7 +991,7 @@ fn the_search_clear_button_shows_with_a_query_and_clears_it(cx: &mut TestAppCont
 
 /// The General page's view, with `config.yaml` "read" as `cfg`.
 fn general_page(s: &mut Settings, cfg: shelbi_state::UserConfig) -> Entity<SettingsView> {
-    s.key("ctrl-1");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-1"));
     let view = s.read(|w, _| match &w.route {
         Route::Settings(view) => view.clone(),
         _ => panic!("settings is open"),
@@ -1289,6 +1290,22 @@ fn reduce_transparency_makes_the_window_opaque_and_disables_the_sliders(cx: &mut
     assert!(!s.read(|_, cx| opacity.read(cx).is_disabled()));
 }
 
+/// On Linux the compositor blurs (Hyprland's `decoration:blur`), at a radius
+/// the app can't set: Settings shows the transparency slider and no blur one.
+#[gpui::test]
+fn a_compositor_blur_leaves_only_the_transparency_slider(cx: &mut TestAppContext) {
+    crate::platform::blur::test_radius_adjustable(false);
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let mut cfg = shelbi_state::UserConfig::default();
+    cfg.desktop.window_opacity = Some(80);
+    general_page(&mut s, cfg);
+    assert!(s.drawn("settings-window-opacity"));
+    assert!(!s.drawn("settings-window-blur"), "the compositor's radius, not ours");
+    assert_eq!(theme_opacity(&mut s), 0.8, "the window is still translucent");
+    crate::platform::blur::test_radius_adjustable(true);
+}
+
 // ---- Settings ▸ Workflows (`dt-wf-settings-index`) -------------------------
 
 use crate::views::workflows::WorkflowsPage;
@@ -1300,7 +1317,7 @@ impl Settings {
     fn open_workflows(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("ctrl-8");
+        s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
         let page = s.workflows();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.settle();
@@ -1517,7 +1534,7 @@ impl Settings {
     fn open_orchestrator(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("ctrl-5");
+        s.key(&crate::keys::test_keys::row_spec("ctrl-5"));
         let page = s.orchestrator();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.saved();
@@ -1609,7 +1626,7 @@ impl Settings {
     fn open_properties(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("ctrl-4");
+        s.key(&crate::keys::test_keys::row_spec("ctrl-4"));
         let page = s.properties();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.saved();
@@ -1701,7 +1718,7 @@ impl Settings {
     fn open_issues(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("ctrl-7");
+        s.key(&crate::keys::test_keys::row_spec("ctrl-7"));
         let page = s.issues();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.saved();
@@ -2029,7 +2046,7 @@ fn the_editor_takes_the_window_without_the_sidebar(cx: &mut TestAppContext) {
 
     // ⌘N doesn't switch pages under it; Back returns to the page, the
     // sidebar with it.
-    s.key("ctrl-1");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-1"));
     assert!(s.drawn("workflow-editor"));
     s.click("workflow-editor-back");
     assert!(!s.drawn("workflow-editor") && s.drawn("settings-workflows") && s.drawn("column-settings"));
@@ -3071,7 +3088,9 @@ fn the_canvas_pans_zooms_and_fits(cx: &mut TestAppContext) {
 
     // ⌘-scroll zooms about the pointer: the node under it stays put.
     let review = s.center("builder-node-review");
-    s.scroll(review, 0.0, 50.0, Modifiers::command());
+    // (Ctrl-scroll on Linux.)
+    let zoom = if crate::keys::MAC { Modifiers::command() } else { Modifiers::control() };
+    s.scroll(review, 0.0, 50.0, zoom);
     let zoomed = s.bounds("builder-node-review").unwrap();
     assert!(zoomed.size.width > px(216.0));
     assert!(zoomed.contains(&review));
@@ -3199,7 +3218,7 @@ impl Settings {
     fn open_agents(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("ctrl-6");
+        s.key(&crate::keys::test_keys::row_spec("ctrl-6"));
         let page = s.agents();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.settle();
@@ -3506,7 +3525,7 @@ fn the_agent_editor_takes_the_window_without_the_sidebar(cx: &mut TestAppContext
 
     // ⌘N doesn't switch pages under it; Back returns to the page, the
     // sidebar with it.
-    s.key("ctrl-1");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-1"));
     assert!(s.drawn("agent-editor"));
     s.click("agent-editor-back");
     assert!(!s.drawn("agent-editor") && s.drawn("settings-agents") && s.drawn("column-settings"));
@@ -3737,14 +3756,14 @@ fn assignment_rows_open_their_workflow_and_the_link_shows_workflows(cx: &mut Tes
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
 
     // Manage assignments in Workflows.
-    s.key("ctrl-6");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-6"));
     s.click("agent-edit-developer");
     s.click("agent-workflows-link");
     assert!(!s.drawn("agent-editor") && s.drawn("settings-workflows"));
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
 
     // With unsaved edits, a row asks first.
-    s.key("ctrl-6");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-6"));
     s.click("agent-edit-developer");
     s.edit_agent(|e, window, cx| e.make(AgentChange::Permissions(Some("plan".into())), window, cx));
     s.click("agent-assignment-task-in-progress");
@@ -3843,7 +3862,7 @@ impl Settings {
     fn open_workspaces(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("ctrl-9");
+        s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
         s.load_workspaces();
         s
     }
@@ -3907,10 +3926,10 @@ fn workspaces_sits_last_after_workflows_on_its_own_chord(cx: &mut TestAppContext
     let workflows = s.bounds("settings-nav-workflows").unwrap();
     let workspaces = s.bounds("settings-nav-workspaces").unwrap();
     assert!(label.bottom() < issues.top() && issues.bottom() < workflows.top() && workflows.bottom() < workspaces.top());
-    s.key("ctrl-9");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workspaces), Some(SettingsPage::Workspaces)));
     assert!(s.drawn("settings-page-workspaces") && s.drawn("workspaces-heading"));
-    s.key("ctrl-3");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     assert_eq!(s.page(), Some(SettingsPage::Terminal), "⌃3 stays Terminal's");
     s.click("settings-nav-workspaces");
     assert_eq!(s.page(), Some(SettingsPage::Workspaces));
@@ -3926,7 +3945,7 @@ fn the_workspaces_page_lists_the_pool_then_its_machines(cx: &mut TestAppContext)
     write_pool("alpha", POOL);
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("ctrl-9");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
     assert!(s.drawn("workspaces-loading"), "loading until the read lands");
     s.load_workspaces();
     assert!(!s.drawn("workspaces-loading"));
@@ -3979,7 +3998,7 @@ fn a_remote_that_cant_be_reached_keeps_its_configuration(cx: &mut TestAppContext
     assert!(s.drawn("machine-dir-Build server") && s.drawn("machine-configure-Build server"));
     assert!(s.drawn("workspace-row-charlie"), "its workspaces stay listed");
     assert_eq!(status(&s), "Unreachable");
-    s.key("ctrl-8");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
     assert_eq!(s.page(), Some(SettingsPage::Workflows), "the rest of Settings carries on");
 }
 
@@ -4388,7 +4407,7 @@ fn the_keyboard_moves_through_the_form(cx: &mut TestAppContext) {
     s.key("shift-tab");
     s.key("shift-tab");
     assert!(s.form_focused(MachineField::Name));
-    s.key("ctrl-8");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
     assert_eq!(s.page(), Some(SettingsPage::Workspaces), "the sidebar's chords wait for the form");
     assert!(s.machine_form().is_some());
 }
@@ -4934,7 +4953,7 @@ fn the_dialog_holds_the_keyboard_until_it_closes(cx: &mut TestAppContext) {
     s.key("shift-tab");
     assert_eq!(s.dialog_focus(), Ctl::Submit);
     // The settings sidebar's chords wait.
-    s.key("ctrl-8");
+    s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
     assert_eq!(s.page(), Some(SettingsPage::Workspaces));
     assert!(s.dialog().is_some());
     // The machine picker from the keyboard.

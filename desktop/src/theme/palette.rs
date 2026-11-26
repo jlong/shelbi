@@ -791,23 +791,279 @@ pub const CONTRAST_EXCEPTIONS: &[(&str, &str)] = &[
     ("light", "primary_label on"),
 ];
 
+/// WCAG AA for text.
+pub(in crate::theme) const AA: f64 = 4.5;
+/// WCAG 1.4.11 for icons, focus rings and a field's edge.
+pub(in crate::theme) const NON_TEXT: f64 = 3.0;
+
+/// One color drawn on another, and the ratio it must reach.
+#[derive(Debug, Clone)]
+pub(in crate::theme) struct Pairing {
+    /// `fg on bg`, as the contrast exceptions name it.
+    pub what: String,
+    pub fg: Rgba,
+    /// Opaque: the background flattened onto what it sits on.
+    pub bg: Rgba,
+    pub min: f64,
+}
+
+impl Pairing {
+    pub fn ratio(&self) -> f64 {
+        ratio(self.fg, self.bg)
+    }
+
+    /// The role drawn in front: the first word of `what` (a band's dismiss
+    /// button is drawn in `foreground`).
+    pub fn fg_role(&self) -> &str {
+        let what = self.what.strip_prefix("band: ").unwrap_or(&self.what);
+        match what.split(" on ").next().unwrap_or(what) {
+            "dismiss" => "foreground",
+            role => role,
+        }
+    }
+}
+
+fn flatten(c: Rgba, under: Rgba) -> Rgba {
+    Rgba {
+        rgb: c.over(under.rgb),
+        a: 0xff,
+    }
+}
+
+fn ratio(fg: Rgba, bg: Rgba) -> f64 {
+    fg.over(bg.rgb).contrast_ratio(bg.rgb)
+}
+
+/// Every pairing the desktop draws: what is drawn on what, the two colors
+/// (the background flattened onto what it sits on) and the minimum ratio.
+/// The contrast tests walk it, and so does [`super::omarchy`], which moves a
+/// theme's text until every pairing meets its minimum.
+pub(in crate::theme) fn pairing_list(p: &Palette) -> Vec<Pairing> {
+    let mut out = Vec::new();
+    let mut check = |what: String, fg: Rgba, bg: Rgba, min: f64| {
+        debug_assert_eq!(bg.a, 0xff, "{what}: the background must be flattened");
+        out.push(Pairing { what, fg, bg, min });
+    };
+    let surfaces = [
+        ("canvas", p.canvas),
+        ("sidebar", p.sidebar),
+        ("card", p.card),
+        ("raised", p.raised),
+    ];
+    // Rows and chips sit on a surface; check them over the surfaces
+    // they're drawn on.
+    let mut backgrounds: Vec<(String, Rgba)> =
+        surfaces.iter().map(|(n, c)| (n.to_string(), *c)).collect();
+    for (name, fill) in [("background", p.background), ("row_selected", p.row_selected)] {
+        for (sname, s) in [("sidebar", p.sidebar), ("canvas", p.canvas), ("raised", p.raised)] {
+            backgrounds.push((format!("{name} over {sname}"), flatten(fill, s)));
+        }
+    }
+    for (name, fg) in [
+        ("text_loud", p.text_loud),
+        ("foreground", p.foreground),
+        ("gray", p.gray),
+        ("muted", p.muted),
+    ] {
+        for (bname, bg) in &backgrounds {
+            check(format!("{name} on {bname}"), fg, *bg, AA);
+        }
+    }
+    for (name, fg) in [
+        ("link", p.link),
+        ("success", p.success),
+        ("warning", p.warning),
+        ("info", p.info),
+        ("error", p.error),
+        ("green", p.green),
+        ("yellow", p.yellow),
+        ("blue", p.blue),
+        ("magenta", p.magenta),
+        ("cyan", p.cyan),
+        ("dark_gray", p.dark_gray),
+        ("red", p.red),
+    ] {
+        for (sname, s) in surfaces {
+            check(format!("{name} on {sname}"), fg, s, AA);
+        }
+    }
+    // The log's titles, on the canvas and on its selected row; the
+    // pickers' labels on their fill.
+    check("log_text on canvas".into(), p.log_text, p.canvas, AA);
+    check(
+        "log_text on row_selected over canvas".into(),
+        p.log_text,
+        flatten(p.row_selected, p.canvas),
+        AA,
+    );
+    check(
+        "log_text on search over canvas".into(),
+        p.log_text,
+        flatten(p.search, p.canvas),
+        AA,
+    );
+    // A Machines row's runner and task, on the canvas (the selected
+    // row's band is checked below).
+    check("table_text on canvas".into(), p.table_text, p.canvas, AA);
+    // A copyable command's text on its own fill.
+    check("code_fg on code_bg".into(), p.code_fg, p.code_bg, AA);
+    // The Machines states and reachability: drawn on the canvas only.
+    for (name, fg) in [("theme_green", p.theme_green), ("theme_cyan", p.theme_cyan)] {
+        check(format!("{name} on canvas"), fg, p.canvas, AA);
+    }
+    // A chip's text on its tint, over a card and the canvas.
+    for (name, fg, tint) in [
+        ("green on green_tint", p.green, p.green_tint),
+        ("yellow on yellow_tint", p.yellow, p.yellow_tint),
+        ("cyan on cyan_tint", p.cyan, p.cyan_tint),
+        ("blue on blue_tint", p.blue, p.blue_tint),
+        ("magenta on magenta_tint", p.magenta, p.magenta_tint),
+        ("red on red_tint", p.red, p.red_tint),
+        ("text_loud on notice", p.text_loud, p.notice),
+    ] {
+        for (sname, s) in [("card", p.card), ("canvas", p.canvas)] {
+            check(format!("{name} over {sname}"), fg, flatten(tint, s), AA);
+        }
+    }
+    check(
+        "workflow_badge_text on workflow_badge".into(),
+        p.workflow_badge_text,
+        p.workflow_badge,
+        AA,
+    );
+    // Buttons: the label on every state's fill, over each surface.
+    for (sname, s) in [("canvas", p.canvas), ("sidebar", p.sidebar), ("raised", p.raised)] {
+        for (label, fg, fills) in [
+            (
+                "text_loud",
+                p.text_loud,
+                [p.background, p.background_hover, p.background_active],
+            ),
+            (
+                "primary_label",
+                p.primary_label,
+                [p.primary_fill, p.primary_fill_hover, p.primary_fill_active],
+            ),
+            (
+                "success_label",
+                p.success_label,
+                [p.success_fill, p.success_fill_hover, p.success_fill_active],
+            ),
+            (
+                "error",
+                p.error,
+                [p.danger_fill, p.danger_fill_hover, p.danger_fill_active],
+            ),
+        ] {
+            for (state, fill) in ["rest", "hover", "pressed"].into_iter().zip(fills) {
+                check(format!("{label} on {state} button over {sname}"), fg, flatten(fill, s), AA);
+            }
+        }
+        let segment = flatten(p.selection, s);
+        check(format!("text_loud on selection over {sname}"), p.text_loud, segment, AA);
+        check(format!("gray on keycap over {sname}"), p.gray, flatten(p.keycap, s), AA);
+        // Non-text (WCAG 1.4.11): icons, the focus ring, a field's edge.
+        check(format!("icon on {sname}"), p.icon, s, NON_TEXT);
+        check(
+            format!("button_icon on rest button over {sname}"),
+            p.button_icon,
+            flatten(p.background, s),
+            NON_TEXT,
+        );
+        check(format!("focus_ring on {sname}"), p.focus_ring, s, NON_TEXT);
+        check(format!("success_focus_ring on {sname}"), p.success_focus_ring, s, NON_TEXT);
+        check(format!("danger_focus_ring on {sname}"), p.danger_focus_ring, s, NON_TEXT);
+        check(format!("input_border on {sname}"), p.input_border, s, NON_TEXT);
+    }
+    // The board toolbar: `Filter:` and the search's placeholder on its
+    // band, a chip's label and icon on each fill over it.
+    let band = flatten(p.toolbar, p.canvas);
+    check("form_hint on toolbar".into(), p.form_hint, band, AA);
+    check("form_hint on search box over toolbar".into(), p.form_hint, flatten(p.background, band), AA);
+    check("icon on search box over toolbar".into(), p.icon, flatten(p.background, band), NON_TEXT);
+    check("button_icon on rest button over toolbar".into(), p.button_icon, flatten(p.background, band), NON_TEXT);
+    for (state, fill) in ["rest", "hover", "pressed"]
+        .into_iter()
+        .zip([p.background, p.background_hover, p.background_active])
+    {
+        check(format!("text_loud on {state} button over toolbar"), p.text_loud, flatten(fill, band), AA);
+    }
+    for (state, fill) in ["rest", "hover", "pressed"]
+        .into_iter()
+        .zip([p.select_fill, p.select_fill_hover, p.select_fill_active])
+    {
+        check(format!("select_label on {state} select over toolbar"), p.select_label, flatten(fill, band), AA);
+    }
+    // The form components, on the canvas they sit on: a textbox's value
+    // in its well, an unselected segment on the track, a checkbox's
+    // label, a helper and a placeholder.
+    let track = flatten(p.search, p.canvas);
+    check("form_text on textbox".into(), p.form_text, p.textbox, AA);
+    check("form_text on segment track".into(), p.form_text, track, AA);
+    check("form_text on canvas".into(), p.form_text, p.canvas, AA);
+    check("text_loud on selected segment".into(), p.text_loud, p.canvas, AA);
+    check("form_hint on canvas".into(), p.form_hint, p.canvas, AA);
+    check("form_hint on textbox".into(), p.form_hint, p.textbox, AA);
+    // Non-text: a textbox's and a box's edge, a checked box and its mark.
+    check("input_border on textbox".into(), p.input_border, p.textbox, NON_TEXT);
+    check("check_border on textbox".into(), p.check_border, p.textbox, NON_TEXT);
+    check("check_fill on canvas".into(), p.check_fill, p.canvas, NON_TEXT);
+    check("text_on_color on check_fill".into(), p.text_on_color, p.check_fill, NON_TEXT);
+    // The selected Machines row: every cell on the selection band.
+    let band = flatten(p.selection, p.canvas);
+    for (name, fg) in [
+        ("table_text", p.table_text),
+        ("muted", p.muted),
+        ("dark_gray", p.dark_gray),
+        ("theme_green", p.theme_green),
+        ("theme_cyan", p.theme_cyan),
+    ] {
+        check(format!("{name} on selection over canvas"), fg, band, AA);
+    }
+    // The Zen pill paints the canvas under its tint (the Navigation
+    // component's measured fill), so "Zen mode on" reads on that.
+    check(
+        "success on zen over canvas".into(),
+        p.success,
+        flatten(p.zen, p.canvas),
+        AA,
+    );
+    check(
+        "accent on nav_selected".into(),
+        p.accent,
+        p.nav_selected,
+        NON_TEXT,
+    );
+    // The notice bands along the foot (`Theme::band`: the tint laid on
+    // the opaque canvas): the message, loud on every band, the update
+    // bar's "Upgrade with", each band's icon and the dismiss buttons'.
+    // Their labelled buttons sit on the canvas (`style::band_button`),
+    // so the button checks over the canvas above cover them.
+    for (name, tint) in [
+        ("notice", p.notice),
+        ("yellow_tint", p.yellow_tint),
+        ("red_tint", p.red_tint),
+        ("blue_tint", p.blue_tint),
+        ("workflow_badge", p.workflow_badge),
+    ] {
+        let band = flatten(tint, p.canvas);
+        check(format!("band: text_loud on {name}"), p.text_loud, band, AA);
+        check(format!("band: dismiss on {name}"), p.foreground, band, NON_TEXT);
+    }
+    check("band: warning on notice".into(), p.warning, flatten(p.notice, p.canvas), NON_TEXT);
+    check("band: blue on blue_tint".into(), p.blue, flatten(p.blue_tint, p.canvas), NON_TEXT);
+    check(
+        "band: foreground on blue_tint".into(),
+        p.foreground,
+        flatten(p.blue_tint, p.canvas),
+        AA,
+    );
+    out
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-
-    const AA: f64 = 4.5;
-    const NON_TEXT: f64 = 3.0;
-
-    fn flatten(c: Rgba, under: Rgba) -> Rgba {
-        Rgba {
-            rgb: c.over(under.rgb),
-            a: 0xff,
-        }
-    }
-
-    fn ratio(fg: Rgba, bg: Rgba) -> f64 {
-        fg.over(bg.rgb).contrast_ratio(bg.rgb)
-    }
 
     fn theme_name(p: &Palette) -> &'static str {
         match p.appearance {
@@ -818,226 +1074,7 @@ pub(super) mod tests {
 
     /// Every pairing the desktop draws, as `(what on what, ratio, minimum)`.
     pub(in crate::theme) fn pairings(p: &Palette) -> Vec<(String, f64, f64)> {
-        let mut out = Vec::new();
-        let mut check = |what: String, fg: Rgba, bg: Rgba, min: f64| {
-            assert_eq!(bg.a, 0xff, "{what}: the background must be flattened");
-            out.push((what, ratio(fg, bg), min));
-        };
-        let surfaces = [
-            ("canvas", p.canvas),
-            ("sidebar", p.sidebar),
-            ("card", p.card),
-            ("raised", p.raised),
-        ];
-        // Rows and chips sit on a surface; check them over the surfaces
-        // they're drawn on.
-        let mut backgrounds: Vec<(String, Rgba)> =
-            surfaces.iter().map(|(n, c)| (n.to_string(), *c)).collect();
-        for (name, fill) in [("background", p.background), ("row_selected", p.row_selected)] {
-            for (sname, s) in [("sidebar", p.sidebar), ("canvas", p.canvas), ("raised", p.raised)] {
-                backgrounds.push((format!("{name} over {sname}"), flatten(fill, s)));
-            }
-        }
-        for (name, fg) in [
-            ("text_loud", p.text_loud),
-            ("foreground", p.foreground),
-            ("gray", p.gray),
-            ("muted", p.muted),
-        ] {
-            for (bname, bg) in &backgrounds {
-                check(format!("{name} on {bname}"), fg, *bg, AA);
-            }
-        }
-        for (name, fg) in [
-            ("link", p.link),
-            ("success", p.success),
-            ("warning", p.warning),
-            ("info", p.info),
-            ("error", p.error),
-            ("green", p.green),
-            ("yellow", p.yellow),
-            ("blue", p.blue),
-            ("magenta", p.magenta),
-            ("cyan", p.cyan),
-            ("dark_gray", p.dark_gray),
-            ("red", p.red),
-        ] {
-            for (sname, s) in surfaces {
-                check(format!("{name} on {sname}"), fg, s, AA);
-            }
-        }
-        // The log's titles, on the canvas and on its selected row; the
-        // pickers' labels on their fill.
-        check("log_text on canvas".into(), p.log_text, p.canvas, AA);
-        check(
-            "log_text on row_selected over canvas".into(),
-            p.log_text,
-            flatten(p.row_selected, p.canvas),
-            AA,
-        );
-        check(
-            "log_text on search over canvas".into(),
-            p.log_text,
-            flatten(p.search, p.canvas),
-            AA,
-        );
-        // A Machines row's runner and task, on the canvas (the selected
-        // row's band is checked below).
-        check("table_text on canvas".into(), p.table_text, p.canvas, AA);
-        // A copyable command's text on its own fill.
-        check("code_fg on code_bg".into(), p.code_fg, p.code_bg, AA);
-        // The Machines states and reachability: drawn on the canvas only.
-        for (name, fg) in [("theme_green", p.theme_green), ("theme_cyan", p.theme_cyan)] {
-            check(format!("{name} on canvas"), fg, p.canvas, AA);
-        }
-        // A chip's text on its tint, over a card and the canvas.
-        for (name, fg, tint) in [
-            ("green on green_tint", p.green, p.green_tint),
-            ("yellow on yellow_tint", p.yellow, p.yellow_tint),
-            ("cyan on cyan_tint", p.cyan, p.cyan_tint),
-            ("blue on blue_tint", p.blue, p.blue_tint),
-            ("magenta on magenta_tint", p.magenta, p.magenta_tint),
-            ("red on red_tint", p.red, p.red_tint),
-            ("text_loud on notice", p.text_loud, p.notice),
-        ] {
-            for (sname, s) in [("card", p.card), ("canvas", p.canvas)] {
-                check(format!("{name} over {sname}"), fg, flatten(tint, s), AA);
-            }
-        }
-        check(
-            "workflow_badge_text on workflow_badge".into(),
-            p.workflow_badge_text,
-            p.workflow_badge,
-            AA,
-        );
-        // Buttons: the label on every state's fill, over each surface.
-        for (sname, s) in [("canvas", p.canvas), ("sidebar", p.sidebar), ("raised", p.raised)] {
-            for (label, fg, fills) in [
-                (
-                    "text_loud",
-                    p.text_loud,
-                    [p.background, p.background_hover, p.background_active],
-                ),
-                (
-                    "primary_label",
-                    p.primary_label,
-                    [p.primary_fill, p.primary_fill_hover, p.primary_fill_active],
-                ),
-                (
-                    "success_label",
-                    p.success_label,
-                    [p.success_fill, p.success_fill_hover, p.success_fill_active],
-                ),
-                (
-                    "error",
-                    p.error,
-                    [p.danger_fill, p.danger_fill_hover, p.danger_fill_active],
-                ),
-            ] {
-                for (state, fill) in ["rest", "hover", "pressed"].into_iter().zip(fills) {
-                    check(format!("{label} on {state} button over {sname}"), fg, flatten(fill, s), AA);
-                }
-            }
-            let segment = flatten(p.selection, s);
-            check(format!("text_loud on selection over {sname}"), p.text_loud, segment, AA);
-            check(format!("gray on keycap over {sname}"), p.gray, flatten(p.keycap, s), AA);
-            // Non-text (WCAG 1.4.11): icons, the focus ring, a field's edge.
-            check(format!("icon on {sname}"), p.icon, s, NON_TEXT);
-            check(
-                format!("button_icon on rest button over {sname}"),
-                p.button_icon,
-                flatten(p.background, s),
-                NON_TEXT,
-            );
-            check(format!("focus_ring on {sname}"), p.focus_ring, s, NON_TEXT);
-            check(format!("success_focus_ring on {sname}"), p.success_focus_ring, s, NON_TEXT);
-            check(format!("danger_focus_ring on {sname}"), p.danger_focus_ring, s, NON_TEXT);
-            check(format!("input_border on {sname}"), p.input_border, s, NON_TEXT);
-        }
-        // The board toolbar: `Filter:` and the search's placeholder on its
-        // band, a chip's label and icon on each fill over it.
-        let band = flatten(p.toolbar, p.canvas);
-        check("form_hint on toolbar".into(), p.form_hint, band, AA);
-        check("form_hint on search box over toolbar".into(), p.form_hint, flatten(p.background, band), AA);
-        check("icon on search box over toolbar".into(), p.icon, flatten(p.background, band), NON_TEXT);
-        check("button_icon on rest button over toolbar".into(), p.button_icon, flatten(p.background, band), NON_TEXT);
-        for (state, fill) in ["rest", "hover", "pressed"]
-            .into_iter()
-            .zip([p.background, p.background_hover, p.background_active])
-        {
-            check(format!("text_loud on {state} button over toolbar"), p.text_loud, flatten(fill, band), AA);
-        }
-        for (state, fill) in ["rest", "hover", "pressed"]
-            .into_iter()
-            .zip([p.select_fill, p.select_fill_hover, p.select_fill_active])
-        {
-            check(format!("select_label on {state} select over toolbar"), p.select_label, flatten(fill, band), AA);
-        }
-        // The form components, on the canvas they sit on: a textbox's value
-        // in its well, an unselected segment on the track, a checkbox's
-        // label, a helper and a placeholder.
-        let track = flatten(p.search, p.canvas);
-        check("form_text on textbox".into(), p.form_text, p.textbox, AA);
-        check("form_text on segment track".into(), p.form_text, track, AA);
-        check("form_text on canvas".into(), p.form_text, p.canvas, AA);
-        check("text_loud on selected segment".into(), p.text_loud, p.canvas, AA);
-        check("form_hint on canvas".into(), p.form_hint, p.canvas, AA);
-        check("form_hint on textbox".into(), p.form_hint, p.textbox, AA);
-        // Non-text: a textbox's and a box's edge, a checked box and its mark.
-        check("input_border on textbox".into(), p.input_border, p.textbox, NON_TEXT);
-        check("check_border on textbox".into(), p.check_border, p.textbox, NON_TEXT);
-        check("check_fill on canvas".into(), p.check_fill, p.canvas, NON_TEXT);
-        check("text_on_color on check_fill".into(), p.text_on_color, p.check_fill, NON_TEXT);
-        // The selected Machines row: every cell on the selection band.
-        let band = flatten(p.selection, p.canvas);
-        for (name, fg) in [
-            ("table_text", p.table_text),
-            ("muted", p.muted),
-            ("dark_gray", p.dark_gray),
-            ("theme_green", p.theme_green),
-            ("theme_cyan", p.theme_cyan),
-        ] {
-            check(format!("{name} on selection over canvas"), fg, band, AA);
-        }
-        // The Zen pill paints the canvas under its tint (the Navigation
-        // component's measured fill), so "Zen mode on" reads on that.
-        check(
-            "success on zen over canvas".into(),
-            p.success,
-            flatten(p.zen, p.canvas),
-            AA,
-        );
-        check(
-            "accent on nav_selected".into(),
-            p.accent,
-            p.nav_selected,
-            NON_TEXT,
-        );
-        // The notice bands along the foot (`Theme::band`: the tint laid on
-        // the opaque canvas): the message, loud on every band, the update
-        // bar's "Upgrade with", each band's icon and the dismiss buttons'.
-        // Their labelled buttons sit on the canvas (`style::band_button`),
-        // so the button checks over the canvas above cover them.
-        for (name, tint) in [
-            ("notice", p.notice),
-            ("yellow_tint", p.yellow_tint),
-            ("red_tint", p.red_tint),
-            ("blue_tint", p.blue_tint),
-            ("workflow_badge", p.workflow_badge),
-        ] {
-            let band = flatten(tint, p.canvas);
-            check(format!("band: text_loud on {name}"), p.text_loud, band, AA);
-            check(format!("band: dismiss on {name}"), p.foreground, band, NON_TEXT);
-        }
-        check("band: warning on notice".into(), p.warning, flatten(p.notice, p.canvas), NON_TEXT);
-        check("band: blue on blue_tint".into(), p.blue, flatten(p.blue_tint, p.canvas), NON_TEXT);
-        check(
-            "band: foreground on blue_tint".into(),
-            p.foreground,
-            flatten(p.blue_tint, p.canvas),
-            AA,
-        );
-        out
+        pairing_list(p).into_iter().map(|x| (x.ratio(), x)).map(|(r, x)| (x.what, r, x.min)).collect()
     }
 
     /// The pairings below their minimum, as exception keys.

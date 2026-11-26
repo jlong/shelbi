@@ -343,6 +343,13 @@ impl WorkspacesPage {
 
 /// A section's heading (`Machines heading`, 2524:10990): the title over its
 /// description, 8pt apart, and the section's button centered beside them.
+/// The Workspaces heading's help line.
+const WORKSPACES_HELP: &str = if crate::keys::MAC {
+    "Give agents their own place to work, on this Mac or another machine."
+} else {
+    "Give agents their own place to work, on this computer or another machine."
+};
+
 fn heading(selector: &'static str, title: &'static str, help: &'static str, button: AnyElement, theme: &Theme) -> Div {
     div()
         .debug_selector(move || selector.into())
@@ -455,7 +462,7 @@ impl WorkspacesPage {
             .child(heading(
                 "workspaces-heading",
                 "Workspaces",
-                "Give agents their own place to work, on this Mac or another machine.",
+                WORKSPACES_HELP,
                 new_workspace.into_any_element(),
                 theme,
             ))

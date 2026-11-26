@@ -3874,14 +3874,14 @@ mod tests {
         assert!(!drawn(&mut cx, "delete-prompt"));
         assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));
         // Esc on the confirm does the same.
-        cx.simulate_keystrokes("cmd-backspace");
+        cx.simulate_keystrokes(&crate::keys::test_keys::app_spec("cmd-backspace"));
         assert!(drawn(&mut cx, "delete-prompt"), "⌘⌫ asks too");
         cx.simulate_keystrokes("escape");
         assert!(!drawn(&mut cx, "delete-prompt"));
         assert!(events.borrow().is_empty());
         assert!(drawn(&mut cx, "task-pane"), "Esc closes the confirm, not the pane");
         // Delete sends the registry's delete.
-        cx.simulate_keystrokes("cmd-backspace");
+        cx.simulate_keystrokes(&crate::keys::test_keys::app_spec("cmd-backspace"));
         click(&mut cx, "delete-confirm");
         assert_eq!(*events.borrow(), vec![CommandKind::DeleteIssue { id: "A".into() }]);
         assert!(!drawn(&mut cx, "delete-prompt"));
@@ -4209,9 +4209,9 @@ mod tests {
         );
 
         // Undo is the editor's.
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes(&crate::keys::test_keys::text_spec("cmd-z"));
         assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Body of A");
-        cx.simulate_keystrokes("cmd-shift-z");
+        cx.simulate_keystrokes(&crate::keys::test_keys::text_spec("cmd-shift-z"));
 
         // Esc hands the keys back to the pane, saving: nothing is reverted.
         cx.simulate_keystrokes("escape");
@@ -4305,7 +4305,7 @@ mod tests {
         let at = title.read_with(&cx, |t, _| t.point_of(0)).unwrap();
         cx.simulate_click(at, gpui::Modifiers::none());
         assert!(drawn(&mut cx, "pane-title-editor"));
-        cx.simulate_keystrokes("cmd-a backspace");
+        cx.simulate_keystrokes(&crate::keys::test_keys::text_spec("cmd-a backspace"));
         assert_eq!(title.read_with(&cx, |t, _| t.text().to_string()), "");
         // Enter moves on to the body; the blank title isn't sent, and says so.
         cx.simulate_keystrokes("enter");
@@ -4324,11 +4324,11 @@ mod tests {
         assert!(drawn(&mut cx, "pane-title-editor"));
         // A pasted line break comes in as a space.
         cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("Renamed\nin one".into())));
-        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes(&crate::keys::test_keys::text_spec("cmd-v"));
         assert!(drawn(&mut cx, "pane-title-editor"));
         cx.simulate_input(" line");
         assert_eq!(title.read_with(&cx, |t, _| t.text().to_string()), "Renamed in one line");
-        cx.simulate_keystrokes("cmd-s");
+        cx.simulate_keystrokes(&crate::keys::test_keys::text_spec("cmd-s"));
         assert_eq!(sent(&view, &cx).last().map(|(_, t, _)| t.clone()), Some(Some("Renamed in one line".into())));
     }
 

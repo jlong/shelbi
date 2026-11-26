@@ -1,8 +1,9 @@
 //! The image menu: a right-click on a Changelog image (a figure in the
 //! column, `views::markdown`, or the lightbox's image,
 //! `views::overlay::lightbox`) opens it at the pointer, over everything.
-//! Its one row, "Download Image…", opens the save panel in `~/Downloads`
-//! with the image's file name ([`file_name`]); saving writes the image's
+//! Its one row, "Download Image…", opens the save panel in the downloads
+//! folder ([`downloads_dir`]) with the image's file name ([`file_name`]);
+//! saving writes the image's
 //! bytes unchanged ([`save`]: a copy of a local file, the downloaded bytes of
 //! a web image), off the UI thread. A failure shows in the window's toast;
 //! Cancel does nothing.
@@ -58,7 +59,8 @@ impl ImageMenu {
 /// (`prompt_for_new_path`); tests answer it themselves.
 pub type SavePanel = std::rc::Rc<dyn Fn(&Path, &str, &mut App) -> LocalBoxFuture<'static, Result<Option<PathBuf>, String>>>;
 
-/// gpui's save panel (`NSSavePanel` on macOS).
+/// gpui's save panel (`NSSavePanel` on macOS, the portal's file chooser on
+/// Linux).
 pub fn system_save_panel() -> SavePanel {
     std::rc::Rc::new(|dir, name, cx| {
         let answer = cx.prompt_for_new_path(dir, Some(name));
@@ -73,10 +75,10 @@ pub fn system_save_panel() -> SavePanel {
     })
 }
 
-/// Where the save panel opens: `~/Downloads` (the home folder if `HOME`
-/// isn't set, which it always is in the app).
+/// Where the save panel opens: `~/Downloads` on macOS, the XDG download
+/// folder on Linux (`platform::os::downloads_dir`).
 pub fn downloads_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from).join("Downloads")
+    crate::platform::os::downloads_dir()
 }
 
 /// The name the save panel offers for `source`: the file's own name, or the
