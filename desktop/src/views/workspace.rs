@@ -171,17 +171,7 @@ impl WorkspaceOps for LiveOps {
         if let Some(host) = self.project.key().host() {
             return Err(shelbi_app::remote_window::local_open_unavailable(host));
         }
-        std::process::Command::new("open")
-            .arg(path)
-            .status()
-            .map_err(|e| format!("couldn't run `open`: {e}"))
-            .and_then(|s| {
-                if s.success() {
-                    Ok(())
-                } else {
-                    Err(format!("`open {path}` exited {s}"))
-                }
-            })
+        super::review::run_open(path)
     }
 }
 

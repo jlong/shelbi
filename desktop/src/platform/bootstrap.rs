@@ -2,9 +2,10 @@
 //! control connection.
 //!
 //! `ResolvingEnv → FindingCli → StartingDaemon → Connecting → Ready`, or
-//! `Failed(kind)` at the step that broke. When discovery finds no CLI and
+//! `Failed(kind)` at the step that broke. When discovery finds no CLI,
 //! nothing says where one should be (no `desktop.cli_path`, a readable
-//! `config.yaml`), `FindingCli` is followed by `InstallingCli` (the release
+//! `config.yaml`) and the OS lets the app install one (macOS; on Linux the
+//! package provides it), `FindingCli` is followed by `InstallingCli` (the release
 //! matching the app, [`install`]) and discovery runs again; a configured
 //! path that isn't there is reported, never installed over. [`run`] is the machine, written
 //! against the [`Platform`] seam so every path is tested with a scripted
@@ -136,6 +137,12 @@ pub enum ConnectError {
 
 /// What bootstrap needs from the machine.
 pub trait Platform {
+    /// Whether a missing CLI may be installed by the app
+    /// ([`super::os::INSTALLS_CLI`]: on macOS; on Linux the package
+    /// provides it, and a missing one is reported).
+    fn installs_cli(&self) -> bool {
+        super::os::INSTALLS_CLI
+    }
     /// The login-shell environment for the app's children.
     fn login_env(&mut self) -> Env;
     /// `desktop.cli_path` from `config.yaml`.
@@ -178,7 +185,7 @@ pub fn run(
     enter(BootstrapState::FindingCli);
     let cli = match find_cli(platform, &env) {
         Ok(cli) => cli,
-        Err(not_found) if !may_install(&not_found) => {
+        Err(not_found) if !platform.installs_cli() || !may_install(&not_found) => {
             return enter(BootstrapState::Failed(Failure::CliNotFound(not_found)))
         }
         Err(_) => {
@@ -452,6 +459,13 @@ impl Bootstrap {
 mod tests {
     use super::*;
 
+    /// Where the scripted machine's CLI is: this OS's first known install
+    /// location (Homebrew on macOS, `~/.local/bin` on Linux), off the
+    /// scripted login `PATH`.
+    fn known_cli() -> PathBuf {
+        discovery::known_locations(Some(Path::new("/Users/me")))[0].join(discovery::CLI_NAME)
+    }
+
     /// A scripted machine: every answer is a field.
     struct Scripted {
         path: String,
@@ -466,6 +480,9 @@ mod tests {
         /// path becomes executable.
         installs: Vec<Result<PathBuf, InstallError>>,
         installed: usize,
+        /// [`Platform::installs_cli`]: on, as on macOS, unless a test turns
+        /// it off (Linux).
+        may_install: bool,
     }
 
     impl Scripted {
@@ -473,7 +490,7 @@ mod tests {
             Self {
                 path: "/usr/bin:/bin".into(),
                 setting: Ok(None),
-                executables: vec![PathBuf::from("/opt/homebrew/bin/shelbi")],
+                executables: vec![known_cli()],
                 cli_version: Some(daemon_version.into()),
                 cli_protocol: Some(6),
                 start: Ok(()),
@@ -484,6 +501,7 @@ mod tests {
                 started_with: None,
                 installs: vec![Ok(PathBuf::from("/Users/me/bin/shelbi"))],
                 installed: 0,
+                may_install: true,
             }
         }
 
@@ -496,6 +514,9 @@ mod tests {
     }
 
     impl Platform for Scripted {
+        fn installs_cli(&self) -> bool {
+            self.may_install
+        }
         fn login_env(&mut self) -> Env {
             [("PATH".to_string(), self.path.clone())].into()
         }
@@ -565,17 +586,17 @@ mod tests {
         let BootstrapState::Ready(ready) = end else {
             panic!("expected Ready")
         };
-        assert_eq!(ready.cli.path, PathBuf::from("/opt/homebrew/bin/shelbi"));
+        assert_eq!(ready.cli.path, known_cli());
         assert_eq!(ready.cli.source, CliSource::KnownLocation);
         assert_eq!(ready.control.daemon_version(), "0.10.0");
         assert!(ready.control.relaunch_required().is_none());
         // The daemon starts with the found CLI under the login environment.
         let (cli, env) = p.started_with.unwrap();
-        assert_eq!(cli, PathBuf::from("/opt/homebrew/bin/shelbi"));
+        assert_eq!(cli, known_cli());
         // The CLI's directory joins the login PATH for the app's children.
-        assert_eq!(env["PATH"], "/usr/bin:/bin:/opt/homebrew/bin");
+        assert_eq!(env["PATH"], format!("/usr/bin:/bin:{}", known_cli().parent().unwrap().display()));
         assert_eq!(p.installed, 0, "a found CLI is never installed over");
-        assert!(!ready.on_login_path, "Homebrew isn't on this login PATH");
+        assert!(!ready.on_login_path, "the known location isn't on this login PATH");
         assert_eq!(ready.automatic.as_ref(), Some(&ready.cli.path), "discovery found it");
     }
 
@@ -585,7 +606,7 @@ mod tests {
         p.path = "/Users/me/.local/bin:/usr/bin".into();
         p.executables = vec![
             PathBuf::from("/Users/me/.local/bin/shelbi"),
-            PathBuf::from("/opt/homebrew/bin/shelbi"),
+            known_cli(),
         ];
         let (_, end) = run_scripted(&mut p, "0.10.0");
         let BootstrapState::Ready(ready) = end else {
@@ -610,7 +631,7 @@ mod tests {
         assert_eq!(ready.cli.source, CliSource::Setting);
         // What Settings shows once the override is cleared: the search
         // without it, never the override itself.
-        assert_eq!(ready.automatic, Some(PathBuf::from("/opt/homebrew/bin/shelbi")));
+        assert_eq!(ready.automatic, Some(known_cli()));
     }
 
     #[test]
@@ -706,6 +727,19 @@ mod tests {
     }
 
     #[test]
+    fn where_the_package_provides_the_cli_a_missing_one_is_reported_not_installed() {
+        let mut p = Scripted::fresh("0.10.0");
+        p.may_install = false;
+        let (seen, end) = run_scripted(&mut p, "0.10.0");
+        assert_eq!(seen, ["env", "cli", "failed"]);
+        let BootstrapState::Failed(Failure::CliNotFound(nf)) = end else {
+            panic!("expected CliNotFound, got {end:?}")
+        };
+        assert_eq!(nf.setting, None, "nothing configured: the screen names the install command");
+        assert_eq!(p.installed, 0);
+    }
+
+    #[test]
     fn an_incompatible_cli_keeps_its_diagnosis_and_is_not_replaced() {
         let mut p = Scripted::healthy("0.10.0");
         let (_, end) = run_scripted(&mut p, "0.11.0");
@@ -789,7 +823,7 @@ mod tests {
         let BootstrapState::Failed(Failure::ProtocolMismatch { cli, check }) = end else {
             panic!("expected ProtocolMismatch, got {end:?}")
         };
-        assert_eq!(cli, PathBuf::from("/opt/homebrew/bin/shelbi"));
+        assert_eq!(cli, known_cli());
         assert_eq!(
             check,
             ProtocolCheck::CliOlder {

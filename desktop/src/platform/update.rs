@@ -1,8 +1,11 @@
 //! The new-release check: once a day, off the UI thread, ask GitHub for the
 //! latest Shelbi release and, when it is newer than this app, show a notice
-//! with the Homebrew command that upgrades it. There is no in-app updater:
-//! the app ships as a Homebrew cask (`shelbi-desktop`) that depends on the
-//! `shelbi` formula, and Homebrew owns the upgrade.
+//! with the package manager's command that upgrades it
+//! (`platform::os::APP_UPGRADE_COMMAND`). There is no in-app updater: on
+//! macOS the app ships as a Homebrew cask (`shelbi-desktop`) that depends on
+//! the `shelbi` formula, and Homebrew owns the upgrade; on Linux it is the
+//! `shelbi-desktop-bin` AUR package, which depends on `shelbi-bin`, and
+//! pacman (through yay) owns it.
 //!
 //! Rate limit: the result is cached in `~/.shelbi/desktop-update-check.json`
 //! (`checked_at` + `latest`) and GitHub is asked at most once per
@@ -17,8 +20,9 @@
 //!   cache. `desktop/README.md` shows how to test the notice this way.
 //! - `SHELBI_DESKTOP_UPDATE_CHECK=0` (or `off`, `false`): never check.
 //!
-//! The fetch is `/usr/bin/curl`: present on every Mac, and it keeps an HTTP
-//! stack out of the app for one GET a day.
+//! The fetch is `/usr/bin/curl`: present on every Mac and every Arch
+//! install (pacman needs it), and it keeps an HTTP stack out of the app for
+//! one GET a day.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

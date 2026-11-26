@@ -344,9 +344,14 @@ pub fn ci_color(ci: PrCi, theme: &Theme) -> Hsla {
     }
 }
 
+/// The Open button's tooltip: Finder on macOS, the file manager
+/// (`xdg-open`) on Linux.
+const OPEN_TOOLTIP: &str =
+    if crate::keys::MAC { "Show the worktree in Finder" } else { "Open the worktree in the file manager" };
+
 /// The worktree's Open button: the X-Small Default button.
 pub fn open_button(id: &'static str, theme: &Theme) -> Stateful<Div> {
-    style::xsmall_button(id, "Open", theme).tooltip(style::tooltip("Show the worktree in Finder"))
+    style::xsmall_button(id, "Open", theme).tooltip(style::tooltip(OPEN_TOOLTIP))
 }
 
 /// The worktree row's button for a worktree on another machine, which

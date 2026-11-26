@@ -1,0 +1,74 @@
+name: desktop-linux-ci
+
+# Build, lint, and test the gpui desktop app (`desktop/`, its own Cargo
+# workspace) on Linux, on every pull request that can change it: the app,
+# the shared crates and vendored emulator it builds from by path, the
+# plugins `shelbi-orchestrator` embeds, and this file. The macOS job
+# (`desktop-ci.yml`) stays manual; this one keeps a Mac change from
+# silently breaking the Linux port (`desktop-linux`).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop/**'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'plugins/**'
+      - '.github/workflows/desktop-linux-ci.yml'
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'crates/**'
+      - 'vendor/**'
+      - 'plugins/**'
+      - '.github/workflows/desktop-linux-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-linux-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop-linux:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      # What gpui's Linux backend links against (Wayland and X11 clients,
+      # xkbcommon, fontconfig/freetype) and what the build scripts need.
+      - name: Install system libraries
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-xkb-dev libfontconfig-dev libfreetype-dev \
+            libvulkan1 libssl-dev libzstd-dev pkg-config clang
+
+      # Install exactly the toolchain `desktop/rust-toolchain.toml` pins (with
+      # its clippy component); rustup reads the file from the working
+      # directory, so every later cargo step uses it too.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo clippy --version
+
+      - name: Cache desktop/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+          key: linux
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # No display: the view tests run on gpui's headless test platform.
+      - name: Test
+        run: cargo test --locked

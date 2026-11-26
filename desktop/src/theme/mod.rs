@@ -29,6 +29,7 @@ pub mod diff;
 pub mod fold;
 pub mod glass;
 pub mod motion;
+pub mod omarchy;
 pub mod palette;
 pub mod style;
 pub mod window;
@@ -57,6 +58,14 @@ pub struct Theme {
     /// The contrast setting the roles were moved by, in percent (0 is the
     /// palette as designed).
     contrast: u8,
+    /// The active Omarchy theme, which `auto` paints from in place of the
+    /// built-in palette ([`omarchy`]); `None` off Omarchy.
+    system: Option<omarchy::SystemTheme>,
+    /// The window's appearance this theme was resolved against (which an
+    /// Omarchy theme or a pinned setting can paint over), kept so a
+    /// re-resolve (the contrast, the opacity, Omarchy coming or going)
+    /// starts from the window, not from what was painted.
+    window: WindowAppearance,
 }
 
 impl Deref for Theme {
@@ -90,22 +99,55 @@ impl Theme {
     /// window whose system appearance is `system`. The terminal palette is
     /// the standard palette's at every contrast: a session's default colors
     /// and its ANSI sixteen don't move with the setting.
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn resolve_with(preference: ThemePreference, contrast: u8, system: WindowAppearance) -> Self {
-        let standard = Palette::for_appearance(resolve_appearance(preference, Some(is_dark(system))));
+        Self::resolve_in(None, preference, contrast, system)
+    }
+
+    /// [`Theme::resolve_with`] on a machine whose desktop theme is `source`
+    /// (the active Omarchy theme, [`omarchy`]): `auto` paints from it, in
+    /// its own appearance, whatever the window's; `dark` and `light` keep
+    /// the built-in palette.
+    pub fn resolve_in(
+        source: Option<omarchy::SystemTheme>,
+        preference: ThemePreference,
+        contrast: u8,
+        system: WindowAppearance,
+    ) -> Self {
+        let followed = source.filter(|_| preference == ThemePreference::Auto);
+        let (standard, terminal) = match followed {
+            Some(theme) => (theme.palette, theme.terminal),
+            None => {
+                let standard = Palette::for_appearance(resolve_appearance(preference, Some(is_dark(system))));
+                (standard, TerminalPalette::for_palette(&standard))
+            }
+        };
         let contrast = contrast.min(*contrast::CONTRAST_RANGE.end());
         Self {
             preference,
-            terminal: TerminalPalette::for_palette(&standard),
+            terminal,
             colors: standard.with_contrast(contrast).map(hsla),
             opacity: 1.0,
             contrast,
+            system: source,
+            window: if is_dark(system) { WindowAppearance::Dark } else { WindowAppearance::Light },
         }
     }
 
     /// This theme at `contrast` percent, its opacity kept.
     pub fn with_contrast(self, contrast: u8) -> Self {
-        let system = if self.is_dark() { WindowAppearance::Dark } else { WindowAppearance::Light };
-        Self::resolve_with(self.preference, contrast, system).with_opacity(self.opacity)
+        Self::resolve_in(self.system, self.preference, contrast, self.window).with_opacity(self.opacity)
+    }
+
+    /// This theme on a machine whose desktop theme is now `source`, its
+    /// setting, contrast and opacity kept.
+    pub fn with_system(self, source: Option<omarchy::SystemTheme>) -> Self {
+        Self::resolve_in(source, self.preference, self.contrast, self.window).with_opacity(self.opacity)
+    }
+
+    /// Whether this theme paints from the active Omarchy theme.
+    pub fn follows_omarchy(&self) -> bool {
+        self.system.is_some() && self.preference == ThemePreference::Auto
     }
 
     /// The contrast setting the roles carry, in percent.
@@ -148,8 +190,7 @@ impl Theme {
         if !self.translucent() {
             return *self;
         }
-        let system = if self.is_dark() { WindowAppearance::Dark } else { WindowAppearance::Light };
-        Self::resolve_with(self.preference, self.contrast, system)
+        Self::resolve_in(self.system, self.preference, self.contrast, self.window)
     }
 
     /// The tint for the fill role `fill` laid on the fill role `base`
@@ -411,7 +452,7 @@ pub fn init(cx: &mut App) {
     let opacity = window::WindowLook::current(cx).effective().alpha();
     let contrast = contrast::from_config(&cfg.desktop);
     install(
-        Theme::resolve_with(preference, contrast, cx.window_appearance()).with_opacity(opacity),
+        Theme::resolve_in(omarchy::load_current(), preference, contrast, cx.window_appearance()).with_opacity(opacity),
         cx,
     );
 }
@@ -423,9 +464,20 @@ pub fn apply_preference(preference: ThemePreference, window: &Window, cx: &mut A
     cx.set_window_appearance(chrome_appearance(preference));
     let current = *cx.global::<Theme>();
     install(
-        Theme::resolve_with(preference, current.contrast, window.appearance()).with_opacity(current.opacity),
+        Theme::resolve_in(current.system, preference, current.contrast, window.appearance())
+            .with_opacity(current.opacity),
         cx,
     );
+}
+
+/// The machine's desktop theme changed (an Omarchy theme switch, or Omarchy
+/// gone): re-resolve and repaint every window, if the colors moved.
+pub fn set_system(source: Option<omarchy::SystemTheme>, cx: &mut App) {
+    let current = *cx.global::<Theme>();
+    let next = current.with_system(source);
+    if next != current {
+        install(next, cx);
+    }
 }
 
 /// Change the contrast setting now (Settings' slider, as it moves): every
@@ -450,6 +502,7 @@ pub(crate) fn install(theme: Theme, cx: &mut App) {
         preference = ?theme.preference,
         appearance = ?theme.appearance,
         contrast = theme.contrast,
+        omarchy = theme.follows_omarchy(),
         "theme resolved"
     );
     cx.set_global(theme);
@@ -510,8 +563,8 @@ pub fn follow_system<V: 'static>(window: &mut Window, cx: &mut Context<V>) -> Su
 
 fn sync(window: &Window, cx: &mut App) {
     let current = *cx.global::<Theme>();
-    let next =
-        Theme::resolve_with(current.preference, current.contrast, window.appearance()).with_opacity(current.opacity);
+    let next = Theme::resolve_in(current.system, current.preference, current.contrast, window.appearance())
+        .with_opacity(current.opacity);
     if next != current {
         install(next, cx);
     }
@@ -520,6 +573,50 @@ fn sync(window: &Window, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tokyo Night, as Omarchy ships it.
+    fn tokyo_night() -> omarchy::SystemTheme {
+        let text = "mode = \"dark\"\naccent = \"#7aa2f7\"\nselection = \"#292e42\"\nmuted = \"#414868\"\n\
+                    background = \"#1a1b26\"\nforeground = \"#a9b1d6\"\nbright_foreground = \"#c0caf5\"\n";
+        omarchy::SystemTheme::from_colors(&omarchy::OmarchyColors::parse(text).unwrap())
+    }
+
+    #[test]
+    fn auto_paints_from_the_omarchy_theme_and_a_pinned_setting_does_not() {
+        let omarchy = tokyo_night();
+        for system in [WindowAppearance::Dark, WindowAppearance::Light] {
+            let t = Theme::resolve_in(Some(omarchy), ThemePreference::Auto, 0, system);
+            assert!(t.follows_omarchy() && t.is_dark(), "Omarchy's mode wins over the window's");
+            assert_eq!(t.canvas, hsla(Rgba::hex(0x1a1b26)));
+            assert_eq!(t.terminal, omarchy.terminal);
+        }
+        let pinned = Theme::resolve_in(Some(omarchy), ThemePreference::Light, 0, WindowAppearance::Dark);
+        assert!(!pinned.follows_omarchy());
+        assert_eq!(pinned.canvas, hsla(Palette::light().canvas));
+        // Off Omarchy, `auto` is the built-in palette.
+        let off = Theme::resolve_in(None, ThemePreference::Auto, 0, WindowAppearance::Dark);
+        assert_eq!(off, Theme::resolve(ThemePreference::Auto, WindowAppearance::Dark));
+    }
+
+    #[test]
+    fn the_omarchy_theme_survives_contrast_opacity_and_a_switch() {
+        let omarchy = tokyo_night();
+        let t = Theme::resolve_in(Some(omarchy), ThemePreference::Auto, 0, WindowAppearance::Light)
+            .with_opacity(0.8)
+            .with_contrast(40);
+        assert!(t.follows_omarchy());
+        assert_eq!(t.opaque().terminal_canvas(), hsla(Rgba::hex(0x1a1b26)));
+        assert_eq!((t.contrast(), t.opacity()), (40, 0.8));
+        // Omarchy gone: back to the built-in palette for the window's own
+        // appearance (Light here, though Tokyo Night was dark), settings
+        // kept.
+        let off = t.with_system(None);
+        assert!(!off.follows_omarchy() && !off.is_dark());
+        assert_eq!((off.contrast(), off.opacity()), (40, 0.8));
+        assert!(
+            off == Theme::resolve(ThemePreference::Auto, WindowAppearance::Light).with_contrast(40).with_opacity(0.8)
+        );
+    }
 
     fn rgba8(c: Hsla) -> (u8, u8, u8, u8) {
         let c = c.to_rgb();

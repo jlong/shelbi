@@ -96,8 +96,11 @@ pub const IN_REPO_TITLE: &str = "In the project";
 pub const IN_REPO_BODY: &str =
     "Keep settings with your code and share them with your team through Git.";
 pub const GLOBAL_TITLE: &str = "Outside the project";
-pub const GLOBAL_BODY: &str =
-    "Keep settings personal to you on this Mac, separate from your repository.";
+pub const GLOBAL_BODY: &str = if cfg!(target_os = "macos") {
+    "Keep settings personal to you on this Mac, separate from your repository."
+} else {
+    "Keep settings personal to you on this computer, separate from your repository."
+};
 
 /// Where the wizard was opened from, which decides screen 01's Back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

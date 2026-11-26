@@ -31,6 +31,16 @@
 //! no window chrome draws around the ghost, and no display edge or menu bar
 //! holds it back from the pointer ([`float_origin`]).
 //!
+//! Wayland gives an app no global positions: a window can't learn where it
+//! or another is on screen, or be placed there. So there
+//! ([`crate::platform::screen::global_positions`] false) the drag only knows
+//! its own window: no other window's bar takes the tab (the tab menu's
+//! "Move to window" does that), no floating ghost opens (the card is drawn
+//! in the source window, as far as its edges), and a tab dropped away from
+//! its bar opens in a new window where the compositor puts it (Hyprland
+//! tiles it). The compositor still sends the source window the press's
+//! moves past its edges, so tearing off works the same.
+//!
 //! The session is the one place the drop gap lives: which bar the tab is
 //! over and the gap there ([`DragState::over`], [`DragState::gap`]). Each
 //! window's bar follows it ([`BarRole`]), on every move and every frame, so
@@ -208,6 +218,11 @@ pub struct DragState {
     float_native: Option<NativeWindow>,
     /// The floating ghost is opening.
     float_opening: bool,
+    /// The platform can place a window at a screen point
+    /// ([`crate::platform::screen::global_positions`]): the floating ghost
+    /// can follow the pointer. Without (Wayland), the source window draws
+    /// the torn-off card itself, within its own edges.
+    pub can_float: bool,
 }
 
 impl DragState {
@@ -238,13 +253,14 @@ impl DragState {
             float: None,
             float_native: None,
             float_opening: false,
+            can_float: true,
         }
     }
 
     /// The floating ghost draws the ghost (not the source window's own):
     /// whenever the tab isn't over its own bar.
     pub fn floats(&self) -> bool {
-        self.over != Some(self.source)
+        self.can_float && self.over != Some(self.source)
     }
 
     /// What the drag asks of `window`'s bar: the source's tab is home over

@@ -60,11 +60,7 @@ fn open_path_with(
         .find(|p| p.exists())
         .ok_or_else(|| format!("no such file (from {})", cwd.map_or("?".into(), |c| c.display().to_string())))?;
     if file.is_dir() {
-        return std::process::Command::new("open")
-            .arg(&file)
-            .status()
-            .map(|_| None)
-            .map_err(|e| e.to_string());
+        return crate::platform::os::open(&file.to_string_lossy()).map(|_| None);
     }
     external_edit::spawn(&external_edit::launch_choice(editor, &file, line, column))
 }

@@ -64,8 +64,10 @@ impl FontZoom {
 /// The terminal settings in effect.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalSettings {
-    /// The font family (Source Code Pro unless set; a family that isn't
-    /// installed falls back to Source Code Pro when the font is measured).
+    /// The font family: `desktop.terminal_font_family`, else Omarchy's
+    /// monospace font on Omarchy ([`crate::theme::omarchy::font`]), else
+    /// Source Code Pro. A family that isn't installed falls back to Source
+    /// Code Pro when the font is measured.
     pub font_family: String,
     /// The font size in points.
     pub font_size: f32,
@@ -104,8 +106,15 @@ impl Global for TerminalSettings {}
 
 impl TerminalSettings {
     /// The settings `config.yaml`'s `desktop:` block asks for: blank or
-    /// missing keys take the defaults, an out-of-range size is clamped.
+    /// missing keys take the defaults (the font Omarchy's, on Omarchy), an
+    /// out-of-range size is clamped.
     pub fn from_config(cfg: &DesktopConfig) -> Self {
+        Self::from_config_with(cfg, crate::theme::omarchy::font())
+    }
+
+    /// [`TerminalSettings::from_config`] with `system_font` as the family
+    /// when the config names none.
+    fn from_config_with(cfg: &DesktopConfig, system_font: Option<String>) -> Self {
         let defaults = Self::default();
         Self {
             font_family: cfg
@@ -113,7 +122,9 @@ impl TerminalSettings {
                 .as_deref()
                 .map(str::trim)
                 .filter(|f| !f.is_empty())
-                .map_or(defaults.font_family, str::to_string),
+                .map(str::to_string)
+                .or(system_font)
+                .unwrap_or(defaults.font_family),
             font_size: cfg.terminal_font_size.map_or(defaults.font_size, |s| {
                 s.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end()) as f32
             }),
@@ -133,6 +144,12 @@ impl TerminalSettings {
     /// install what it says.
     pub fn init(cx: &mut App) {
         cx.set_global(Self::default());
+        Self::reload(cx);
+    }
+
+    /// Read the config off the UI thread and install what it says (again:
+    /// Omarchy's font changed).
+    pub fn reload(cx: &mut App) {
         let read = cx
             .background_executor()
             .spawn(async { shelbi_state::load_user_config() });
@@ -260,6 +277,18 @@ mod tests {
         assert_eq!(s.font_size, 14.0);
         assert_eq!(s.option_as_meta, OptionAsMeta::Off);
         assert_eq!(s.scrollbar, TerminalScrollbar::Auto);
+    }
+
+    #[test]
+    fn omarchys_font_is_the_default_family_and_the_config_still_wins() {
+        let omarchy = Some("JetBrainsMono Nerd Font".to_string());
+        let s = TerminalSettings::from_config_with(&DesktopConfig::default(), omarchy.clone());
+        assert_eq!(s.font_family, "JetBrainsMono Nerd Font");
+        let cfg = DesktopConfig {
+            terminal_font_family: Some("Berkeley Mono".into()),
+            ..DesktopConfig::default()
+        };
+        assert_eq!(TerminalSettings::from_config_with(&cfg, omarchy).font_family, "Berkeley Mono");
     }
 
     #[test]

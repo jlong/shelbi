@@ -28,7 +28,7 @@ use gpui::{div, prelude::*, px, AnyElement, BoxShadow, Context, Hsla, Pixels, Sc
 use shelbi_app::overlay::palette::{Palette, PaletteFocus};
 use shelbi_app::overlay::palette_search::{FilterChip, ResultItem, ResultKind, ResultRow, SearchFilter};
 use shelbi_palette::{DecorationColor, Entry};
-use shelbi_state::keymap::{DisplayStyle, Keymaps};
+use shelbi_state::keymap::Keymaps;
 
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::controls;
@@ -164,27 +164,28 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
     (icon, color)
 }
 
-/// The palette-open chord the Mac app shows as its hint, as macOS spells it:
-/// the footer's close chord and the header rows' Search tooltips read it.
+/// The palette-open chord the app shows as its hint, as the platform spells
+/// it: the footer's close chord and the header rows' Search tooltips read it.
 ///
-/// A ⌘ chord the user binds to `open_palette` wins, as the Mac convention.
-/// While `open_palette` keeps its built-in chords (`ctrl-p`, the TUI's) the
-/// hint is the platform chord, ⌘K, which always opens the palette here. Any
+/// An app chord the user binds to `open_palette` (⌘, Ctrl+Shift on Linux)
+/// wins, as the platform convention. While `open_palette` keeps its built-in
+/// chords (`ctrl-p`, the TUI's) the hint is the platform chord, ⌘K
+/// (Ctrl+Shift+K on Linux), which always opens the palette here. Any
 /// other binding a `keys.yaml` makes shows its own first chord. The settings
 /// editor never saves an override equal to the built-ins, so "the built-in
 /// chords" and "no override" are one case.
 pub fn hint_chord(keymaps: &Keymaps) -> String {
-    use shelbi_app::overlay::PLATFORM_PALETTE_CHORD;
-    use shelbi_state::keymap::{edit::builtin_chords, Action, GlobalAction, Mods};
+    use shelbi_state::keymap::{edit::builtin_chords, Action, GlobalAction};
     let bound: Vec<_> = keymaps.global.chords_for(GlobalAction::OpenPalette).into_iter().copied().collect();
+    let platform = crate::keys::palette_chord();
     let chord = bound
         .iter()
-        .find(|c| c.mods.contains(Mods::SUPER) && c.leader.is_none())
+        .find(|c| c.mods.contains(crate::keys::app_mods()) && c.leader.is_none())
         .copied()
-        .or_else(|| (bound.is_empty() || bound == builtin_chords(Action::Global(GlobalAction::OpenPalette))).then_some(PLATFORM_PALETTE_CHORD))
+        .or_else(|| (bound.is_empty() || bound == builtin_chords(Action::Global(GlobalAction::OpenPalette))).then_some(platform))
         .or_else(|| bound.first().copied())
-        .unwrap_or(PLATFORM_PALETTE_CHORD);
-    crate::keys::chord_text(&chord, DisplayStyle::Mac)
+        .unwrap_or(platform);
+    crate::keys::chord_label(&chord)
 }
 
 /// The footer's close chord: the [`hint_chord`] (`⌘K` by default).
@@ -783,9 +784,10 @@ mod tests {
     #[test]
     fn the_footer_names_the_users_palette_chord() {
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
-        assert_eq!(close_chord(&keymaps), "⌘K");
+        let mac = crate::keys::MAC;
+        assert_eq!(close_chord(&keymaps), if mac { "⌘K" } else { "Ctrl+Shift+K" });
         let own = shelbi_state::keymap::validate_keymaps_yaml("defaults:\n  global:\n    open_palette: ctrl-o\n", None).0;
-        assert_eq!(close_chord(&own), "⌃O");
+        assert_eq!(close_chord(&own), if mac { "⌃O" } else { "Ctrl+O" });
     }
 
     /// The Mac hint: ⌘K while `open_palette` keeps its built-in `ctrl-p`, a
@@ -794,12 +796,17 @@ mod tests {
     #[test]
     fn the_hint_prefers_a_command_chord_and_keeps_a_users_own() {
         let km = |yaml: &str| shelbi_state::keymap::validate_keymaps_yaml(yaml, None).0;
-        assert_eq!(hint_chord(&km("")), "⌘K", "the defaults");
+        let mac = crate::keys::MAC;
+        let pick = |m: &'static str, l: &'static str| if mac { m } else { l };
+        assert_eq!(hint_chord(&km("")), pick("⌘K", "Ctrl+Shift+K"), "the defaults");
         let only_ctrl = km("defaults:\n  global:\n    open_palette: ctrl-o\n");
-        assert_eq!(hint_chord(&only_ctrl), "⌃O", "a user's only chord");
-        let both = km("defaults:\n  global:\n    open_palette: [ctrl-p, super-j]\n");
-        assert_eq!(hint_chord(&both), "⌘J", "a user's ⌘ chord wins");
+        assert_eq!(hint_chord(&only_ctrl), pick("⌃O", "Ctrl+O"), "a user's only chord");
+        let both = km(pick(
+            "defaults:\n  global:\n    open_palette: [ctrl-p, super-j]\n",
+            "defaults:\n  global:\n    open_palette: [ctrl-p, ctrl-shift-j]\n",
+        ));
+        assert_eq!(hint_chord(&both), pick("⌘J", "Ctrl+Shift+J"), "a user's app chord wins");
         let project = km("projects:\n  demo:\n    global:\n      open_palette: alt-p\n");
-        assert_eq!(hint_chord(&project), "⌘K", "another project's override doesn't apply");
+        assert_eq!(hint_chord(&project), pick("⌘K", "Ctrl+Shift+K"), "another project's override doesn't apply");
     }
 }

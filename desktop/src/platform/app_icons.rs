@@ -1,9 +1,15 @@
-//! An app bundle's icon as Finder shows it (`NSWorkspace iconForFile:`),
-//! drawn at a given pixel size and encoded as a PNG, for Settings' Editor and
-//! Diff tool pickers ([`crate::views::tool_select`]).
+//! An app's icon for Settings' Editor and Diff tool pickers
+//! ([`crate::views::tool_select`]), as image bytes gpui draws ([`image`]).
 //!
-//! `NSWorkspace` and `NSImage` drawing are safe off the main thread, so the
-//! pickers read icons on the background executor.
+//! On macOS, an app bundle's icon as Finder shows it (`NSWorkspace
+//! iconForFile:`), drawn at the size asked and encoded as a PNG. On Linux,
+//! the icon a desktop entry names, found in the icon theme
+//! ([`super::icon_theme`]): its file as it is, a PNG or an SVG (gpui draws
+//! both at the picker's size).
+//!
+//! `NSWorkspace` and `NSImage` drawing are safe off the main thread, and the
+//! theme lookup only reads files, so the pickers read icons on the background
+//! executor.
 
 use std::path::Path;
 
@@ -53,9 +59,23 @@ pub fn png(app: &Path, px: u32) -> Option<Vec<u8>> {
     Some(data.to_vec())
 }
 
+/// `app`'s icon for a `px` × `px` slot: its bytes and their format.
+#[cfg(target_os = "macos")]
+pub fn image(app: &Path, px: u32) -> Option<(gpui::ImageFormat, Vec<u8>)> {
+    png(app, px).map(|png| (gpui::ImageFormat::Png, png))
+}
+
+/// `app`'s icon for a `px` × `px` slot (its desktop entry's, from the icon
+/// theme): its bytes and their format.
 #[cfg(not(target_os = "macos"))]
-pub fn png(_app: &Path, _px: u32) -> Option<Vec<u8>> {
-    None
+pub fn image(app: &Path, px: u32) -> Option<(gpui::ImageFormat, Vec<u8>)> {
+    let file = super::icon_theme::desktop_icon(app, px)?;
+    let format = match file.extension()?.to_str()? {
+        "svg" => gpui::ImageFormat::Svg,
+        "png" => gpui::ImageFormat::Png,
+        _ => return None,
+    };
+    std::fs::read(&file).ok().map(|bytes| (format, bytes))
 }
 
 #[cfg(all(test, target_os = "macos"))]

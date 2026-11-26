@@ -20,6 +20,28 @@ stub arms it implemented. `dt-parity-audit` removed the stub for good.
 | [`theme.md`](theme.md) | The desktop's palette (the Figma tokens as roles, dark and light), its type styles, the terminal font, its contrast rules and exceptions, and the shared component shapes |
 | [`gpui.md`](gpui.md) | The gpui channel: what is pinned and why, the breakage log, gpui quirks met along the way |
 | [`status/desktop-app.md`](status/desktop-app.md) | The umbrella: foundation, and the record of the whole effort |
+| [`status/desktop-linux.md`](status/desktop-linux.md) | The Linux port's umbrella: what runs on Linux, how it ships, and where each piece is recorded |
+
+## The Linux port (`desktop-linux`)
+
+The same app runs on Linux under Wayland: Omarchy (Arch, Hyprland) is the
+target, x86_64 only for now. It installs from the AUR, `yay -S
+shelbi-desktop-bin`, which pulls in the CLI (`shelbi-bin`); see
+[`../README.md`](../README.md#install). The plan is "Shelbi Desktop for
+Omarchy" in Claude Docs. The work landed on the long-lived branch
+`jlong/desktop-linux`, one squash-merged commit per subtask. The first five
+kept their records in the reference docs rather than status docs of their
+own:
+
+| Subtask | Scope | Where it's recorded |
+|---|---|---|
+| `dl-spike` | Builds and opens a window on Wayland under Hyprland, on the pinned gpui-pre | [`gpui.md`](gpui.md) (the Linux channel decision and breakage) |
+| `dl-platform` | Every macOS module behind `src/platform/os/` with a Linux implementation: CLI discovery from a Walker launch, the XDG portal, `xdg-open`, notifications to mako, Linux CI | [`../README.md`](../README.md#on-linux) |
+| `dl-windowing` | Translucency through Hyprland's blur, the app id `dev.shelbi.Desktop`, tabs, new windows and tear-off within Wayland's limits | [`gpui.md`](gpui.md#windows-under-hyprland-dl-windowing-2026-11-24) |
+| `dl-omarchy-theme` | Colors and the terminal font from the active Omarchy theme, followed live | [`theme.md`](theme.md) |
+| `dl-input` | Ctrl+Shift app chords, the Wayland clipboard, file and image drops, the menu bar's commands in the palette | [`../README.md`](../README.md#keys-clipboard-and-drops-on-linux) |
+| `dl-packaging` | The Linux release archive and the AUR packages `shelbi-bin` and `shelbi-desktop-bin` | [`../README.md`](../README.md#on-linux-1), `packaging/aur/README.md` |
+| `dl-parity` | The parity walk on a packaged install on Omarchy, and what it fixed and filed | [`status/dl-parity.md`](status/dl-parity.md), the Omarchy columns in [`parity.md`](parity.md) |
 
 ## Status docs by phase
 

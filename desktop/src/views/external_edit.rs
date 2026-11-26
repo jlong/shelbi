@@ -11,9 +11,11 @@
 //! line in whichever editor it is.
 //!
 //! A window app has no terminal, so a terminal editor (vim, nvim, hx, ...)
-//! runs in a new Terminal.app window via `osascript`; anything else (`code
-//! --wait`, `zed`, `subl`) is spawned directly, and an app `editor:`
-//! (`{ app: /Applications/Zed.app }`) opens the file with `open -a`. The watcher stops when a
+//! runs in a new terminal window (`platform::os::run_in_terminal`:
+//! Terminal.app on macOS, the default terminal through `xdg-terminal-exec`
+//! on Linux); anything else (`code --wait`, `zed`, `subl`) is spawned
+//! directly, and an app `editor:` (`{ app: /Applications/Zed.app }`) opens
+//! the file with `open -a` (`platform::os::open_with_app`). The watcher stops when a
 //! directly spawned editor exits (after one last check), or after
 //! [`WATCH_LIMIT`] for a Terminal-hosted one, whose exit it can't observe.
 
@@ -39,7 +41,7 @@ pub enum Launch {
     /// Spawn `program args...` directly (a GUI editor). The args include the
     /// file.
     Direct { program: String, args: Vec<String> },
-    /// Run this shell command line in a new Terminal.app window.
+    /// Run this shell command line in a new terminal window.
     Terminal { command: String },
     /// Open the file in this app (`open -a <app> <file>`).
     App { app: PathBuf, file: PathBuf },
@@ -122,46 +124,20 @@ pub fn launch_at(editor: &str, file: &Path, line: Option<u32>, column: Option<u3
 }
 
 /// Start `launch`: a GUI editor as a child process (returned, so a caller
-/// can watch for its exit), a terminal editor in a new Terminal.app window
+/// can watch for its exit), a terminal editor in a new terminal window
 /// or a file in an app (`None`: its exit can't be observed).
 pub fn spawn(launch: &Launch) -> Result<Option<std::process::Child>, String> {
     match launch {
-        Launch::App { app, file } => {
-            let status = std::process::Command::new("open")
-                .arg("-a")
-                .arg(app)
-                .arg(file)
-                .stdin(std::process::Stdio::null())
-                .status()
-                .map_err(|e| format!("opening {}: {e}", app.display()))?;
-            if status.success() {
-                Ok(None)
-            } else {
-                Err(format!("{} couldn't open {} ({status})", shelbi_state::tools::app_display_name(app), file.display()))
-            }
-        }
+        Launch::App { app, file } => crate::platform::os::open_with_app(app, file).map(|()| None).map_err(|e| {
+            format!("{} couldn't open {}: {e}", shelbi_state::tools::app_display_name(app), file.display())
+        }),
         Launch::Direct { program, args } => std::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .spawn()
             .map(Some)
             .map_err(|e| format!("launching editor `{program}`: {e}")),
-        Launch::Terminal { command } => {
-            let script = format!(
-                "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
-                applescript_string(command)
-            );
-            let status = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .status()
-                .map_err(|e| format!("launching Terminal for `{command}`: {e}"))?;
-            if status.success() {
-                Ok(None)
-            } else {
-                Err(format!("Terminal couldn't start `{command}` ({status})"))
-            }
-        }
+        Launch::Terminal { command } => crate::platform::os::run_in_terminal(command).map(|()| None),
     }
 }
 
@@ -180,11 +156,6 @@ pub fn open_file(path: &Path) -> Result<String, String> {
         spawn(&launch_choice(&editor, path, None, None))?;
         Ok(editor.display_name())
     }
-}
-
-/// The AppleScript string literal for `s`.
-fn applescript_string(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// The scratch file an issue's body is edited in.
@@ -305,10 +276,6 @@ pub(crate) mod tests {
         assert_eq!(p.file_name().unwrap(), "my_proj--dt-1.md");
     }
 
-    #[test]
-    fn applescript_strings_escape_quotes_and_backslashes() {
-        assert_eq!(applescript_string(r#"vim "a\b""#), r#""vim \"a\\b\"""#);
-    }
 
     #[test]
     fn an_app_editor_opens_the_file_with_open_a() {

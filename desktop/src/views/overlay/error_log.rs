@@ -139,7 +139,7 @@ pub fn render<H: OverlayHost>(
         .h(px(h))
         .child(header)
         .child(div().flex_1().min_h_0().flex().flex_col().px_4().py_2().child(body.flex_1().min_h_0()))
-        .child(hint(format!("{HINT} · ⌘C copy"), theme))
+        .child(hint(format!("{HINT} · {} copy", crate::keys::app_label("super-c")), theme))
         .into_any_element()
 }
 

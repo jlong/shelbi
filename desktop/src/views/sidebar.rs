@@ -62,9 +62,14 @@ const TRAFFIC_LIGHT_BUTTON: f32 = 14.0;
 /// Where Figma centers the close button: 26pt in and 26pt down.
 const TRAFFIC_LIGHT_CENTER: f32 = 26.0;
 /// The traffic lights' right edge (three buttons, 9pt apart), for the
-/// collapsed sidebar's toggle beside them.
-pub const TRAFFIC_LIGHTS_RIGHT: f32 =
-    TRAFFIC_LIGHT_CENTER - TRAFFIC_LIGHT_BUTTON / 2.0 + 3.0 * TRAFFIC_LIGHT_BUTTON + 2.0 * 9.0;
+/// collapsed sidebar's toggle beside them. Linux draws no window buttons
+/// (Hyprland has none), so there the room is nothing and the tabs and the
+/// toggle start at the window's edge plus their own gap.
+pub const TRAFFIC_LIGHTS_RIGHT: f32 = if crate::keys::MAC {
+    TRAFFIC_LIGHT_CENTER - TRAFFIC_LIGHT_BUTTON / 2.0 + 3.0 * TRAFFIC_LIGHT_BUTTON + 2.0 * 9.0
+} else {
+    0.0
+};
 /// The gap from the traffic lights' right edge to whatever sits beside them
 /// when no sidebar is showing: Figma's Header puts the Back button's frame
 /// 12pt past the zoom button.
@@ -409,6 +414,14 @@ pub enum SidebarEvent {
     OpenTabMenu(String),
     /// Close the tab's context menu (a press outside it).
     CloseTabMenu,
+    /// Show the tab menu's Move to Window submenu (its row hovered or
+    /// clicked).
+    OpenTabSubmenu,
+    /// Hide it (another row hovered).
+    CloseTabSubmenu,
+    /// Move to Window: move a project's tab into another window (`None`: a
+    /// new one).
+    MoveTab(String, Option<gpui::WindowId>),
     /// A tab's context menu's Close All Other Projects: close every other
     /// tab's project, keeping this one.
     CloseOtherTabs(String),
@@ -1722,8 +1735,13 @@ mod tests {
         // at (26, 26), on the 52pt titlebar row's middle.
         assert_eq!(traffic_light_position(), gpui::point(px(19.0), px(19.0)));
         assert_eq!(TITLEBAR_H / 2.0, 26.0);
-        assert_eq!(TRAFFIC_LIGHTS_RIGHT, 79.0);
-        assert_eq!(BESIDE_TRAFFIC_LIGHTS, 91.0, "Figma's 12pt gap past the zoom button");
+        if crate::keys::MAC {
+            assert_eq!(TRAFFIC_LIGHTS_RIGHT, 79.0);
+            assert_eq!(BESIDE_TRAFFIC_LIGHTS, 91.0, "Figma's 12pt gap past the zoom button");
+        } else {
+            assert_eq!(TRAFFIC_LIGHTS_RIGHT, 0.0, "no window buttons on Linux");
+            assert_eq!(BESIDE_TRAFFIC_LIGHTS, 12.0, "the same 12pt gap, from the edge");
+        }
     }
 
     #[test]

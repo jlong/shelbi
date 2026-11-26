@@ -1,0 +1,32 @@
+# Maintainer: John W. Long <john at johnwlong dot com>
+#
+# Template: scripts/release/render-aur-package.sh fills @PKGVER@ and @SHA256@
+# and writes the PKGBUILD and .SRCINFO the release workflow pushes to the AUR.
+
+pkgname=shelbi-bin
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Open-source agent orchestrator for parallel coding agents (prebuilt CLI)'
+arch=('x86_64')
+url='https://github.com/jlong/shelbi'
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'git' 'openssh')
+provides=("shelbi=${pkgver}")
+conflicts=('shelbi')
+options=('!strip' '!debug')
+source_x86_64=("shelbi-${pkgver}-x86_64.tar.gz::${url}/releases/download/v${pkgver}/shelbi_Linux_x86_64.tar.gz")
+sha256sums_x86_64=('@SHA256@')
+
+package() {
+  install -Dm755 shelbi "${pkgdir}/usr/bin/shelbi"
+
+  # The system plugins, where the CLI looks for them beside /usr/bin
+  # (crates/shelbi-orchestrator/src/system_plugin.rs), as the .deb does.
+  local file
+  while IFS= read -r -d '' file; do
+    install -Dm644 "${file}" "${pkgdir}/usr/share/shelbi/${file}"
+  done < <(find plugins -type f -print0)
+
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/shelbi/README.md"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

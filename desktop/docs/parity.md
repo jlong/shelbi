@@ -17,6 +17,20 @@ public field fails that test until it has a row here.
 
 ## Command walk
 
+Walked again on Omarchy on 2026-11-24 (`dl-parity`), the Omarchy column
+below: the AUR packages `shelbi-bin` and `shelbi-desktop-bin` built with
+`makepkg` from the `desktop-linux` branch, the app run from the packaged
+files against a sandboxed Shelbi root (its own daemon and sessions, the
+hub's socket variables unset), on Hyprland 0.56 with Omarchy's theme. The
+sandbox had projects `pa` and `pb`, each with a local bare `origin`, a `dev`
+workspace and a `review-1` slot, a fake `claude` agent, a task in review on a
+pushed branch, and `editor: nvim`. The app was driven with real Wayland
+input: `wtype` for keys and a `zwlr_virtual_pointer_v1` client for the
+mouse, screenshots by `grim`. The keys are Linux's (`../README.md`, Keys,
+clipboard and drops on Linux): Ctrl+Shift+K for the palette, Alt+N for the
+sidebar rows. What it fixed and filed is in
+[`status/dl-parity.md`](status/dl-parity.md).
+
 Walked by hand on 2026-10-14 (`dt-parity-audit`) in both clients built from
 this branch, against a sandboxed Shelbi root (its own daemon and sessions, the
 hub's socket variables unset): projects `pa` and `pb`, a fake orchestrator
@@ -28,49 +42,49 @@ native menus (AX presses), with the palette checked by hand too (Ctrl+Space,
 "Activity", Enter). The smoke tests run every registry command through both
 paths on every `cargo test`.
 
-| Command | Registry id | TUI | Desktop |
-|---|---|---|---|
-| Orchestrator | `view:orch` | Chat attaches to the orchestrator session | Same (Go ▸ Orchestrator) |
-| Issues | `view:tasks` | Board | Board (Go ▸ Issues) |
-| Changelog | `view:changelog` | Added after this walk: the sidebar's Changelog row (its page is `changelog-tui`'s), with a timeline down the reading column's left (`changelog-timeline`): a `●` tick per entry and a `◆` marker per release the project's `releases:` tag glob matches, between the entries before and after it | The Changelog page (`changelog-desktop`: Go ▸ Changelog, ⌘L, the sidebar's Changelog; the same timeline in the column's left gutter, `changelog-timeline`: a dot per entry beside its title and an accent diamond per release with its label and date; issue chips open the issue's detail, PR and URL chips the browser; an image scaled down to fit the column opens in a lightbox over the window, `changelog-lightbox`, and a right-click on any drawn image offers Download Image…, `changelog-image-download`, where the TUI draws images as their alt text) |
-| Activity | `view:activity` | Feed, palette-only since the Changelog took its row | Feed, palette-only since the Changelog took its row |
-| Machines | `view:machines` | Machines view, palette-only | Machines view (Go ▸ Machines) |
-| Jobs | `view:jobs` | Added after this walk (`jobs-screen`, history in `job-history`): the project's awareness jobs, palette-only, in a five-column table (Description, Command, Status, Duration, Finished; `jobs.rs`): running jobs first, then the finished ones from the job history under a `Finished` row, a failed Status in bold red; the selected row's whole command under it. Enter opens the job's sheet over the table in the issue detail's centered box (`job-shell`, `job-sheet-pane`): `id · label` in its border, status and elapsed time, the running command's live terminal (attached read-only) or a finished one's saved output; ↑/↓ move the sheet to the next job, `c` cancels, Esc closes. A running job with an `--estimate` (`job-estimates`) draws a one-row block bar in its Duration cell (`4m 12s / 10m`), full in the overdue tone with Status `Overdue` past it; a finished one shows its duration against the estimate as text | Same table and `Finished` row (`views/jobs.rs`), a failed Status in red medium; the whole command in the Command cell's tooltip. Clicking a row opens the same sheet floating over the full-width table, drawn as the issue pane (`views/floating_pane.rs`: inset, width, resizable left edge, slide in and out), Header `id · label`, Status / Duration (with the estimate bar) / Command properties over the terminal; another row's click shows that job, ✕ and Escape close, and a Cancel job button while it runs. The same estimate text and `Overdue` status, with the bar as a thin line along the bottom of the row (`shelbi_app::estimate`'s fraction). A remote window says jobs aren't available yet |
-| Reminders | `view:reminders` | Added after this walk (`reminders-screen`): the project's `shelbi remind` reminders, palette-only and left out of the palette's default list until a query is typed (`rem` finds it), in a four-column table (Id, When, Reminder, Repeats; `reminders.rs`, drawn with the Jobs page's pieces in `list_screen.rs`): the pending ones soonest first under `Pending` (When in blue: `in 14m`, `tomorrow`), then the fired ones from the reminder history under `Fired` (`fired 20m ago`); the selected row's whole text under it. Enter opens the reminder's sheet over the table in the issue detail's centered box, as the job sheet does (`list_screen::render_sheet_frame`): `id · text` in its border, its status, its text, Due / Repeats / Created / Id; ↑/↓ move the sheet to the next reminder, `c` cancels a pending one, Esc closes | Same table and headings (`views/reminders.rs`, with the Jobs view's title, rows and list from `views/list_screen.rs`), the whole text in the Reminder cell's tooltip. Clicking a row opens the same facts floating over the full-width table in the shared floating pane the job sheet and the issue pane use (`views/floating_pane.rs`: inset, the window's resizable pane width, slide in and out), Header `id · text`, Status / Due / Repeats / Created / Id properties over the whole text; another row's click shows that reminder, ✕ and Escape close, and a Cancel reminder button while it is pending. A remote window says reminders aren't available yet |
-| Workspace | `workspace:<name>` | Idle placeholder for an idle workspace; the agent when one runs | Same (Go ▸ Workspaces ▸ dev) |
-| Open review | `review:<id>` | Serving task: the review interface (panel, live server line, reviewer session) | Queued task: the "Load for review" slot dialog (Go ▸ Reviews ▸ … ▸ Open Review); a serving one opens the Review view |
-| Approve | `action:approve-review:<id>` | Reached the daemon; the sandbox's gated merge refused (no `origin` to push to) and the status line said so | Reached the daemon; refused (the slot never loaded the task) and the banner said so |
-| Reject | `action:reject-review:<id>` | Reason prompt; Ctrl+D sent it; the task went back to `todo` | Same (Reviews ▸ … ▸ Reject…) |
-| Zen toggle | `action:toggle-zen` | First off-to-on shows the intro; confirm turned Zen on; again turned it off | Same; the View menu item relabels on/off |
-| New Issue | `action:new-issue` | Added after this walk (`new-task-dialog`), covered by both smoke tests: the New task overlay over the view (also the board's `n` and its `+ New issue`), Ctrl+Enter creates | The New task dialog over the window (`views/new_task.rs`; also the board's New issue and `n`, File ▸ New Issue…), ⌘Return creates; the window flashes the outcome |
-| Error log | `action:error-log` | Overlay ("No errors logged.") | Same (View ▸ Error Log) |
-| Settings | `action:settings` | Added after this walk (`tui-settings-shell`), covered by both smoke tests: Settings over the view, its sidebar in the sidebar's column (also `,` in the sidebar and the ⚙ beside the project title) | The existing Settings, on the page last used (Shelbi ▸ Settings…, ⌘,) |
-| Switch Project | `action:switch-project` | Fixed here: was a switch to an empty project name; now the palette's Projects column, focused | The tab bar's `+` menu: the projects that aren't open, then Add project (File ▸ Switch Project…) |
-| Switch to a project | `action:switch-project:<slug>` | The client moves to `pb`, and back | The window switches to `pb` in place, and back to where `pa` was left (File ▸ Open Project ▸ pb; `dt-switch-project-in-window`) |
-| New Window | `action:new-window` | Not offered: the registry lists it only for a multi-window client (`CommandModel::multi_window`); the TUI's arm says to run `shelbi` in another terminal | A second window on the current project, cascaded (File ▸ New Window, ⌘⇧N, and the palette) |
-| Add project | `action:add-project` | Form with detection and the derived id; cancelled before creating (submit would launch a real agent). Since `unify-project-create` the form is the four steps every front end shares (`shelbi_app::new_project::Step`; `overlay/add_project.rs` over `shelbi_app::overlay::add_project`): the folder (Continue runs `project_create::check_folder`, then shows its git-init / pick-up offers before the next Continue takes them), Agent defaults (the detected runner preselected), Issues (GitHub preselected for a GitHub origin, its `gh` preflight on Continue), and where settings live (the recommendation and why), each "Step N of 4" with Back and Continue / Create Project, by keys and mouse; Create Project hands `Form::plan` to `project_create::create_project` | The Add Project wizard's own window (`dt-add-project-wizard`): the same four steps over `shelbi_app::add_project_wizard` (the folder box with its git-init / pick-up checkboxes, Agent defaults, the Issues cards with the repo field and an off-thread preflight, the settings cards with the recommendation line), then Create Project through the same `project_create::create_project`, its checklist, and the created workflows, whose Okay opens the project on its Orchestrator; also File ▸ Add Project…, the switcher and the chooser |
-| Add project ▸ Agent defaults | (step 2 of `action:add-project`, and of the first-run flow that creates a project) | Default Harness and Default model as the onboarding's pickers (`picker.rs`: the box, its menu, ← →, "Custom model…"), over the form's shared `HarnessPicker`; the choice rides `Form::plan` into `project_create::create_project` (`shell/mod.rs` `submit_add_project`, `launch/mod.rs` `submit_project`) | The same two pickers (`views/harness_picker.rs`, shared with the onboarding) over the wizard's `HarnessPicker` (Figma 2720:33054); the choice rides `CreateRequest::plan` into `project_create::create_project`. Both clients refuse a generic default inline (a new project declares no generic runner) |
-| Connect to Remote Session… | `action:connect-remote` | Not offered until its dialog lands (`launch-tui`; the registry lists it only for a client with `CommandModel::remote_connect`) | Added after this walk (`launch-desktop`), covered by the smoke tests: the Connect to Remote Session dialog over the window (Shelbi ▸ Connect to Remote Session…, the palette); over the launch window with no project window |
-| Show Launch Screen | `action:launch-screen` | Not offered until its launch screen lands (`launch-tui`, `CommandModel::launch_screen`) | Added after this walk (`launch-desktop`): the launch window, or the open one to the front (File ▸ Show Launch Screen, the palette) |
-| Open in Terminal View | `action:open-terminal-view` | Not offered: the registry lists it only in a native remote window (`CommandModel::remote_host`), and a remote project opens in the TUI over `ssh -t` already; the TUI's arm focuses the main area and says it is the terminal view (`rw-remote-cutover`) | Added after this walk (`rw-remote-cutover`), covered by the scenario and `app_remote_tests`: View ▸ Open in Terminal View and the palette open the far TUI over `ssh -t` in a window beside the native one; gray in a window on this machine |
-| Edit Project Settings | `edit:project` | Made real here: the editor ran on `projects/pa.yaml` with the terminal handed over (checked with `vi`), then the shell repainted | Made real here: the editor ran on the same path ("Opened pa.yaml in …") |
-| Edit an agent | `edit:agent:<name>` | `agents/developer/instructions.md` | Same path |
-| Edit Zen Mode | `edit:zenmode` | `zenmode.md` | Same path |
-| Edit Workflows | `edit:workflows` | The `workflows/` directory | Same path |
-| Detach | `action:detach` | The TUI exits; every session keeps running | The app quits; every session keeps running |
-| Detach Other Clients | `action:detach-others` | Detached the desktop app ("Detached 1 other window.") | Detached the TUI |
-| Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to the neighbor tab (else another open project, else the empty-state chooser), the project's tab going from every window; also a tab's `×` and File ▸ Close Project…; `pb` kept running |
-| Close All Other Projects | `action:close-other-projects` | Added after this walk (`tab-context-menu`), covered by both smoke tests and `close_other_projects_*` in `shell/mod.rs`: listed while another project is open (`CommandModel::open_others`); one confirmation dialog (`overlay/close_others.rs`) names them, then each quits through the daemon off the UI thread and the status line says how it went; the TUI stays on its project | Added after this walk (`tab-context-menu`): listed while the window has another tab; one confirmation sheet names them, then each quits through Close Project's path and its tab goes from every window, the window staying on its project; also File ▸ Close All Other Projects… and a tab's context menu (keeping that tab's project) |
-| Quit Shelbi | `action:quit-shelbi` | Every sandbox session ended and the sandbox daemon stopped | Not pressed in this walk: the TUI's Quit Shelbi had already stopped the sandbox. The smoke test runs it through the palette and the menu; its confirmation sheet is the one Quit Project showed (`confirm_quit_shelbi`) |
-| Open a searched issue | (palette search) `action:open-issue:<id>` | Added after this walk (`changelog-palette-search`): the board's detail popover over the view the palette opened from (read off the UI thread when the issue is past the board's first history page), as a Changelog issue link opens it | The issue's detail on the board, as a Changelog issue chip opens it |
-| Open a searched Changelog entry | (palette search) `action:open-changelog-entry:<id>` | Added after this walk: the Changelog page, its search cleared, the entry unfolded, focused and at the top | The Changelog page, its search cleared, the entry at the top of the list |
-| Move a card | (board) `MoveIssue` | ⇧L / ⇧H moved `backlog` ↔ `todo` | Same keys (and drag and drop); the task pane's Status picker (`dt-task-inline-properties`) |
-| Reorder a card | (board) `PrioritizeIssue` | ⇧K moved a card to the top | Same keys (and drag within a column); the task pane's Priority picker, a 1-based place sent as its 0-based slot |
-| Change workflow | (board) `SetIssueWorkflow` | Not on the TUI board (see Known gaps); a palette-less effect would reach `dispatch_effect`'s `EditIssue` arm | The task pane's Workflow picker; a workflow without the issue's status is offered disabled with why (`shelbi_app::task_properties`) |
-| Assign | (board) `AssignIssue` | Not on the TUI board (see Known gaps) | `a`: workspace picker; `@dev` written |
-| Start | (board) `StartIssue` | Not on the TUI board | `s`: dispatched to `dev`; the sandbox agent never confirmed, so the daemon rolled it back |
-| Edit | (board) `EditIssue` | Not on the TUI board | `e`, More > Edit description, the palette: the pane's body editor takes the keys, caret at the end (no edit mode: the title and body are always editable in place, `dt-task-wysiwyg-editor`) over the shared draft (`shelbi_app::issue_edit`): saves itself after a pause, ⌘S saves at once, Esc hands the keys back saving |
-| New issue | (board) `AddIssue` | Not on the TUI board | `n`: form; the issue was created in `backlog` |
+| Command | Registry id | TUI | Desktop | Omarchy |
+|---|---|---|---|---|
+| Orchestrator | `view:orch` | Chat attaches to the orchestrator session | Same (Go ▸ Orchestrator) | ✓ (Ctrl+Shift+O) |
+| Issues | `view:tasks` | Board | Board (Go ▸ Issues) | ✓ (Ctrl+Shift+I) |
+| Changelog | `view:changelog` | Added after this walk: the sidebar's Changelog row (its page is `changelog-tui`'s), with a timeline down the reading column's left (`changelog-timeline`): a `●` tick per entry and a `◆` marker per release the project's `releases:` tag glob matches, between the entries before and after it | The Changelog page (`changelog-desktop`: Go ▸ Changelog, ⌘L, the sidebar's Changelog; the same timeline in the column's left gutter, `changelog-timeline`: a dot per entry beside its title and an accent diamond per release with its label and date; issue chips open the issue's detail, PR and URL chips the browser; an image scaled down to fit the column opens in a lightbox over the window, `changelog-lightbox`, and a right-click on any drawn image offers Download Image…, `changelog-image-download`, where the TUI draws images as their alt text) | ✓ (Ctrl+Shift+L); the footer named ⌥↓/⌥↑ and ⌘F, fixed here to Alt+Down/Alt+Up and Ctrl+Shift+F |
+| Activity | `view:activity` | Feed, palette-only since the Changelog took its row | Feed, palette-only since the Changelog took its row | ✓ palette |
+| Machines | `view:machines` | Machines view, palette-only | Machines view (Go ▸ Machines) | ✓ palette |
+| Jobs | `view:jobs` | Added after this walk (`jobs-screen`, history in `job-history`): the project's awareness jobs, palette-only, in a five-column table (Description, Command, Status, Duration, Finished; `jobs.rs`): running jobs first, then the finished ones from the job history under a `Finished` row, a failed Status in bold red; the selected row's whole command under it. Enter opens the job's sheet over the table in the issue detail's centered box (`job-shell`, `job-sheet-pane`): `id · label` in its border, status and elapsed time, the running command's live terminal (attached read-only) or a finished one's saved output; ↑/↓ move the sheet to the next job, `c` cancels, Esc closes. A running job with an `--estimate` (`job-estimates`) draws a one-row block bar in its Duration cell (`4m 12s / 10m`), full in the overdue tone with Status `Overdue` past it; a finished one shows its duration against the estimate as text | Same table and `Finished` row (`views/jobs.rs`), a failed Status in red medium; the whole command in the Command cell's tooltip. Clicking a row opens the same sheet floating over the full-width table, drawn as the issue pane (`views/floating_pane.rs`: inset, width, resizable left edge, slide in and out), Header `id · label`, Status / Duration (with the estimate bar) / Command properties over the terminal; another row's click shows that job, ✕ and Escape close, and a Cancel job button while it runs. The same estimate text and `Overdue` status, with the bar as a thin line along the bottom of the row (`shelbi_app::estimate`'s fraction). A remote window says jobs aren't available yet | ✓ palette (empty: the sandbox ran no jobs, so the sheet wasn't opened) |
+| Reminders | `view:reminders` | Added after this walk (`reminders-screen`): the project's `shelbi remind` reminders, palette-only and left out of the palette's default list until a query is typed (`rem` finds it), in a four-column table (Id, When, Reminder, Repeats; `reminders.rs`, drawn with the Jobs page's pieces in `list_screen.rs`): the pending ones soonest first under `Pending` (When in blue: `in 14m`, `tomorrow`), then the fired ones from the reminder history under `Fired` (`fired 20m ago`); the selected row's whole text under it. Enter opens the reminder's sheet over the table in the issue detail's centered box, as the job sheet does (`list_screen::render_sheet_frame`): `id · text` in its border, its status, its text, Due / Repeats / Created / Id; ↑/↓ move the sheet to the next reminder, `c` cancels a pending one, Esc closes | Same table and headings (`views/reminders.rs`, with the Jobs view's title, rows and list from `views/list_screen.rs`), the whole text in the Reminder cell's tooltip. Clicking a row opens the same facts floating over the full-width table in the shared floating pane the job sheet and the issue pane use (`views/floating_pane.rs`: inset, the window's resizable pane width, slide in and out), Header `id · text`, Status / Due / Repeats / Created / Id properties over the whole text; another row's click shows that reminder, ✕ and Escape close, and a Cancel reminder button while it is pending. A remote window says reminders aren't available yet | ✓ palette (`rem`; empty) |
+| Workspace | `workspace:<name>` | Idle placeholder for an idle workspace; the agent when one runs | Same (Go ▸ Workspaces ▸ dev) | ✓ idle page and Shell; the sidebar's Alt+1 (⌃1 on the Mac) |
+| Open review | `review:<id>` | Serving task: the review interface (panel, live server line, reviewer session) | Queued task: the "Load for review" slot dialog (Go ▸ Reviews ▸ … ▸ Open Review); a serving one opens the Review view | ✓ the slot loaded and served; Diff, Editor (the configured `nvim` in Ghostty) and Shell rows |
+| Approve | `action:approve-review:<id>` | Reached the daemon; the sandbox's gated merge refused (no `origin` to push to) and the status line said so | Reached the daemon; refused (the slot never loaded the task) and the banner said so | ✓ reached the daemon; the gated merge refused (no `gh` PR for the local origin) and the notice said so |
+| Reject | `action:reject-review:<id>` | Reason prompt; Ctrl+D sent it; the task went back to `todo` | Same (Reviews ▸ … ▸ Reject…) | ✓ reason prompt, Ctrl+D sent it, the task went back to `todo` and the review closed |
+| Zen toggle | `action:toggle-zen` | First off-to-on shows the intro; confirm turned Zen on; again turned it off | Same; the View menu item relabels on/off | ✓ intro, then on; the sidebar pill relabels |
+| New Issue | `action:new-issue` | Added after this walk (`new-task-dialog`), covered by both smoke tests: the New task overlay over the view (also the board's `n` and its `+ New issue`), Ctrl+Enter creates | The New task dialog over the window (`views/new_task.rs`; also the board's New issue and `n`, File ▸ New Issue…), ⌘Return creates; the window flashes the outcome | ✓ Ctrl+Enter created it; the footer said "⌘ Return to create", fixed here to "Ctrl+Enter to create" |
+| Error log | `action:error-log` | Overlay ("No errors logged.") | Same (View ▸ Error Log) | ✓ ("No errors logged.") |
+| Settings | `action:settings` | Added after this walk (`tui-settings-shell`), covered by both smoke tests: Settings over the view, its sidebar in the sidebar's column (also `,` in the sidebar and the ⚙ beside the project title) | The existing Settings, on the page last used (Shelbi ▸ Settings…, ⌘,) | ✓ Ctrl+Shift+, (Shift+comma arrives as `<`); pages on Alt+1 to Alt+9 |
+| Switch Project | `action:switch-project` | Fixed here: was a switch to an empty project name; now the palette's Projects column, focused | The tab bar's `+` menu: the projects that aren't open, then Add project (File ▸ Switch Project…) | ✓ a New tab with the launch screen; it doesn't take keys until clicked (filed) |
+| Switch to a project | `action:switch-project:<slug>` | The client moves to `pb`, and back | The window switches to `pb` in place, and back to where `pa` was left (File ▸ Open Project ▸ pb; `dt-switch-project-in-window`) | ✓ tab clicks and Ctrl+Shift+1 to 9 |
+| New Window | `action:new-window` | Not offered: the registry lists it only for a multi-window client (`CommandModel::multi_window`); the TUI's arm says to run `shelbi` in another terminal | A second window on the current project, cascaded (File ▸ New Window, ⌘⇧N, and the palette) | ✓ Ctrl+Shift+N; Hyprland tiles the second window. Close Window is Ctrl+Shift+W |
+| Add project | `action:add-project` | Form with detection and the derived id; cancelled before creating (submit would launch a real agent). Since `unify-project-create` the form is the four steps every front end shares (`shelbi_app::new_project::Step`; `overlay/add_project.rs` over `shelbi_app::overlay::add_project`): the folder (Continue runs `project_create::check_folder`, then shows its git-init / pick-up offers before the next Continue takes them), Agent defaults (the detected runner preselected), Issues (GitHub preselected for a GitHub origin, its `gh` preflight on Continue), and where settings live (the recommendation and why), each "Step N of 4" with Back and Continue / Create Project, by keys and mouse; Create Project hands `Form::plan` to `project_create::create_project` | The Add Project wizard's own window (`dt-add-project-wizard`): the same four steps over `shelbi_app::add_project_wizard` (the folder box with its git-init / pick-up checkboxes, Agent defaults, the Issues cards with the repo field and an off-thread preflight, the settings cards with the recommendation line), then Create Project through the same `project_create::create_project`, its checklist, and the created workflows, whose Okay opens the project on its Orchestrator; also File ▸ Add Project…, the switcher and the chooser | ✓ all four steps; Browse is the portal's GTK folder chooser; cancelled before Create |
+| Add project ▸ Agent defaults | (step 2 of `action:add-project`, and of the first-run flow that creates a project) | Default Harness and Default model as the onboarding's pickers (`picker.rs`: the box, its menu, ← →, "Custom model…"), over the form's shared `HarnessPicker`; the choice rides `Form::plan` into `project_create::create_project` (`shell/mod.rs` `submit_add_project`, `launch/mod.rs` `submit_project`) | The same two pickers (`views/harness_picker.rs`, shared with the onboarding) over the wizard's `HarnessPicker` (Figma 2720:33054); the choice rides `CreateRequest::plan` into `project_create::create_project`. Both clients refuse a generic default inline (a new project declares no generic runner) | ✓ (Claude Code preselected) |
+| Connect to Remote Session… | `action:connect-remote` | Not offered until its dialog lands (`launch-tui`; the registry lists it only for a client with `CommandModel::remote_connect`) | Added after this walk (`launch-desktop`), covered by the smoke tests: the Connect to Remote Session dialog over the window (Shelbi ▸ Connect to Remote Session…, the palette); over the launch window with no project window | ✓ the dialog (no SSH host in the sandbox to find sessions on) |
+| Show Launch Screen | `action:launch-screen` | Not offered until its launch screen lands (`launch-tui`, `CommandModel::launch_screen`) | Added after this walk (`launch-desktop`): the launch window, or the open one to the front (File ▸ Show Launch Screen, the palette) | ✓ the launch window, tiled beside the project window |
+| Open in Terminal View | `action:open-terminal-view` | Not offered: the registry lists it only in a native remote window (`CommandModel::remote_host`), and a remote project opens in the TUI over `ssh -t` already; the TUI's arm focuses the main area and says it is the terminal view (`rw-remote-cutover`) | Added after this walk (`rw-remote-cutover`), covered by the scenario and `app_remote_tests`: View ▸ Open in Terminal View and the palette open the far TUI over `ssh -t` in a window beside the native one; gray in a window on this machine | ✓ not listed for a local project, as on the Mac |
+| Edit Project Settings | `edit:project` | Made real here: the editor ran on `projects/pa.yaml` with the terminal handed over (checked with `vi`), then the shell repainted | Made real here: the editor ran on the same path ("Opened pa.yaml in …") | ✓ `nvim` on `projects/pb.yaml` in a Ghostty window (`xdg-terminal-exec`) |
+| Edit an agent | `edit:agent:<name>` | `agents/developer/instructions.md` | Same path | ✓ `agents/developer/instructions.md` |
+| Edit Zen Mode | `edit:zenmode` | `zenmode.md` | Same path | ✓ `zenmode.md` |
+| Edit Workflows | `edit:workflows` | The `workflows/` directory | Same path | ✓ the `workflows/` directory |
+| Detach | `action:detach` | The TUI exits; every session keeps running | The app quits; every session keeps running | ✓ the app quit; the orchestrator session and the daemon kept running |
+| Detach Other Clients | `action:detach-others` | Detached the desktop app ("Detached 1 other window.") | Detached the TUI | ✓ detached the TUI ("Detached 1 other window.") |
+| Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to the neighbor tab (else another open project, else the empty-state chooser), the project's tab going from every window; also a tab's `×` and File ▸ Close Project…; `pb` kept running | ✓ tab menu ▸ Close Project; the window went to the chooser after the 30s handoff wait. Its confirmation was gpui's unstyled fallback, clipping its text: replaced here by the app's dialog |
+| Close All Other Projects | `action:close-other-projects` | Added after this walk (`tab-context-menu`), covered by both smoke tests and `close_other_projects_*` in `shell/mod.rs`: listed while another project is open (`CommandModel::open_others`); one confirmation dialog (`overlay/close_others.rs`) names them, then each quits through the daemon off the UI thread and the status line says how it went; the TUI stays on its project | Added after this walk (`tab-context-menu`): listed while the window has another tab; one confirmation sheet names them, then each quits through Close Project's path and its tab goes from every window, the window staying on its project; also File ▸ Close All Other Projects… and a tab's context menu (keeping that tab's project) | ✓ palette and tab menu; the other window moved to the remaining project, keeping its Settings page |
+| Quit Shelbi | `action:quit-shelbi` | Every sandbox session ended and the sandbox daemon stopped | Not pressed in this walk: the TUI's Quit Shelbi had already stopped the sandbox. The smoke test runs it through the palette and the menu; its confirmation sheet is the one Quit Project showed (`confirm_quit_shelbi`) | ✓ every sandbox session ended and the daemon stopped. The palette also listed the menu's client quit as a second "Quit Shelbi": renamed here to "Quit (agents keep running)" |
+| Open a searched issue | (palette search) `action:open-issue:<id>` | Added after this walk (`changelog-palette-search`): the board's detail popover over the view the palette opened from (read off the UI thread when the issue is past the board's first history page), as a Changelog issue link opens it | The issue's detail on the board, as a Changelog issue chip opens it | ✓ |
+| Open a searched Changelog entry | (palette search) `action:open-changelog-entry:<id>` | Added after this walk: the Changelog page, its search cleared, the entry unfolded, focused and at the top | The Changelog page, its search cleared, the entry at the top of the list | ✓ |
+| Move a card | (board) `MoveIssue` | ⇧L / ⇧H moved `backlog` ↔ `todo` | Same keys (and drag and drop); the task pane's Status picker (`dt-task-inline-properties`) | ✓ ⇧L; drag and drop with a real mouse (a synthetic drag didn't start one) |
+| Reorder a card | (board) `PrioritizeIssue` | ⇧K moved a card to the top | Same keys (and drag within a column); the task pane's Priority picker, a 1-based place sent as its 0-based slot | ✓ ⇧K |
+| Change workflow | (board) `SetIssueWorkflow` | Not on the TUI board (see Known gaps); a palette-less effect would reach `dispatch_effect`'s `EditIssue` arm | The task pane's Workflow picker; a workflow without the issue's status is offered disabled with why (`shelbi_app::task_properties`) | ✓ the pane's Workflow picker (Task → Subtask) |
+| Assign | (board) `AssignIssue` | Not on the TUI board (see Known gaps) | `a`: workspace picker; `@dev` written | ✓ `a`, `@dev` |
+| Start | (board) `StartIssue` | Not on the TUI board | `s`: dispatched to `dev`; the sandbox agent never confirmed, so the daemon rolled it back | ✓ `s` dispatched to `dev`. Start right after Assign was refused as changed elsewhere; the retry worked (filed) |
+| Edit | (board) `EditIssue` | Not on the TUI board | `e`, More > Edit description, the palette: the pane's body editor takes the keys, caret at the end (no edit mode: the title and body are always editable in place, `dt-task-wysiwyg-editor`) over the shared draft (`shelbi_app::issue_edit`): saves itself after a pause, ⌘S saves at once, Esc hands the keys back saving | ✓ `e`, saved on Esc |
+| New issue | (board) `AddIssue` | Not on the TUI board | `n`: form; the issue was created in `backlog` | ✓ `n` |
 
 ## Platform differences (by design)
 
@@ -476,6 +490,34 @@ paths on every `cargo test`.
   image data) and pastes that path. Every terminal pane takes drops (chat,
   workspace agent and user shell, review).
 
+### On Linux (Omarchy)
+
+The differences above are the Mac app's against the TUI; on Linux the
+desktop keeps all of them except where this list says otherwise (each
+checked in the Omarchy walk):
+
+- **Keys.** Every ⌘ chord is Ctrl+Shift+key, the sidebar's ⌃1 to ⌃9 are
+  Alt+1 to Alt+9, and the hints say so (`keys::chord_label`). A terminal
+  keeps the plain Ctrl keys; Super stays with Hyprland.
+- **Menus.** There's no menu bar: its client actions are in the palette
+  beside the registry's commands, the client's quit as "Quit (agents keep
+  running)".
+- **Confirmations.** Close Project, Close All Other Projects and Quit Shelbi
+  confirm in the app's own dialog (`views/prompt.rs`), where the Mac shows a
+  sheet.
+- **Windows.** Hyprland places and tiles every window: New Window,
+  the launch window and a torn-off tab open as tiles, and Move to Window in
+  the tab menu is how a tab moves into another window (Wayland gives a drag
+  no way to find one). The tab bar has no traffic lights to make room for.
+- **Editors.** A terminal editor opens in the default terminal through
+  `xdg-terminal-exec` (Ghostty on Omarchy), not Terminal.app; Open on a
+  worktree row opens the file manager.
+- **Folder pickers** are the XDG portal's (GTK's chooser on Omarchy).
+- **Settings ▸ Terminal** lists fontconfig's monospaced families, and has no
+  Option key setting (Alt is always Meta). Settings has no blur slider:
+  Hyprland blurs.
+- **Colors** follow the active Omarchy theme with `theme: auto`.
+
 ## Known gaps
 
 Found by this audit and not closed by it; each is a follow-up.
@@ -523,6 +565,20 @@ Found by this audit and not closed by it; each is a follow-up.
     between views. A PR's host is ignored, so GitHub Enterprise isn't reached.
   - `shelbi diff comment` has no `add`: an agent can answer a thread but not start one.
 
+- **Found in the Omarchy walk** (`dl-parity`, filed on the project's board):
+  - A project still in orchestrator onboarding isn't in the daemon's open
+    set: the daemon idle-exits with no other project open, and the project's
+    tab goes when the window switches away
+    (`desktop-a-project-still-in-orchestrator-onboarding-loses-its-tab-and-its-daemon`).
+  - A New tab opened by Switch Project takes no keys until clicked
+    (`desktop-a-new-tab-opened-from-the-palette-s-switch-project-takes-no-keys`).
+  - Start right after Assign on the board is refused as changed elsewhere
+    (`desktop-board-start-right-after-assign-is-refused-as-changed-elsewhere`).
+  - A narrow window (a tiled half screen) clips the orchestrator onboarding
+    and some Settings tables (`desktop-views-break-in-a-narrow-window-a-tiled-half-screen`).
+  - `visual-check` doesn't build on Linux
+    (`desktop-the-visual-check-feature-doesn-t-build-on-linux`).
+
 ## View-model fields
 
 One table per `shelbi_app::view` model (`crates/shelbi-app/src/view.rs`, plus
@@ -533,324 +589,329 @@ relative to `crates/shelbi-tui/src/`, desktop paths relative to
 renders from its own type rather than the shared model, the cell names the
 equivalent datum.
 
+The Omarchy column is the walk's (`dl-parity`): ✓ seen as the Desktop
+column says, "not shown" where the desktop doesn't display the field, and
+"not exercised" for a state the sandbox never reached (a remote machine,
+GitHub, an error), with why.
+
 ### `SidebarModel`
-| Field | TUI | Desktop |
-|---|---|---|
-| `project_label` | sidebar header title (`shell/sidebar.rs` `render_header`) | sidebar header title (`views/sidebar.rs` `render_header`); window title, and so the Window menu's list (`app.rs` `set_window_title`, at window build and on every switch); "Quit X?" prompt (`app.rs` `confirm_quit_project`); notification bodies (`notify.rs` `observe_sidebar`, `observe_orchestrator`) |
-| `nav` | nav block rows, glyph picked from the label (`shell/sidebar.rs` `render_nav`, `nav_glyph`); palette view entries | nav rows, Heroicon picked from the view, with their ⌘O / ⌘I / ⌘L hints (`views/sidebar.rs` `render_nav_row`, `nav_icon`); palette view entries; Go menu with the same chords (`menus/tree.rs`) |
-| `workspaces` | Workspaces section rows (`shell/sidebar.rs` `render_row`); palette workspace entries | Workspaces section rows, above the review sections, collapsible (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Workspaces menu (`menus/tree.rs`); blocked-workspace notifications (`notify.rs` `observe_sidebar`) |
-| `reviews` | Ready / Queued for Review sections (`shell/sidebar.rs` `render_row`); palette review + approve/reject entries | Ready / Queued for review sections with their count badges, collapsible, below Workspaces (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Reviews menu (`menus/tree.rs`); "Ready for review" notifications (`notify.rs` `observe_sidebar`); review view live server state (`app.rs` `update_review_row`) |
-| `config_error` | red wrapped `! message` row under Workspaces (`shell/sidebar.rs` `render_row`, `config_error_lines`) | red `! message` row under Workspaces (`views/sidebar.rs` `render_row`); also gates review-closed reconcile (`app.rs` `update_review_row`) |
-| `board_loading` | italic "Loading…" placeholder row (`shell/sidebar.rs` `render_row`) | italic "Loading…" placeholder row (`views/sidebar.rs` `render_row`); also suppresses notifications on a cold skeleton (`notify.rs` `observe_sidebar`) and the review-closed reconcile (`app.rs` `update_review_row`) |
-| `collapsed_machines` | machine group `▸`/`▾` glyph, `(N, M active)` suffix, hidden rows (via `rows()`, `shell/sidebar.rs` `render_row`); toggled in `shell/mod.rs` | same glyph, suffix and hidden rows (via `rows()`, `views/sidebar.rs` `row_text`); toggled in `app.rs` |
-| `board_banner` | not shown in the sidebar; the board's status is the Issues title row's (see the board model's `banner`) | footer notes above the buttons, only when stale or cached with no daemon, in yellow; a warm board's age (`board 12s`) is dropped as a refresh timer (`views/sidebar.rs` `board_warning`, `render_footer`) |
-| `daemon_version_line` | the Settings button's hover name beside the toolbar; above the toolbar only on a mismatch (`shell/sidebar.rs` `FooterButton::tooltip`, `render_footer`) | the Settings button's tooltip; in the footer notes only on a mismatch (`views/sidebar.rs` `render_footer`) |
-| `daemon_version_mismatch` | shows the version line, red, above the toolbar, the fix (`shelbi daemon restart`) on its own line (`shell/sidebar.rs` `render_footer`) | shows the version line, red, in the footer notes (`views/sidebar.rs` `render_footer`) |
-| `status_line` | footer status row, muted for the first-run hint, else yellow (`shell/sidebar.rs` `render_footer`); stamped from the startup status in `shell/mod.rs` `apply_snapshot` | not shown: the footer would draw it, but the desktop never stamps it (the first-run hint is TUI onboarding copy; see Platform differences) |
-| `zen_mode` | green "ZEN MODE ON" band (`shell/sidebar.rs` `render_zen_row`); palette Zen toggle label | the footer's Zen pill, green "Zen mode on" or neutral "Zen mode off", a click toggles Zen (`views/sidebar.rs` `render_zen_pill`); palette Zen toggle label; Zen menu item title (`menus/tree.rs`) |
-| `unread_errors` | red `!` button in the footer when > 0 (`shell/sidebar.rs` `render_footer`, `render_error_button`) | red `!` button in the footer when > 0 (`views/sidebar.rs` `render_footer`) |
-| `session_lost` | full-width red top banner in every view (`shell/mod.rs` `render_session_lost_banner`) | red notice at the top of the main column (`app.rs` render, `notice`) |
-| `orchestrator_status` | red `Orchestrator: <status>` footer status row, 3 rows reserved so it wraps, taking the row over `status_line` (`shell/sidebar.rs` `render_footer`, text from `SidebarModel::footer_status`); Orchestrator view placeholder "Orchestrator is down. <status>. Select Orchestrator again to relaunch it." while its session is not live (`shell/mod.rs` `orchestrator_down_notice`) | red `Orchestrator: <status>` first of the footer notes, above the buttons (`views/sidebar.rs` `render_footer`, `footer_status`); the same placeholder in the Chat view while the orchestrator is not live (`views/session_view.rs` `notice`, fed by `app.rs` `update_chat_supervisor_status`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `project_label` | sidebar header title (`shell/sidebar.rs` `render_header`) | sidebar header title (`views/sidebar.rs` `render_header`); window title, and so the Window menu's list (`app.rs` `set_window_title`, at window build and on every switch); "Quit X?" prompt (`app.rs` `confirm_quit_project`); notification bodies (`notify.rs` `observe_sidebar`, `observe_orchestrator`) | ✓ |
+| `nav` | nav block rows, glyph picked from the label (`shell/sidebar.rs` `render_nav`, `nav_glyph`); palette view entries | nav rows, Heroicon picked from the view, with their ⌘O / ⌘I / ⌘L hints (`views/sidebar.rs` `render_nav_row`, `nav_icon`); palette view entries; Go menu with the same chords (`menus/tree.rs`) | ✓ the hints read Ctrl Shift O / I / L |
+| `workspaces` | Workspaces section rows (`shell/sidebar.rs` `render_row`); palette workspace entries | Workspaces section rows, above the review sections, collapsible (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Workspaces menu (`menus/tree.rs`); blocked-workspace notifications (`notify.rs` `observe_sidebar`) | ✓ |
+| `reviews` | Ready / Queued for Review sections (`shell/sidebar.rs` `render_row`); palette review + approve/reject entries | Ready / Queued for review sections with their count badges, collapsible, below Workspaces (`views/sidebar.rs` `layout`, `render_row`); palette; Go > Reviews menu (`menus/tree.rs`); "Ready for review" notifications (`notify.rs` `observe_sidebar`); review view live server state (`app.rs` `update_review_row`) | ✓ |
+| `config_error` | red wrapped `! message` row under Workspaces (`shell/sidebar.rs` `render_row`, `config_error_lines`) | red `! message` row under Workspaces (`views/sidebar.rs` `render_row`); also gates review-closed reconcile (`app.rs` `update_review_row`) | not exercised: no config error |
+| `board_loading` | italic "Loading…" placeholder row (`shell/sidebar.rs` `render_row`) | italic "Loading…" placeholder row (`views/sidebar.rs` `render_row`); also suppresses notifications on a cold skeleton (`notify.rs` `observe_sidebar`) and the review-closed reconcile (`app.rs` `update_review_row`) | not exercised: too brief to see |
+| `collapsed_machines` | machine group `▸`/`▾` glyph, `(N, M active)` suffix, hidden rows (via `rows()`, `shell/sidebar.rs` `render_row`); toggled in `shell/mod.rs` | same glyph, suffix and hidden rows (via `rows()`, `views/sidebar.rs` `row_text`); toggled in `app.rs` | not exercised: one machine |
+| `board_banner` | not shown in the sidebar; the board's status is the Issues title row's (see the board model's `banner`) | footer notes above the buttons, only when stale or cached with no daemon, in yellow; a warm board's age (`board 12s`) is dropped as a refresh timer (`views/sidebar.rs` `board_warning`, `render_footer`) | not exercised: never stale |
+| `daemon_version_line` | the Settings button's hover name beside the toolbar; above the toolbar only on a mismatch (`shell/sidebar.rs` `FooterButton::tooltip`, `render_footer`) | the Settings button's tooltip; in the footer notes only on a mismatch (`views/sidebar.rs` `render_footer`) | not exercised: the tooltip wasn't hovered |
+| `daemon_version_mismatch` | shows the version line, red, above the toolbar, the fix (`shelbi daemon restart`) on its own line (`shell/sidebar.rs` `render_footer`) | shows the version line, red, in the footer notes (`views/sidebar.rs` `render_footer`) | not exercised: versions matched |
+| `status_line` | footer status row, muted for the first-run hint, else yellow (`shell/sidebar.rs` `render_footer`); stamped from the startup status in `shell/mod.rs` `apply_snapshot` | not shown: the footer would draw it, but the desktop never stamps it (the first-run hint is TUI onboarding copy; see Platform differences) | not shown |
+| `zen_mode` | green "ZEN MODE ON" band (`shell/sidebar.rs` `render_zen_row`); palette Zen toggle label | the footer's Zen pill, green "Zen mode on" or neutral "Zen mode off", a click toggles Zen (`views/sidebar.rs` `render_zen_pill`); palette Zen toggle label; Zen menu item title (`menus/tree.rs`) | ✓ |
+| `unread_errors` | red `!` button in the footer when > 0 (`shell/sidebar.rs` `render_footer`, `render_error_button`) | red `!` button in the footer when > 0 (`views/sidebar.rs` `render_footer`) | not exercised: no errors |
+| `session_lost` | full-width red top banner in every view (`shell/mod.rs` `render_session_lost_banner`) | red notice at the top of the main column (`app.rs` render, `notice`) | not exercised: no session lost |
+| `orchestrator_status` | red `Orchestrator: <status>` footer status row, 3 rows reserved so it wraps, taking the row over `status_line` (`shell/sidebar.rs` `render_footer`, text from `SidebarModel::footer_status`); Orchestrator view placeholder "Orchestrator is down. <status>. Select Orchestrator again to relaunch it." while its session is not live (`shell/mod.rs` `orchestrator_down_notice`) | red `Orchestrator: <status>` first of the footer notes, above the buttons (`views/sidebar.rs` `render_footer`, `footer_status`); the same placeholder in the Chat view while the orchestrator is not live (`views/session_view.rs` `notice`, fed by `app.rs` `update_chat_supervisor_status`) | not exercised: the orchestrator never failed |
 
 ### `NavItem`
-| Field | TUI | Desktop |
-|---|---|---|
-| `label` | nav row text, and it picks the glyph (`shell/sidebar.rs` `nav_item_line`, `nav_glyph`); palette entry title | nav row text (`views/sidebar.rs` `render_nav_row`); palette entry title; Go menu item |
-| `view` | not shown: routing only, mapped to a session or native view (`shell/sidebar.rs` `target_from_view`) | picks the nav row's icon (`views/sidebar.rs` `nav_icon`); routing via `SidebarRow::target` |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `label` | nav row text, and it picks the glyph (`shell/sidebar.rs` `nav_item_line`, `nav_glyph`); palette entry title | nav row text (`views/sidebar.rs` `render_nav_row`); palette entry title; Go menu item | ✓ |
+| `view` | not shown: routing only, mapped to a session or native view (`shell/sidebar.rs` `target_from_view`) | picks the nav row's icon (`views/sidebar.rs` `nav_icon`); routing via `SidebarRow::target` | ✓ |
 
 ### `WorkspaceRow`
-| Field | TUI | Desktop |
-|---|---|---|
-| `name` | row label (`shell/sidebar.rs` `render_row`); palette entry title | row label (`views/sidebar.rs` `row_text`); palette; Go menu; workspace panel name in bold (`views/workspace.rs` `render_panel`); notification titles (`notify.rs`) |
-| `machine` | machine group header text when the project spans several machines (via `rows()`, `shell/sidebar.rs` `render_row`) | machine group header (via `rows()`, `views/sidebar.rs` `row_text`); panel machine row (`views/workspace.rs` `render_panel`); remote attach target (`views/workspace.rs` `set_row`) |
-| `is_remote` | not used (remote attach comes from session discovery, `shell/session.rs`) | panel machine row with a globe icon and `(remote)` (`views/workspace.rs` `render_panel`); routes the session through the remote relay and drops the Diff, Editor and folder rows (`views/workspace.rs` `set_row`, `panel_shape`) |
-| `current_task` | not shown as text in the sidebar; counts toward `M active` on a collapsed group (via `rows()`); palette workspace subtitle; gates opening the workspace panel (`shell/mod.rs` `workspace_has_task`) and the panel's IN PROGRESS/IDLE status (`shell/mod.rs` `ws_status_from_model`) | `M active` count (via `rows()`); palette subtitle; panel task id and the full panel vs the reduced idle one (`views/workspace.rs` `render_panel`, `panel_shape` via `has_task`); notification body (`notify.rs`) |
-| `agent` | right-aligned row label, title-cased, or `idle` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label, X-Small semibold, then the row's ⌃N; "Idle", muted, without one (`views/sidebar.rs` `row_text`); panel `· Agent` role after the name and the agent switch row's label (`views/workspace.rs` `render_panel`) |
-| `badge` | colored state glyph in the row (`shell/sidebar.rs` `render_row`) | the Navigation component's state glyph (green play, yellow `?`, cyan waiting `⋯`, quiet dot; the shared glyph for the states it doesn't draw) (`views/sidebar.rs` `workspace_glyph`); panel status glyph plus words beside the back button, e.g. `⏵ Working` (`views/workspace.rs` `render_panel`); drives blocked/needs-permission notifications (`notify.rs` `observe_sidebar`) |
-| `pause_reason` | right-aligned row label in place of the agent while the row is Paused, e.g. `Free limit` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label in place of the agent while the row is Paused (`right_label`, `views/sidebar.rs` `row_text`); filled from the runner's `runner-state` report (`shelbi-orchestrator` `sidebar_model`) |
-| `waiting_on` | the palette's workspace subtitle after the task while the row is Waiting, e.g. `t-1 · Waiting on job j372 · desktop checks` (`state_detail`, via `command_model`) | the row's tooltip while it is Waiting (`views/sidebar.rs` `workspace_tooltip` via `state_detail`); the palette subtitle, as the TUI's; filled from the running jobs the worker started (`shelbi-orchestrator` `sidebar_model`, `shelbi_state::waiting_jobs`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `name` | row label (`shell/sidebar.rs` `render_row`); palette entry title | row label (`views/sidebar.rs` `row_text`); palette; Go menu; workspace panel name in bold (`views/workspace.rs` `render_panel`); notification titles (`notify.rs`) | ✓ |
+| `machine` | machine group header text when the project spans several machines (via `rows()`, `shell/sidebar.rs` `render_row`) | machine group header (via `rows()`, `views/sidebar.rs` `row_text`); panel machine row (`views/workspace.rs` `render_panel`); remote attach target (`views/workspace.rs` `set_row`) | not exercised: one machine, so no group header |
+| `is_remote` | not used (remote attach comes from session discovery, `shell/session.rs`) | panel machine row with a globe icon and `(remote)` (`views/workspace.rs` `render_panel`); routes the session through the remote relay and drops the Diff, Editor and folder rows (`views/workspace.rs` `set_row`, `panel_shape`) | not exercised: no remote machine |
+| `current_task` | not shown as text in the sidebar; counts toward `M active` on a collapsed group (via `rows()`); palette workspace subtitle; gates opening the workspace panel (`shell/mod.rs` `workspace_has_task`) and the panel's IN PROGRESS/IDLE status (`shell/mod.rs` `ws_status_from_model`) | `M active` count (via `rows()`); palette subtitle; panel task id and the full panel vs the reduced idle one (`views/workspace.rs` `render_panel`, `panel_shape` via `has_task`); notification body (`notify.rs`) | ✓ |
+| `agent` | right-aligned row label, title-cased, or `idle` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label, X-Small semibold, then the row's ⌃N; "Idle", muted, without one (`views/sidebar.rs` `row_text`); panel `· Agent` role after the name and the agent switch row's label (`views/workspace.rs` `render_panel`) | ✓ "Developer", then Alt+1 (⌃1 on the Mac) |
+| `badge` | colored state glyph in the row (`shell/sidebar.rs` `render_row`) | the Navigation component's state glyph (green play, yellow `?`, cyan waiting `⋯`, quiet dot; the shared glyph for the states it doesn't draw) (`views/sidebar.rs` `workspace_glyph`); panel status glyph plus words beside the back button, e.g. `⏵ Working` (`views/workspace.rs` `render_panel`); drives blocked/needs-permission notifications (`notify.rs` `observe_sidebar`) | ✓ |
+| `pause_reason` | right-aligned row label in place of the agent while the row is Paused, e.g. `Free limit` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label in place of the agent while the row is Paused (`right_label`, `views/sidebar.rs` `row_text`); filled from the runner's `runner-state` report (`shelbi-orchestrator` `sidebar_model`) | not exercised: no worker hit a usage limit |
+| `waiting_on` | the palette's workspace subtitle after the task while the row is Waiting, e.g. `t-1 · Waiting on job j372 · desktop checks` (`state_detail`, via `command_model`) | the row's tooltip while it is Waiting (`views/sidebar.rs` `workspace_tooltip` via `state_detail`); the palette subtitle, as the TUI's; filled from the running jobs the worker started (`shelbi-orchestrator` `sidebar_model`, `shelbi_state::waiting_jobs`) | not exercised: no worker waited on a job |
 
 ### `ReviewRow`
-| Field | TUI | Desktop |
-|---|---|---|
-| `task_id` | not shown: routing key for opening the review (`shell/sidebar.rs` `build_rows`, `RowTarget::Review`); palette command id | not shown in the row: routing key (via `SidebarRow::target`) and debug selector (`views/sidebar.rs` `row_selector`); shown in the "reached review" notification body (`notify.rs`) |
-| `title` | row first line, truncated with `…` (`shell/sidebar.rs` `render_row`); palette entry and Approve/Reject titles | row first line (`views/sidebar.rs` `row_text`); palette; Go > Reviews menu; notification title (`notify.rs`) |
-| `branch` | dim `⎇ branch` second line (`shell/sidebar.rs` `render_row`); the open Review panel's branch row, ahead of the task's (`shell/review.rs` `set_server`) | muted second line after the number (`views/sidebar.rs` `row_text`, `render_row`); the open Review panel's branch row, ahead of the task's (`ReviewPanelModel::build`) |
-| `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | not shown: State=Review dropped the server block and the sidebar row's right side is its ⌃N hint (the Navigation component); the review URL stands in (the Web Browser row's tooltip) |
-| `workspace` | not used | not used |
-| `pr` | not in the row: keeps the open Review panel's PR current (`shell/review.rs` `set_server`) | not in the row: keeps the open Review panel's PR current (`ReviewPanelModel::build`, via `views/review.rs` `update_row`) |
-| `number` | not shown | `#401` before the branch on the row's second line (`views/sidebar.rs` `row_text`); filled from the board index for a GitHub-backed project (`shelbi-orchestrator` `sidebar_model`) |
-| `state` | section split (Ready vs Queued, via `rows()`) and the badge glyph, bold cyan ✓ when serving (`shell/sidebar.rs` `render_row`) | section split (via `rows()`) and the component's glyph: the cyan check when serving, a quiet dot when queued (`views/sidebar.rs` `review_glyph`); the review panel's Web Browser row, inert with "loading…" until serving, the sub-state and detail in its tooltip (`views/review.rs` `render_waiting_browser`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `task_id` | not shown: routing key for opening the review (`shell/sidebar.rs` `build_rows`, `RowTarget::Review`); palette command id | not shown in the row: routing key (via `SidebarRow::target`) and debug selector (`views/sidebar.rs` `row_selector`); shown in the "reached review" notification body (`notify.rs`) | not shown |
+| `title` | row first line, truncated with `…` (`shell/sidebar.rs` `render_row`); palette entry and Approve/Reject titles | row first line (`views/sidebar.rs` `row_text`); palette; Go > Reviews menu; notification title (`notify.rs`) | ✓ |
+| `branch` | dim `⎇ branch` second line (`shell/sidebar.rs` `render_row`); the open Review panel's branch row, ahead of the task's (`shell/review.rs` `set_server`) | muted second line after the number (`views/sidebar.rs` `row_text`, `render_row`); the open Review panel's branch row, ahead of the task's (`ReviewPanelModel::build`) | ✓ |
+| `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | not shown: State=Review dropped the server block and the sidebar row's right side is its ⌃N hint (the Navigation component); the review URL stands in (the Web Browser row's tooltip) | not shown |
+| `workspace` | not used | not used | not shown |
+| `pr` | not in the row: keeps the open Review panel's PR current (`shell/review.rs` `set_server`) | not in the row: keeps the open Review panel's PR current (`ReviewPanelModel::build`, via `views/review.rs` `update_row`) | not exercised: no GitHub |
+| `number` | not shown | `#401` before the branch on the row's second line (`views/sidebar.rs` `row_text`); filled from the board index for a GitHub-backed project (`shelbi-orchestrator` `sidebar_model`) | not exercised: no GitHub |
+| `state` | section split (Ready vs Queued, via `rows()`) and the badge glyph, bold cyan ✓ when serving (`shell/sidebar.rs` `render_row`) | section split (via `rows()`) and the component's glyph: the cyan check when serving, a quiet dot when queued (`views/sidebar.rs` `review_glyph`); the review panel's Web Browser row, inert with "loading…" until serving, the sub-state and detail in its tooltip (`views/review.rs` `render_waiting_browser`) | ✓ |
 
 ### `WorkspaceDetailsInfo`
 The TUI never constructs this struct; its workspace panel reads the same facts from `workspace_session::workspace_details` into its own `WorkspacePanel` (`shell/mod.rs` `build_workspace_interface`). The TUI column describes that equivalent display.
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `task` | struct not used; the task title shows bold in the panel (`workspace_panel.rs` `render_full`, `render_task_info`); id only in the More popover meta (`kanban.rs` `render_task_popover_into`) | panel title, wrapped (`views/workspace.rs` `render_panel` via `WorkspaceHeader`); the id only as the title's fallback |
-| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | description clamped to five lines, only when non-empty, More opening the task pane over the screen (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`; the window draws the board's pane, `app.rs` `open_task_over`) |
-| `branch` | struct not used; the same resolved branch (the task's, else the worktree's) as the panel's `⎇` branch row under the folder, a click or Enter copies it with a `Copied <branch>` toast (`workspace_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `shell/mod.rs` `copy_branch`); also the More popover meta | the panel's branch row under the worktree (git-branch icon, the name cut at the end), a click or Enter copies it with a toast, only with a task (`views/workspace.rs` `render_panel`, `branch`, `task_panel::branch_row`); the idle page's place line when there is no worktree (`WorkspaceHeader::location_line`) |
-| `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel worktree row, its last four components (`…/shelbi/.shelbi/wt/alpha`), Open reveals it in Finder when local (`views/workspace.rs` `render_panel`, `task_panel::worktree_row`, `reveal_folder`); the idle page's place line |
-| `remote_address` | struct not used; a remote workspace's folder row copies the same `host:path` (`shell/mod.rs` `apply_workspace_action`, `WorkspaceAction::RevealFolder`) | the worktree row's Copy button and what it copies, in place of Open (`views/workspace.rs` `render_panel`, `reveal_folder`; `task_panel::copy_button`) |
-| `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch row label (`views/workspace.rs` `render_panel`) |
-| `apps` | struct not used; the panel's `AppTools` (`shell/workspace.rs`): Edit / View Diff launch the app, the main area keeps its view | the panel's `WsPanelShape::with_apps` (`views/workspace.rs`): Edit / View Diff launch the app, the view stays |
-| `pr` | struct not used; the task's PR (`board::task_pr`) as the panel's `⇵ PR #1234 ●` row under the branch, the dot in the CI's color; a click or Enter opens it, a row in the keys only with a link (`workspace_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `WorkspaceAction::OpenPr` in `shell/mod.rs`) | the panel's PR row under the branch: the pull-request icon, `PR #1234`, one CI-colored dot, the URL, state and CI in its tooltip; a click or Enter opens it (`views/workspace.rs` `render_panel`, `open_pr`, `task_panel::pr_row`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `task` | struct not used; the task title shows bold in the panel (`workspace_panel.rs` `render_full`, `render_task_info`); id only in the More popover meta (`kanban.rs` `render_task_popover_into`) | panel title, wrapped (`views/workspace.rs` `render_panel` via `WorkspaceHeader`); the id only as the title's fallback | ✓ |
+| `body` | struct not used; inline preview lines plus the More popover (`workspace_panel.rs` `render_task_info`; `shell/overlays.rs` `TaskDescription`) | description clamped to five lines, only when non-empty, More opening the task pane over the screen (`views/workspace.rs` `render_panel`, via `shelbi_app::review::description_text`; the window draws the board's pane, `app.rs` `open_task_over`) | ✓ |
+| `branch` | struct not used; the same resolved branch (the task's, else the worktree's) as the panel's `⎇` branch row under the folder, a click or Enter copies it with a `Copied <branch>` toast (`workspace_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `shell/mod.rs` `copy_branch`); also the More popover meta | the panel's branch row under the worktree (git-branch icon, the name cut at the end), a click or Enter copies it with a toast, only with a task (`views/workspace.rs` `render_panel`, `branch`, `task_panel::branch_row`); the idle page's place line when there is no worktree (`WorkspaceHeader::location_line`) | ✓ |
+| `worktree` | struct not used; worktree path shown as the folder row, click reveals (`workspace_panel.rs` `render_folder`) | panel worktree row, its last four components (`…/shelbi/.shelbi/wt/alpha`), Open reveals it in Finder when local (`views/workspace.rs` `render_panel`, `task_panel::worktree_row`, `reveal_folder`); the idle page's place line | ✓ |
+| `remote_address` | struct not used; a remote workspace's folder row copies the same `host:path` (`shell/mod.rs` `apply_workspace_action`, `WorkspaceAction::RevealFolder`) | the worktree row's Copy button and what it copies, in place of Open (`views/workspace.rs` `render_panel`, `reveal_folder`; `task_panel::copy_button`) | not exercised: no remote machine |
+| `editor_name` | struct not used; "Edit in X" switch label (`workspace_panel.rs` `switch_entry`) | "Edit in X" switch row label (`views/workspace.rs` `render_panel`) | ✓ |
+| `apps` | struct not used; the panel's `AppTools` (`shell/workspace.rs`): Edit / View Diff launch the app, the main area keeps its view | the panel's `WsPanelShape::with_apps` (`views/workspace.rs`): Edit / View Diff launch the app, the view stays | ✓ |
+| `pr` | struct not used; the task's PR (`board::task_pr`) as the panel's `⇵ PR #1234 ●` row under the branch, the dot in the CI's color; a click or Enter opens it, a row in the keys only with a link (`workspace_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `WorkspaceAction::OpenPr` in `shell/mod.rs`) | the panel's PR row under the branch: the pull-request icon, `PR #1234`, one CI-colored dot, the URL, state and CI in its tooltip; a click or Enter opens it (`views/workspace.rs` `render_panel`, `open_pr`, `task_panel::pr_row`) | not exercised: no GitHub |
 
 ### `WorkspaceHeader`
 The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the back button plus a column status (`IN PROGRESS` / `IDLE`), the title, a preview, the folder row and the switcher.
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `name` | not used; the workspace panel never shows the workspace name | the idle page's toolbar (`views/workspace.rs` `render_toolbar`); not in the panel (State=Workspace draws none) |
-| `task_id` | not used; id only in the More popover | not shown: the panel title's fallback when the title is empty (`views/workspace.rs` `render_panel`); gates the status and summary |
-| `title` | not used; the panel shows the task title from its own `IssueFile` (`workspace_panel.rs` `render_task_info`) | panel title, wrapped (`views/workspace.rs` `render_panel`) |
-| `branch` | not used; branch only in the More popover | the idle page's place line without a worktree (`views/workspace.rs` `render_toolbar` via `location_line`) |
-| `machine` | not used | the idle page's place line (`views/workspace.rs` `render_toolbar`); a remote panel's worktree tooltip (`render_panel`) |
-| `is_remote` | not used | `(remote)` on the idle page's place line (`views/workspace.rs` `render_toolbar`); the worktree tooltip names the machine (`render_panel`) |
-| `agent` | not used; Agent switch label comes from the task's `agent:` frontmatter (`shell/mod.rs` `agent_display_name`) | the agent view's label, `Developer` (`views/workspace.rs` `render_panel`) |
-| `state` | not used; panel status is the task column (`IN PROGRESS`/`IDLE`, `shell/mod.rs` `status_for_column`, `ws_status_from_model`), not the live badge | the idle page's state, glyph and lowercase words (`views/workspace.rs` `render_toolbar` via `state_decoration`); the panel shows the task's column (IN PROGRESS), as the TUI's |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `name` | not used; the workspace panel never shows the workspace name | the idle page's toolbar (`views/workspace.rs` `render_toolbar`); not in the panel (State=Workspace draws none) | ✓ |
+| `task_id` | not used; id only in the More popover | not shown: the panel title's fallback when the title is empty (`views/workspace.rs` `render_panel`); gates the status and summary | not shown |
+| `title` | not used; the panel shows the task title from its own `IssueFile` (`workspace_panel.rs` `render_task_info`) | panel title, wrapped (`views/workspace.rs` `render_panel`) | ✓ |
+| `branch` | not used; branch only in the More popover | the idle page's place line without a worktree (`views/workspace.rs` `render_toolbar` via `location_line`) | ✓ |
+| `machine` | not used | the idle page's place line (`views/workspace.rs` `render_toolbar`); a remote panel's worktree tooltip (`render_panel`) | ✓ |
+| `is_remote` | not used | `(remote)` on the idle page's place line (`views/workspace.rs` `render_toolbar`); the worktree tooltip names the machine (`render_panel`) | not exercised: no remote machine |
+| `agent` | not used; Agent switch label comes from the task's `agent:` frontmatter (`shell/mod.rs` `agent_display_name`) | the agent view's label, `Developer` (`views/workspace.rs` `render_panel`) | ✓ |
+| `state` | not used; panel status is the task column (`IN PROGRESS`/`IDLE`, `shell/mod.rs` `status_for_column`, `ws_status_from_model`), not the live badge | the idle page's state, glyph and lowercase words (`views/workspace.rs` `render_toolbar` via `state_decoration`); the panel shows the task's column (IN PROGRESS), as the TUI's | ✓ |
 
 #
 
 ### `IssuesModel`
-| Field | TUI | Desktop |
-|---|---|---|
-| `columns` | equivalent `app.all_columns` + `column_tasks()`, drawn as lanes (`kanban.rs` `render_columns`) | lanes (`views/issues.rs` `render_board`) |
-| `title` | equivalent `display_label()` (display_name else slug) in title row "Issues · name" (`kanban.rs` `render_title`) | not shown: the Figma Issues frame has no board title (the selected project tab names the project) |
-| `loading` | equivalent `board_loading`: centered "Loading board…" overlay while no tasks (`kanban.rs` `render_full` / `render_loading_overlay`) | "Loading board…" row in each empty column (`views/issues.rs` `render_column`) |
-| `banner` | equivalent `board_banner` in title row, muted while warm, yellow when stale or cached with no daemon (`kanban.rs` `render_title`) | muted text in header (`views/issues.rs` `render_header`) |
-| `connection` | equivalent `input.connection` as muted `Connected · acme/app` in the title row after the banner (`kanban.rs` `render_title`) | `Connected · acme/app` in the header before New issue (`views/issues.rs` `render_header`) |
-| `error` | equivalent: refresh error written to `status_line` (`kanban.rs` `fail_refresh`), shown in footer (`render_footer`) | footer status when no newer status (`views/issues.rs` `render_footer`) |
-| `done_loading` | not shown: no equivalent; done column shows "(empty)" until the closed page lands | "Loading history…" row in done column (`views/issues.rs` `render_column`) |
-| `has_more_done` | equivalent `has_more_done()`: "↓ load more (m)" row in done column, paging GitHub search results while they show (`kanban.rs` `render_column`, `load_more_done`) | "Load more (m)" clickable row in done column, paging GitHub search results while they show (`views/issues.rs` `render_column`, `load_more`) |
-| `search` | equivalent `app.search.status()`: `/query` in the title row, a muted `…` while a GitHub search is on its way, then the match count or "showing local results" (`kanban.rs` `search_spans`) | a spinner glyph in the toolbar's search field while a GitHub search is on its way, and the match count or "showing local results" beside it (`views/issues.rs` `render_search`, `render_header`) |
-| `show_workflow_badges` | equivalent computed locally via `show_card_workflow_label`, gates card badge (`kanban.rs` `render_columns` / `card_meta_line`) | not shown: the desktop card always carries its workflow badge, as the Figma card draws it (`views/issues.rs` `card_meta`) |
-| `workflow_filter_label` | equivalent own text " Workflow: All ▾" chip, cyan when set, hidden unless more than one workflow (`kanban.rs` `workflow_chip_text` / `render_title`) | the workflow chip's label while a workflow filter is set, in the Button's Select style; unfiltered the chip reads `Workflows` (the Figma Header), always shown (`views/issues.rs` `render_header`) |
-| `workspace_filter_label` | equivalent own text " Workspace: All ▾" chip, cyan when set (`kanban.rs` `filter_chip_text` / `render_title`) | the workspace chip's label while a workspace filter is set, in the Select style; unfiltered the chip reads `Workspaces` (`views/issues.rs` `render_header`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `columns` | equivalent `app.all_columns` + `column_tasks()`, drawn as lanes (`kanban.rs` `render_columns`) | lanes (`views/issues.rs` `render_board`) | ✓ |
+| `title` | equivalent `display_label()` (display_name else slug) in title row "Issues · name" (`kanban.rs` `render_title`) | not shown: the Figma Issues frame has no board title (the selected project tab names the project) | not shown |
+| `loading` | equivalent `board_loading`: centered "Loading board…" overlay while no tasks (`kanban.rs` `render_full` / `render_loading_overlay`) | "Loading board…" row in each empty column (`views/issues.rs` `render_column`) | not exercised: too brief to see |
+| `banner` | equivalent `board_banner` in title row, muted while warm, yellow when stale or cached with no daemon (`kanban.rs` `render_title`) | muted text in header (`views/issues.rs` `render_header`) | not exercised: never stale |
+| `connection` | equivalent `input.connection` as muted `Connected · acme/app` in the title row after the banner (`kanban.rs` `render_title`) | `Connected · acme/app` in the header before New issue (`views/issues.rs` `render_header`) | not exercised: the file-system tracker |
+| `error` | equivalent: refresh error written to `status_line` (`kanban.rs` `fail_refresh`), shown in footer (`render_footer`) | footer status when no newer status (`views/issues.rs` `render_footer`) | not exercised: refusals showed on their cards |
+| `done_loading` | not shown: no equivalent; done column shows "(empty)" until the closed page lands | "Loading history…" row in done column (`views/issues.rs` `render_column`) | not exercised: no history to page |
+| `has_more_done` | equivalent `has_more_done()`: "↓ load more (m)" row in done column, paging GitHub search results while they show (`kanban.rs` `render_column`, `load_more_done`) | "Load more (m)" clickable row in done column, paging GitHub search results while they show (`views/issues.rs` `render_column`, `load_more`) | not exercised: no GitHub |
+| `search` | equivalent `app.search.status()`: `/query` in the title row, a muted `…` while a GitHub search is on its way, then the match count or "showing local results" (`kanban.rs` `search_spans`) | a spinner glyph in the toolbar's search field while a GitHub search is on its way, and the match count or "showing local results" beside it (`views/issues.rs` `render_search`, `render_header`) | not exercised: no GitHub |
+| `show_workflow_badges` | equivalent computed locally via `show_card_workflow_label`, gates card badge (`kanban.rs` `render_columns` / `card_meta_line`) | not shown: the desktop card always carries its workflow badge, as the Figma card draws it (`views/issues.rs` `card_meta`) | not shown |
+| `workflow_filter_label` | equivalent own text " Workflow: All ▾" chip, cyan when set, hidden unless more than one workflow (`kanban.rs` `workflow_chip_text` / `render_title`) | the workflow chip's label while a workflow filter is set, in the Button's Select style; unfiltered the chip reads `Workflows` (the Figma Header), always shown (`views/issues.rs` `render_header`) | ✓ |
+| `workspace_filter_label` | equivalent own text " Workspace: All ▾" chip, cyan when set (`kanban.rs` `filter_chip_text` / `render_title`) | the workspace chip's label while a workspace filter is set, in the Select style; unfiltered the chip reads `Workspaces` (`views/issues.rs` `render_header`) | ✓ |
 
 ### `ColumnDef`
-| Field | TUI | Desktop |
-|---|---|---|
-| `status_id` | not shown: bucketing key, move target, collapse override key (`kanban.rs` `task_belongs_to`, `override_key_for`) | not shown: desktop renders `IssueColumn`; `ColumnDef` only used for move targets (`views/board_state.rs` `move_target`) |
-| `status_name` | header label via `column_label` (`kanban.rs` `render_column`, `render_collapsed_column`) | not shown directly (header uses `IssueColumn.label`, built from it) |
-| `category` | header color via `category_color`; done sort + load-more row (`kanban.rs` `render_column`) | not shown: shared board logic only (`board.rs` `sort_column_cards`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `status_id` | not shown: bucketing key, move target, collapse override key (`kanban.rs` `task_belongs_to`, `override_key_for`) | not shown: desktop renders `IssueColumn`; `ColumnDef` only used for move targets (`views/board_state.rs` `move_target`) | not shown |
+| `status_name` | header label via `column_label` (`kanban.rs` `render_column`, `render_collapsed_column`) | not shown directly (header uses `IssueColumn.label`, built from it) | not shown |
+| `category` | header color via `category_color`; done sort + load-more row (`kanban.rs` `render_column`) | not shown: shared board logic only (`board.rs` `sort_column_cards`) | not shown |
 
 ### `IssueColumn`
-| Field | TUI | Desktop |
-|---|---|---|
-| `status_id` | n/a (uses `ColumnDef.status_id`, see above) | not shown: toggle/drop/move key (`views/board_state.rs` `toggle_column`, `drop_target`) |
-| `status_name` | n/a (equivalent `ColumnDef.status_name` is the header source) | not shown: not used (header uses `label`) |
-| `label` | equivalent `column_label(status_name)` header, rotated in collapsed strip (`kanban.rs` `render_column`, `render_collapsed_column`) | column header; letters of collapsed strip (`views/issues.rs` `render_column`, `render_collapsed`) |
-| `category` | equivalent `ColumnDef.category`: header color (`kanban.rs` `category_color`) | the header's status glyph and its color (`theme/style.rs` `status_icon`, `status_heading`); also picks the done column for history/load-more and done-insertion order (`views/issues.rs` `render_column`, `render_collapsed`, `views/board_state.rs`) |
-| `collapsed` | equivalent `is_column_collapsed()` picks the collapsed strip (`kanban.rs` `render_columns`) | picks the collapsed strip (`views/issues.rs` `render_board`) |
-| `cards` | equivalent `column_tasks()`: cards + "(N)" count (`kanban.rs` `render_column`) | cards + count, "(empty)" (`views/issues.rs` `render_column`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `status_id` | n/a (uses `ColumnDef.status_id`, see above) | not shown: toggle/drop/move key (`views/board_state.rs` `toggle_column`, `drop_target`) | not shown |
+| `status_name` | n/a (equivalent `ColumnDef.status_name` is the header source) | not shown: not used (header uses `label`) | not shown |
+| `label` | equivalent `column_label(status_name)` header, rotated in collapsed strip (`kanban.rs` `render_column`, `render_collapsed_column`) | column header; letters of collapsed strip (`views/issues.rs` `render_column`, `render_collapsed`) | ✓ |
+| `category` | equivalent `ColumnDef.category`: header color (`kanban.rs` `category_color`) | the header's status glyph and its color (`theme/style.rs` `status_icon`, `status_heading`); also picks the done column for history/load-more and done-insertion order (`views/issues.rs` `render_column`, `render_collapsed`, `views/board_state.rs`) | ✓ |
+| `collapsed` | equivalent `is_column_collapsed()` picks the collapsed strip (`kanban.rs` `render_columns`) | picks the collapsed strip (`views/issues.rs` `render_board`) | ✓ |
+| `cards` | equivalent `column_tasks()`: cards + "(N)" count (`kanban.rs` `render_column`) | cards + count, "(empty)" (`views/issues.rs` `render_column`) | ✓ |
 
 ### `IssueCard`
-| Field | TUI | Desktop |
-|---|---|---|
-| `id` | not shown on card (popover/hit key; shown in popover) | not shown on card: identity/key; shown in drag ghost (`views/issues.rs` `CardGhost`) |
-| `title` | card title, wraps to two lines (`kanban.rs` `render_column`) | card title, two-line clamp (`views/issues.rs` `render_card`) |
-| `summary` | not shown: the TUI card has no room for an excerpt; the body shows in the popover | excerpt under the title, four-line clamp (`views/issues.rs` `render_card`) |
-| `blocked` | equivalent `task.is_blocked`: lock prefix + dim title (`kanban.rs` `render_column`) | lock icon + muted title; "blocked by" deps label (`views/issues.rs` `render_card`, `card_meta`) |
-| `branch` | equivalent `card_branch()` "⎇ branch" on meta line (`kanban.rs` `card_meta_line`) | branch after the workflow badge, muted (`views/issues.rs` `card_meta`) |
-| `workflow` | not shown: raw `task.workflow` only feeds workflow-name resolution | not shown: not used anywhere |
-| `workflow_name` | equivalent `task_workflow_name()` badge (`kanban.rs` `card_meta_line`) | workflow badge on every card (`views/issues.rs` `card_meta`, `workflow_badge`) |
-| `assignee` | not shown on card: `assigned_to` drives workspace filter and the footer "workspace" hint (`kanban.rs` `render_footer`) | not shown on card (the Figma card has no assignee): detail's workspace row (`views/task_detail.rs` `render`); assign picker mark |
-| `tracker_owner` | remote tracker only: a card that isn't the user's leads its meta line with `@login` / `unassigned` in yellow (`kanban.rs` `card_meta_line`); the TUI board has no Start to withhold | remote tracker only: a card that isn't the user's leads its meta line with `@login` / `unassigned` (`views/issues.rs` `card_meta`); `s` shows the `--take` hint instead of starting (`views/board_state.rs` `start`, via `IssueCard::start_refusal`) |
-| `priority` | not shown: ordering and reorder slots only | not shown: ordering only (sort in `board.rs`) |
-| `depends_on` | not shown on card (popover only) | "depends on / blocked by ids" meta line (`views/issues.rs` `card_meta`) |
-| `status_id` | n/a (bucketing via `resolved_status_id`) | not shown: written on optimistic move only (`views/board_state.rs` `apply_open`) |
-| `stored_status` | n/a: TUI moves send no expected state (`kanban.rs` `ExecutorMovePersister`) | not shown: mutation expected state (`IssueCard::expected`, `views/board_state.rs`) |
-| `updated_at` | n/a (raw `task.updated_at` used for done ordering only) | not shown: mutation expected state + revised check (`views/board_state.rs`) |
-| `estimate` | equivalent `BoardInput::estimate(id)`: the card's last row is a bar of elapsed / estimate, yellow once overdue, only on a card with an estimate (`kanban.rs` `estimate_bar_line`) | a 3pt bar flush along the card's bottom edge, clipped to its corners, accent fill over a track, warning color once overdue, only on a card with an estimate (`views/issues.rs` `render_card`, `estimate_bar`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `id` | not shown on card (popover/hit key; shown in popover) | not shown on card: identity/key; shown in drag ghost (`views/issues.rs` `CardGhost`) | not shown |
+| `title` | card title, wraps to two lines (`kanban.rs` `render_column`) | card title, two-line clamp (`views/issues.rs` `render_card`) | ✓ |
+| `summary` | not shown: the TUI card has no room for an excerpt; the body shows in the popover | excerpt under the title, four-line clamp (`views/issues.rs` `render_card`) | ✓ |
+| `blocked` | equivalent `task.is_blocked`: lock prefix + dim title (`kanban.rs` `render_column`) | lock icon + muted title; "blocked by" deps label (`views/issues.rs` `render_card`, `card_meta`) | ✓ |
+| `branch` | equivalent `card_branch()` "⎇ branch" on meta line (`kanban.rs` `card_meta_line`) | branch after the workflow badge, muted (`views/issues.rs` `card_meta`) | ✓ |
+| `workflow` | not shown: raw `task.workflow` only feeds workflow-name resolution | not shown: not used anywhere | not shown |
+| `workflow_name` | equivalent `task_workflow_name()` badge (`kanban.rs` `card_meta_line`) | workflow badge on every card (`views/issues.rs` `card_meta`, `workflow_badge`) | ✓ |
+| `assignee` | not shown on card: `assigned_to` drives workspace filter and the footer "workspace" hint (`kanban.rs` `render_footer`) | not shown on card (the Figma card has no assignee): detail's workspace row (`views/task_detail.rs` `render`); assign picker mark | not shown |
+| `tracker_owner` | remote tracker only: a card that isn't the user's leads its meta line with `@login` / `unassigned` in yellow (`kanban.rs` `card_meta_line`); the TUI board has no Start to withhold | remote tracker only: a card that isn't the user's leads its meta line with `@login` / `unassigned` (`views/issues.rs` `card_meta`); `s` shows the `--take` hint instead of starting (`views/board_state.rs` `start`, via `IssueCard::start_refusal`) | not exercised: no remote tracker |
+| `priority` | not shown: ordering and reorder slots only | not shown: ordering only (sort in `board.rs`) | not shown |
+| `depends_on` | not shown on card (popover only) | "depends on / blocked by ids" meta line (`views/issues.rs` `card_meta`) | ✓ |
+| `status_id` | n/a (bucketing via `resolved_status_id`) | not shown: written on optimistic move only (`views/board_state.rs` `apply_open`) | not shown |
+| `stored_status` | n/a: TUI moves send no expected state (`kanban.rs` `ExecutorMovePersister`) | not shown: mutation expected state (`IssueCard::expected`, `views/board_state.rs`) | not shown |
+| `updated_at` | n/a (raw `task.updated_at` used for done ordering only) | not shown: mutation expected state + revised check (`views/board_state.rs`) | not shown |
+| `estimate` | equivalent `BoardInput::estimate(id)`: the card's last row is a bar of elapsed / estimate, yellow once overdue, only on a card with an estimate (`kanban.rs` `estimate_bar_line`) | a 3pt bar flush along the card's bottom edge, clipped to its corners, accent fill over a track, warning color once overdue, only on a card with an estimate (`views/issues.rs` `render_card`, `estimate_bar`) | not exercised: no estimate set |
 
 ### `DepBadge`
-| Field | TUI | Desktop |
-|---|---|---|
-| `id` | equivalent dep id in popover deps row (`kanban.rs` `popover_header`) | card meta deps list (`views/issues.rs` `card_meta`); detail deps row (`views/task_detail.rs` `render`) |
-| `status` | equivalent `columns.get(dep)` as "[status]" or "[missing]" in popover (`kanban.rs` `popover_header`) | "[status]" or "[missing]" in detail (`views/task_detail.rs` `render`); not on card |
-| `done` | equivalent: dep text colored by its column category, green when done, red when missing (`kanban.rs` `popover_header`) | `✓` after a done dependency in the detail, monochrome (`views/task_detail.rs` `dep_text`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `id` | equivalent dep id in popover deps row (`kanban.rs` `popover_header`) | card meta deps list (`views/issues.rs` `card_meta`); detail deps row (`views/task_detail.rs` `render`) | ✓ |
+| `status` | equivalent `columns.get(dep)` as "[status]" or "[missing]" in popover (`kanban.rs` `popover_header`) | "[status]" or "[missing]" in detail (`views/task_detail.rs` `render`); not on card | ✓ |
+| `done` | equivalent: dep text colored by its column category, green when done, red when missing (`kanban.rs` `popover_header`) | `✓` after a done dependency in the detail, monochrome (`views/task_detail.rs` `dep_text`) | not exercised: no done dependency |
 
 ### `BoardFilters`
-| Field | TUI | Desktop |
-|---|---|---|
-| `workflow` | equivalent `app.workflow_filter`: narrows columns/cards, chip text + cyan highlight (`kanban.rs` `task_belongs_to`, `workflow_chip_text`) | narrows model in `IssuesModel::build`; surfaces as chip label and dropdown cursor (`views/board_state.rs`) |
-| `workspace` | equivalent `app.workspace_filter`: filters cards, chip text + cyan highlight (`kanban.rs` `task_matches_filter`, `filter_chip_text`) | filters model in `IssuesModel::build`; chip label, dropdown cursor, persisted (`views/board_state.rs`) |
-| `search` | equivalent `app.search` (`BoardSearch`): `/` types the query in the title row, Enter keeps it, Esc clears it; a GitHub search on a GitHub board, else a filter by title, id and branch (`kanban.rs` `set_search`, `task_matches_search`; `handlers/kanban.rs` `handle_search_key`) | the toolbar's Search field; the same `BoardSearch` in `IssuesModel::build_searched` (`board_search.rs`), `/` focuses it, Esc clears it (`views/issues.rs` `render_search`, `views/board_state.rs` `set_search`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `workflow` | equivalent `app.workflow_filter`: narrows columns/cards, chip text + cyan highlight (`kanban.rs` `task_belongs_to`, `workflow_chip_text`) | narrows model in `IssuesModel::build`; surfaces as chip label and dropdown cursor (`views/board_state.rs`) | ✓ |
+| `workspace` | equivalent `app.workspace_filter`: filters cards, chip text + cyan highlight (`kanban.rs` `task_matches_filter`, `filter_chip_text`) | filters model in `IssuesModel::build`; chip label, dropdown cursor, persisted (`views/board_state.rs`) | ✓ |
+| `search` | equivalent `app.search` (`BoardSearch`): `/` types the query in the title row, Enter keeps it, Esc clears it; a GitHub search on a GitHub board, else a filter by title, id and branch (`kanban.rs` `set_search`, `task_matches_search`; `handlers/kanban.rs` `handle_search_key`) | the toolbar's Search field; the same `BoardSearch` in `IssuesModel::build_searched` (`board_search.rs`), `/` focuses it, Esc clears it (`views/issues.rs` `render_search`, `views/board_state.rs` `set_search`) | ✓ |
 
 ### `TaskDetailModel`
-| Field | TUI | Desktop |
-|---|---|---|
-| `id` | equivalent `task.id` "id:" row (`kanban.rs` `popover_header`) | Header's `Workflow / id` (`views/task_detail.rs` `header`) |
-| `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | pane title, Desktop/Title, edited in place (a `DocEditor` on the draft's title; blank is held back with an inline message) (`views/task_detail.rs` `details`, `views/doc_editor`) |
-| `status_id` | not shown (popover keyed by task id) | not shown: not used |
-| `status_label` | equivalent but different source: `column_label(task.column.default_status_name())`, stored column not resolved status (`kanban.rs` `popover_header`) | not shown: `status_name` instead (the Figma frame spells the status as the workflow does) |
-| `status_name` | not shown: the popover shows the column label (`status_label`) | the Status picker's value when no change is settling (`views/task_detail.rs` `properties`; `BoardState::pane_properties` shows an in-flight move's target) |
-| `category` | equivalent: status text colored by `column_color(task.column)` (`kanban.rs` `popover_header`) | Status property's status glyph (`views/task_detail.rs` `properties`) |
-| `priority` | "priority:" on column row (`kanban.rs` `popover_header`) | not shown raw: the Priority property shows the task's 1-based place in its stored queue, "N in queue" (`shelbi_app::task_properties::queue_position`, `views/task_detail.rs` `properties`) |
-| `assignee` | "workspace: @ws" when set; footer workspace hint (`kanban.rs` `popover_header`, `render_task_popover_into`) | not a property (the Task pane frames dropped the Workspace row); More offers Open workspace only when set, and the assign picker marks it "(assigned)" (`board_state.rs` `pane_actions`, `issues.rs` `render_assign`) |
-| `tracker_owner` | equivalent `OwnershipGate::owner(tracker_assignees)`: "owner:" row, `me` or `@login` plus the `--take` hint, remote tracker only; not in the review popover (`kanban.rs` `popover_header`) | Owner property, `Me` or `@login` plus the `--take` hint, remote tracker only; leaves Start out of More when not the user's (`views/task_detail.rs` `properties`, `board_state.rs` `pane_actions`) |
-| `branch` | equivalent but raw `task.branch` only, no templated base branch (`kanban.rs` `popover_header`) | Branch property in the mono face, resolved `card_branch`, selectable (More copies it); "Created when work starts" when none (`views/task_detail.rs` `properties`) |
-| `workflow_name` | not shown | Header's `Workflow / id`, and the Workflow picker's value when no change is settling, capitalized (`views/task_detail.rs` `workflow_label`) |
-| `depends_on` | deps row with "[status]" (`kanban.rs` `popover_header`) | Depends on property with "[status]", when any (`views/task_detail.rs` `properties`) |
-| `blocked` | "blocked by" vs "depends on" label (`kanban.rs` `popover_header`) | "Blocked by" vs "Depends on" label (`views/task_detail.rs` `properties`) |
-| `pr` | equivalent `board::task_pr(task)`: "pr:" row, `#2137 ↗` then the state and the colored CI result; `p` or a click on the row opens the page, the footer offers it (`kanban.rs` `popover_header`, `render_task_popover_into`, `handlers/kanban.rs`) | PR property: the `#2137 ↗` link, then the state and the colored CI result; `p` and More's Open pull request open it too (`views/task_detail.rs` `properties`, `views/task_panel.rs` `pr_value`, `views/board_state.rs` `open_pr`) |
-| `estimate` | equivalent `BoardInput::estimate(id)`: "estimate:" row, `2h · 1h 12m elapsed (60%)`, yellow `(overdue)` past it, only while the issue has one (`kanban.rs` `popover_header`, via `shelbi_app::estimate`) | Estimate property, the same text, in the warning color once overdue, only while the issue has one (`views/task_detail.rs` `properties`, via `shelbi_app::estimate`) |
-| `created` | "created:" row (`kanban.rs` `popover_header`) | "Created Oct 26" under the body (`views/task_detail.rs` `short_date`) |
-| `updated` | "updated:" on created row (`kanban.rs` `popover_header`) | "Updated Oct 28" beside it (`views/task_detail.rs` `short_date`) |
-| `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | the formatted body in the pane's scroll, edited in place WYSIWYG (`shelbi_app::markdown_edit` over the source; checkboxes click; "Write a description…" placeholder when empty); More / `e` put the keys in it (`views/task_detail.rs` `details`, `views/doc_editor`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `id` | equivalent `task.id` "id:" row (`kanban.rs` `popover_header`) | Header's `Workflow / id` (`views/task_detail.rs` `header`) | ✓ |
+| `title` | equivalent `task.title` in popover border title (`kanban.rs` `render_task_popover_into`) | pane title, Desktop/Title, edited in place (a `DocEditor` on the draft's title; blank is held back with an inline message) (`views/task_detail.rs` `details`, `views/doc_editor`) | ✓ |
+| `status_id` | not shown (popover keyed by task id) | not shown: not used | not shown |
+| `status_label` | equivalent but different source: `column_label(task.column.default_status_name())`, stored column not resolved status (`kanban.rs` `popover_header`) | not shown: `status_name` instead (the Figma frame spells the status as the workflow does) | not shown |
+| `status_name` | not shown: the popover shows the column label (`status_label`) | the Status picker's value when no change is settling (`views/task_detail.rs` `properties`; `BoardState::pane_properties` shows an in-flight move's target) | ✓ |
+| `category` | equivalent: status text colored by `column_color(task.column)` (`kanban.rs` `popover_header`) | Status property's status glyph (`views/task_detail.rs` `properties`) | ✓ |
+| `priority` | "priority:" on column row (`kanban.rs` `popover_header`) | not shown raw: the Priority property shows the task's 1-based place in its stored queue, "N in queue" (`shelbi_app::task_properties::queue_position`, `views/task_detail.rs` `properties`) | not shown |
+| `assignee` | "workspace: @ws" when set; footer workspace hint (`kanban.rs` `popover_header`, `render_task_popover_into`) | not a property (the Task pane frames dropped the Workspace row); More offers Open workspace only when set, and the assign picker marks it "(assigned)" (`board_state.rs` `pane_actions`, `issues.rs` `render_assign`) | not shown |
+| `tracker_owner` | equivalent `OwnershipGate::owner(tracker_assignees)`: "owner:" row, `me` or `@login` plus the `--take` hint, remote tracker only; not in the review popover (`kanban.rs` `popover_header`) | Owner property, `Me` or `@login` plus the `--take` hint, remote tracker only; leaves Start out of More when not the user's (`views/task_detail.rs` `properties`, `board_state.rs` `pane_actions`) | not exercised: no remote tracker |
+| `branch` | equivalent but raw `task.branch` only, no templated base branch (`kanban.rs` `popover_header`) | Branch property in the mono face, resolved `card_branch`, selectable (More copies it); "Created when work starts" when none (`views/task_detail.rs` `properties`) | ✓ |
+| `workflow_name` | not shown | Header's `Workflow / id`, and the Workflow picker's value when no change is settling, capitalized (`views/task_detail.rs` `workflow_label`) | ✓ |
+| `depends_on` | deps row with "[status]" (`kanban.rs` `popover_header`) | Depends on property with "[status]", when any (`views/task_detail.rs` `properties`) | ✓ |
+| `blocked` | "blocked by" vs "depends on" label (`kanban.rs` `popover_header`) | "Blocked by" vs "Depends on" label (`views/task_detail.rs` `properties`) | ✓ |
+| `pr` | equivalent `board::task_pr(task)`: "pr:" row, `#2137 ↗` then the state and the colored CI result; `p` or a click on the row opens the page, the footer offers it (`kanban.rs` `popover_header`, `render_task_popover_into`, `handlers/kanban.rs`) | PR property: the `#2137 ↗` link, then the state and the colored CI result; `p` and More's Open pull request open it too (`views/task_detail.rs` `properties`, `views/task_panel.rs` `pr_value`, `views/board_state.rs` `open_pr`) | not exercised: no GitHub |
+| `estimate` | equivalent `BoardInput::estimate(id)`: "estimate:" row, `2h · 1h 12m elapsed (60%)`, yellow `(overdue)` past it, only while the issue has one (`kanban.rs` `popover_header`, via `shelbi_app::estimate`) | Estimate property, the same text, in the warning color once overdue, only while the issue has one (`views/task_detail.rs` `properties`, via `shelbi_app::estimate`) | not exercised: no estimate set |
+| `created` | "created:" row (`kanban.rs` `popover_header`) | "Created Oct 26" under the body (`views/task_detail.rs` `short_date`) | ✓ |
+| `updated` | "updated:" on created row (`kanban.rs` `popover_header`) | "Updated Oct 28" beside it (`views/task_detail.rs` `short_date`) | ✓ |
+| `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | the formatted body in the pane's scroll, edited in place WYSIWYG (`shelbi_app::markdown_edit` over the source; checkboxes click; "Write a description…" placeholder when empty); More / `e` put the keys in it (`views/task_detail.rs` `details`, `views/doc_editor`) | ✓ |
 
 ### `MachinesModel`
-| Field | TUI | Desktop |
-|---|---|---|
-| `display_name` | title bar after "Machines", falls back to project slug (`machines.rs` `display_label` / `render_title`) | header after "Machines", falls back to slug (`views/machines_state.rs` `title`, `views/machines.rs` `render`) |
-| `machines` | one header line plus workspace lines per machine; "No machines declared" when empty (`machines.rs` `render_body`) | one group per machine; same empty text; footer also shows a total "N workspaces" count via `workspace_count` (`views/machines.rs` `render_body` / `render`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `display_name` | title bar after "Machines", falls back to project slug (`machines.rs` `display_label` / `render_title`) | header after "Machines", falls back to slug (`views/machines_state.rs` `title`, `views/machines.rs` `render`) | ✓ |
+| `machines` | one header line plus workspace lines per machine; "No machines declared" when empty (`machines.rs` `render_body`) | one group per machine; same empty text; footer also shows a total "N workspaces" count via `workspace_count` (`views/machines.rs` `render_body` / `render`) | ✓ |
 
 ### `MachineRow`
-| Field | TUI | Desktop |
-|---|---|---|
-| `name` | bold machine heading (`machines.rs` `machine_header_line`) | machine heading, Base Medium, loud (`views/machines.rs` `machine_header`) |
-| `kind` | not shown: `is_local` is used instead | not shown: `is_local` is used instead |
-| `host` | `ssh <host>` location label (`machines.rs` `machine_header_line`); also feeds prober targets (`probe_targets`) | `ssh <host>` location label (`views/machines.rs` `machine_header`); also feeds prober targets |
-| `is_local` | "local" vs `ssh <host>`; gates reachability and binary badges (`machines.rs` `machine_header_line`) | same (`views/machines.rs` `machine_header`) |
-| `tags` | `[a, b]` badge in workflow-badge color (`machines.rs` `machine_header_line`) | `[a, b]` in the workflow badge's text color on the line under the heading (`views/machines.rs` `machine_metadata`) |
-| `remote` | remote binary `path vX` / incompatible / "not set up" badge, remotes only (`machines.rs` `machine_header_line`) | same text on the line under the heading, muted when resolved, remotes only (`views/machines.rs` `machine_metadata`) |
-| `reachability` | reachable / checking / unreachable badge, remotes only, error truncated at 40 (`machines.rs` `reachability_span`) | same label after the ssh host, remotes only, error truncated at 80 with the whole reason on hover (`views/machines.rs` `machine_header`) |
-| `workspaces` | one line per workspace, "(no workspaces)" when empty (`machines.rs` `render_body`) | one clickable row per workspace, "(no workspaces)" when empty (`views/machines.rs` `render_body`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `name` | bold machine heading (`machines.rs` `machine_header_line`) | machine heading, Base Medium, loud (`views/machines.rs` `machine_header`) | ✓ |
+| `kind` | not shown: `is_local` is used instead | not shown: `is_local` is used instead | not shown |
+| `host` | `ssh <host>` location label (`machines.rs` `machine_header_line`); also feeds prober targets (`probe_targets`) | `ssh <host>` location label (`views/machines.rs` `machine_header`); also feeds prober targets | not exercised: no remote machine |
+| `is_local` | "local" vs `ssh <host>`; gates reachability and binary badges (`machines.rs` `machine_header_line`) | same (`views/machines.rs` `machine_header`) | ✓ |
+| `tags` | `[a, b]` badge in workflow-badge color (`machines.rs` `machine_header_line`) | `[a, b]` in the workflow badge's text color on the line under the heading (`views/machines.rs` `machine_metadata`) | not exercised: the machine has no tags |
+| `remote` | remote binary `path vX` / incompatible / "not set up" badge, remotes only (`machines.rs` `machine_header_line`) | same text on the line under the heading, muted when resolved, remotes only (`views/machines.rs` `machine_metadata`) | not exercised: no remote machine |
+| `reachability` | reachable / checking / unreachable badge, remotes only, error truncated at 40 (`machines.rs` `reachability_span`) | same label after the ssh host, remotes only, error truncated at 80 with the whole reason on hover (`views/machines.rs` `machine_header`) | not exercised: no remote machine |
+| `workspaces` | one line per workspace, "(no workspaces)" when empty (`machines.rs` `render_body`) | one clickable row per workspace, "(no workspaces)" when empty (`views/machines.rs` `render_body`) | ✓ |
 
 ### `MachineWorkspace`
-| Field | TUI | Desktop |
-|---|---|---|
-| `name` | 18-char name column; also what Enter opens (`machines.rs` `workspace_line`, `selected_workspace`) | 150px name column; also what click/Enter focuses (`views/machines.rs` `workspace_row`, `views/machines_state.rs` `focus_selected`) |
-| `is_review_slot` | not shown: never read by the view | not shown: never read by the view (review rows are recognized via `review` / `assignment`) |
-| `state` | observed-state badge (`machines.rs` `workspace_line`) | 76px observed-state column; a serving review slot reads `review` (the Figma frame) (`views/machines.rs` `state_cell`) |
-| `current_task` | not shown: the task cell uses `assignment`, as on the desktop (`dt-parity-audit`) | not shown: the task cell uses `assignment` instead |
-| `assignment` | `in_progress: <ids>` / `review: <id>` / "idle" cell (`machines.rs` `workspace_line`) | `<status>: <title>` via `MachineWorkspace::task_cell`, the ids cell on hover (`views/machines.rs` `workspace_row`) |
-| `agent` | agent column, `-` when idle (`machines.rs` `workspace_line`) | not shown: the Figma frame's third column is the runner (`dt-figma-machines`) |
-| `runner` | not shown: the TUI keeps its agent column | 96px runner column (`Codex`, `Claude`), `—` when idle (`views/machines.rs` `workspace_row`) |
-| `task_title` | task title after the assignment cell (`machines.rs` `workspace_line`) | the title in the task cell, `<status>: <title>` (`MachineWorkspace::task_cell`, `views/machines.rs` `workspace_row`) |
-| `branch` | `⎇ branch` (`machines.rs` `workspace_line`) | `⎇ branch`, right-aligned (`views/machines.rs` `workspace_row`) |
-| `review` | review server state and URL (`machines.rs` `workspace_line`) | `starting` while the server isn't up, and the clickable URL (`views/machines.rs` `workspace_row`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `name` | 18-char name column; also what Enter opens (`machines.rs` `workspace_line`, `selected_workspace`) | 150px name column; also what click/Enter focuses (`views/machines.rs` `workspace_row`, `views/machines_state.rs` `focus_selected`) | ✓ |
+| `is_review_slot` | not shown: never read by the view | not shown: never read by the view (review rows are recognized via `review` / `assignment`) | not shown |
+| `state` | observed-state badge (`machines.rs` `workspace_line`) | 76px observed-state column; a serving review slot reads `review` (the Figma frame) (`views/machines.rs` `state_cell`) | ✓ |
+| `current_task` | not shown: the task cell uses `assignment`, as on the desktop (`dt-parity-audit`) | not shown: the task cell uses `assignment` instead | not shown |
+| `assignment` | `in_progress: <ids>` / `review: <id>` / "idle" cell (`machines.rs` `workspace_line`) | `<status>: <title>` via `MachineWorkspace::task_cell`, the ids cell on hover (`views/machines.rs` `workspace_row`) | ✓ |
+| `agent` | agent column, `-` when idle (`machines.rs` `workspace_line`) | not shown: the Figma frame's third column is the runner (`dt-figma-machines`) | not shown |
+| `runner` | not shown: the TUI keeps its agent column | 96px runner column (`Codex`, `Claude`), `—` when idle (`views/machines.rs` `workspace_row`) | ✓ |
+| `task_title` | task title after the assignment cell (`machines.rs` `workspace_line`) | the title in the task cell, `<status>: <title>` (`MachineWorkspace::task_cell`, `views/machines.rs` `workspace_row`) | ✓ |
+| `branch` | `⎇ branch` (`machines.rs` `workspace_line`) | `⎇ branch`, right-aligned (`views/machines.rs` `workspace_row`) | ✓ |
+| `review` | review server state and URL (`machines.rs` `workspace_line`) | `starting` while the server isn't up, and the clickable URL (`views/machines.rs` `workspace_row`) | ✓ the slot's state; no URL, since the sandbox serves nothing |
 
 ### `ReviewSlot`
-| Field | TUI | Desktop |
-|---|---|---|
-| `task_id` | not shown directly: the same id appears via `assignment` (`review: <id>`) | not shown directly: the same id appears via `assignment` (`review: <id>`), which `MachinesModel::build` derives from this field (`views/machines.rs` `workspace_row`) |
-| `state` | "serving" (cyan) / "starting" (gray) via `ReviewSlot::label` (`machines.rs` `workspace_line`) | "starting" (muted) via `ReviewSlot::label`; serving shows only as the state column's `review` (`views/machines.rs` `workspace_row`) |
-| `url` | URL after the state (`machines.rs` `workspace_line`); not clickable in a terminal | clickable URL with external-link icon, opens in browser (`views/machines.rs` `workspace_row`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `task_id` | not shown directly: the same id appears via `assignment` (`review: <id>`) | not shown directly: the same id appears via `assignment` (`review: <id>`), which `MachinesModel::build` derives from this field (`views/machines.rs` `workspace_row`) | not shown |
+| `state` | "serving" (cyan) / "starting" (gray) via `ReviewSlot::label` (`machines.rs` `workspace_line`) | "starting" (muted) via `ReviewSlot::label`; serving shows only as the state column's `review` (`views/machines.rs` `workspace_row`) | ✓ |
+| `url` | URL after the state (`machines.rs` `workspace_line`); not clickable in a terminal | clickable URL with external-link icon, opens in browser (`views/machines.rs` `workspace_row`) | not exercised: the sandbox serves nothing |
 
 ### `MachinesInput`
 Neither client builds or reads `MachinesInput`. Both call the shared reader `shelbi_orchestrator::machines_model::read_machines_model` (`crates/shelbi-orchestrator/src/machines_model.rs`), which fills it and maps it through `MachinesModel::build`; the clients only see the resulting `MachinesModel`. So each field's parity is the parity of the output field it feeds.
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `display_name` | via `MachinesModel.display_name`: title (`machines.rs` `render_title`) | via `MachinesModel.display_name`: header (`views/machines.rs` `render`) |
-| `machines` | via `MachineRow` name/kind/host/is_local/tags: machine header (`machines.rs` `machine_header_line`) | via same: machine header (`views/machines.rs` `machine_header`) |
-| `workspaces` | via `MachineWorkspace.name` (+ `is_review_slot`, unshown): workspace lines (`machines.rs` `workspace_line`) | via same: workspace rows (`views/machines.rs` `workspace_row`) |
-| `records` | via `MachineRow.remote`: binary badge (`machines.rs` `machine_header_line`) | via same: binary badge (`views/machines.rs` `machine_header`) |
-| `statuses` | via `state` only (badge); `current_task` unshown (`machines.rs` `workspace_line`) | via `state` only (badge); `current_task` unshown (`views/machines.rs` `workspace_row`) |
-| `in_progress` | via `assignment`, `agent`, `task_title`, `branch` (`machines.rs` `workspace_line`) | via `assignment`, `agent`, `task_title`, `branch` (`views/machines.rs` `workspace_row`) |
-| `review_slots` | via `review` (state + URL) and `assignment` (`machines.rs` `workspace_line`) | via `review` (state + URL) and `assignment` (`views/machines.rs` `workspace_row`) |
-| `branches` | via `branch` (`machines.rs` `workspace_line`) | via `branch` (`views/machines.rs` `workspace_row`) |
-| `titles` | via `task_title` (`machines.rs` `workspace_line`) | via `task_title` (`views/machines.rs` `workspace_row`) |
-| `runners` | not shown (via `runner`, which the TUI doesn't draw) | via `runner` (`views/machines.rs` `workspace_row`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `display_name` | via `MachinesModel.display_name`: title (`machines.rs` `render_title`) | via `MachinesModel.display_name`: header (`views/machines.rs` `render`) | ✓ |
+| `machines` | via `MachineRow` name/kind/host/is_local/tags: machine header (`machines.rs` `machine_header_line`) | via same: machine header (`views/machines.rs` `machine_header`) | ✓ |
+| `workspaces` | via `MachineWorkspace.name` (+ `is_review_slot`, unshown): workspace lines (`machines.rs` `workspace_line`) | via same: workspace rows (`views/machines.rs` `workspace_row`) | ✓ |
+| `records` | via `MachineRow.remote`: binary badge (`machines.rs` `machine_header_line`) | via same: binary badge (`views/machines.rs` `machine_header`) | not exercised: no remote machine |
+| `statuses` | via `state` only (badge); `current_task` unshown (`machines.rs` `workspace_line`) | via `state` only (badge); `current_task` unshown (`views/machines.rs` `workspace_row`) | ✓ |
+| `in_progress` | via `assignment`, `agent`, `task_title`, `branch` (`machines.rs` `workspace_line`) | via `assignment`, `agent`, `task_title`, `branch` (`views/machines.rs` `workspace_row`) | ✓ |
+| `review_slots` | via `review` (state + URL) and `assignment` (`machines.rs` `workspace_line`) | via `review` (state + URL) and `assignment` (`views/machines.rs` `workspace_row`) | ✓ |
+| `branches` | via `branch` (`machines.rs` `workspace_line`) | via `branch` (`views/machines.rs` `workspace_row`) | ✓ |
+| `titles` | via `task_title` (`machines.rs` `workspace_line`) | via `task_title` (`views/machines.rs` `workspace_row`) | ✓ |
+| `runners` | not shown (via `runner`, which the TUI doesn't draw) | via `runner` (`views/machines.rs` `workspace_row`) | ✓ |
 
 ### `ReviewPanelModel`
 The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it with `ReviewPanelModel::build`). The TUI does not consume this model: its `ReviewPanel` (`review_panel.rs`) is built from `ReviewOpenParams` (task id, slot, worktree, editor name, a `has_review_url` bool, and the `IssueFile`) in `shell/mod.rs` `build_review_interface`. The TUI column maps each field to the equivalent datum.
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `task_id` | `id` row in the More popover header, from the `IssueFile` (`kanban.rs` `popover_header`, opened by `shell/overlays.rs` `task_description`); also keys approve/reject | title fallback when the title is empty (`views/review.rs` `render_panel`); also keys approve/reject |
-| `slot` | not shown: binds the content sessions (`shell/review.rs` `show_chat` / `show_role`) | not shown: binds the content sessions and the user shell (`views/review.rs` `content_target`, `open_shell`) |
-| `title` | bold task-info title (`review_panel.rs` `render_full` via `panel.rs` `render_task_info`); More popover title (`kanban.rs` `render_task_popover_into`) | Base/Medium title (`views/review.rs` `render_panel` via `task_panel::summary`) |
-| `body` | More popover markdown body (`kanban.rs` `render_task_popover_into`) | not shown as markdown: gates More via `has_body` (`views/review.rs` `render_panel`) |
-| `description` | 3-line preview, computed from the raw body with the same `description_text` (`panel.rs` `description_preview`) | clamped to five lines, More opening the task pane over the screen (`views/review.rs` `render_panel` via `task_panel::summary`; the window draws the board's pane, `app.rs` `open_task_over`) |
-| `worktree` | left-truncated folder row, always shown, the first info row under the summary (`review_panel.rs` `render_full` via `panel.rs` `render_info_rows`) | worktree row, its last four components, Open reveals it in Finder, no Open on a remote slot; the first info row under the summary (`views/review.rs` `render_panel` via `task_panel::worktree_row`) |
-| `status_label` | hardcoded "Ready for review" beside back button (`review_panel.rs` `render_full`) | not shown: the panel shows the task's column (REVIEW, the purple glyph) beside the back button, as State=Review draws it (`views/review.rs` `render_panel`) |
-| `editor_name` | "Edit in <editor>" switch label (`review_panel.rs` `switch_entry`) | same label (`views/review.rs` `render_panel`) |
-| `apps` | Edit / View Diff launch the app instead of a pane (`review_panel.rs` `with_apps`) | same (`views/review.rs` `PanelEffect::OpenApp`) |
-| `review_url` | not shown: only a `has_review_url` bool gating the Open Browser switch (`review_panel.rs` `rows`); URL resolved at open time (`review_panel.rs` `review_url`) | the Web Browser row's tooltip (`views/review.rs` `render_panel`, `render_waiting_browser`); gates the row |
-| `pr` | `⇵ PR #2137 ●` under the branch, the dot in the CI's color (no state or CI words); Enter on it and a click open it (`review_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `PanelEffect::OpenPr` in `shell/mod.rs`) | the PR row under the branch: the pull-request icon, `PR #2137`, one CI-colored dot, the URL, state and CI in its tooltip; Enter and a click open it (`views/review.rs` `render_panel` via `task_panel::pr_row`, `PanelEffect::OpenPr`) |
-| `branch` | `⎇ <branch>` under the folder, hidden without one; Enter or a click copies it with a `Copied <branch>` toast (`review_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `ReviewAction::CopyBranch` in `shell/mod.rs`) | the branch row under the worktree (git-branch icon, the name cut at the end), hidden without one; Enter or a click copies it with a toast (`views/review.rs` `render_panel` via `task_panel::branch_row`, `PanelEffect::CopyBranch`) |
-| `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` drops Open from the worktree row and Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) |
-| `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌃N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) |
-| `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | the Web Browser row: inert with a muted "loading…" in place of its ⌃4 hint until serving, the sub-state, detail and health check in its tooltip (`views/review.rs` `render_waiting_browser`); State=Review draws no server block |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `task_id` | `id` row in the More popover header, from the `IssueFile` (`kanban.rs` `popover_header`, opened by `shell/overlays.rs` `task_description`); also keys approve/reject | title fallback when the title is empty (`views/review.rs` `render_panel`); also keys approve/reject | ✓ |
+| `slot` | not shown: binds the content sessions (`shell/review.rs` `show_chat` / `show_role`) | not shown: binds the content sessions and the user shell (`views/review.rs` `content_target`, `open_shell`) | not shown |
+| `title` | bold task-info title (`review_panel.rs` `render_full` via `panel.rs` `render_task_info`); More popover title (`kanban.rs` `render_task_popover_into`) | Base/Medium title (`views/review.rs` `render_panel` via `task_panel::summary`) | ✓ |
+| `body` | More popover markdown body (`kanban.rs` `render_task_popover_into`) | not shown as markdown: gates More via `has_body` (`views/review.rs` `render_panel`) | not shown |
+| `description` | 3-line preview, computed from the raw body with the same `description_text` (`panel.rs` `description_preview`) | clamped to five lines, More opening the task pane over the screen (`views/review.rs` `render_panel` via `task_panel::summary`; the window draws the board's pane, `app.rs` `open_task_over`) | ✓ |
+| `worktree` | left-truncated folder row, always shown, the first info row under the summary (`review_panel.rs` `render_full` via `panel.rs` `render_info_rows`) | worktree row, its last four components, Open reveals it in Finder, no Open on a remote slot; the first info row under the summary (`views/review.rs` `render_panel` via `task_panel::worktree_row`) | ✓ Open opens it in the file manager (`xdg-open`); its tooltip said Finder, fixed here |
+| `status_label` | hardcoded "Ready for review" beside back button (`review_panel.rs` `render_full`) | not shown: the panel shows the task's column (REVIEW, the purple glyph) beside the back button, as State=Review draws it (`views/review.rs` `render_panel`) | not shown |
+| `editor_name` | "Edit in <editor>" switch label (`review_panel.rs` `switch_entry`) | same label (`views/review.rs` `render_panel`) | ✓ |
+| `apps` | Edit / View Diff launch the app instead of a pane (`review_panel.rs` `with_apps`) | same (`views/review.rs` `PanelEffect::OpenApp`) | ✓ |
+| `review_url` | not shown: only a `has_review_url` bool gating the Open Browser switch (`review_panel.rs` `rows`); URL resolved at open time (`review_panel.rs` `review_url`) | the Web Browser row's tooltip (`views/review.rs` `render_panel`, `render_waiting_browser`); gates the row | not exercised: the tooltip wasn't hovered |
+| `pr` | `⇵ PR #2137 ●` under the branch, the dot in the CI's color (no state or CI words); Enter on it and a click open it (`review_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `PanelEffect::OpenPr` in `shell/mod.rs`) | the PR row under the branch: the pull-request icon, `PR #2137`, one CI-colored dot, the URL, state and CI in its tooltip; Enter and a click open it (`views/review.rs` `render_panel` via `task_panel::pr_row`, `PanelEffect::OpenPr`) | not exercised: no GitHub |
+| `branch` | `⎇ <branch>` under the folder, hidden without one; Enter or a click copies it with a `Copied <branch>` toast (`review_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `ReviewAction::CopyBranch` in `shell/mod.rs`) | the branch row under the worktree (git-branch icon, the name cut at the end), hidden without one; Enter or a click copies it with a toast (`views/review.rs` `render_panel` via `task_panel::branch_row`, `PanelEffect::CopyBranch`) | ✓ |
+| `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` drops Open from the worktree row and Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) | not exercised: no remote machine |
+| `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌃N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) | ✓ with Alt+1 to Alt+4 (⌃N on the Mac) |
+| `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | the Web Browser row: inert with a muted "loading…" in place of its ⌃4 hint until serving, the sub-state, detail and health check in its tooltip (`views/review.rs` `render_waiting_browser`); State=Review draws no server block | ✓ |
 
 ### `OnboardingModel`
 The Orchestrator view's onboarding (`orch-onboarding`), built by `shelbi_app::onboarding::OnboardingState::model` and shown in place of the orchestrator's terminal while the project's orchestrator isn't set up.
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `step` | which step the page draws: intro, harness, instructions (`shell/onboarding.rs` `render`) | which step the view draws (`views/onboarding.rs` `render`, `render_intro`, `render_harness`, `render_instructions`) |
-| `loading` | "Loading…" in the pickers and the editor, Continue and Launch dimmed (`shell/onboarding.rs` `render_harness`, `area_lines`) | "Loading…" in the pickers and in place of the editor, Continue and Launch disabled (`views/onboarding.rs` `render_harness`, `render_instructions`) |
-| `harnesses` | the Harness box (the selected one's label, its provider muted) and its picker's rows; ← → step through them (`picker.rs` `select_lines`, `harness_labels`, `render_menu` via `shell/onboarding.rs` `choices`) | the Harness picker's button (label, provider muted) and its menu rows (`views/harness_picker.rs` `picker_button`, `fields`, from `views/onboarding.rs` `render_harness`) |
-| `models` | the Default model picker's rows, then "Custom model…" (typed in the box) (`shell/onboarding.rs` `choices`, `render_menu`) | the Default model menu's rows (`views/onboarding.rs` `render_harness`); a model already on disk is kept as a row, as the agent editor keeps it |
-| `model_label` | the Default model box's text (`shell/onboarding.rs` `render_harness`) | the Default model button's label (`views/onboarding.rs` `render_harness`) |
-| `model_enabled` | a disabled box, out of the Tab order (`shell/onboarding.rs` `items`, `render_harness`) | the button dimmed with no menu (`views/onboarding.rs` `render_harness`) |
-| `model_note` | in place of the helper under Default model (`shell/onboarding.rs` `render_harness`) | in place of the helper under Default model (`views/onboarding.rs` `render_harness`) |
-| `instructions` | the editor's text, kept in the page's `TextArea` (`shell/onboarding.rs` `area_lines`) | the editor's text, kept in its `TextareaState` (`views/onboarding.rs` `loaded`, `render_instructions`) |
-| `error` | red, over the step's rule (`shell/onboarding.rs` `error_rows`) | red, over the step's rule (`views/onboarding.rs` `render_harness`, `render_instructions`) |
-| `busy` | "Saving…" / "Launching…" on a disabled button; keys and clicks wait (`shell/onboarding.rs` `render_harness`, `render_instructions`) | the same labels on disabled buttons (`views/onboarding.rs` `render_harness`, `render_instructions`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `step` | which step the page draws: intro, harness, instructions (`shell/onboarding.rs` `render`) | which step the view draws (`views/onboarding.rs` `render`, `render_intro`, `render_harness`, `render_instructions`) | ✓ |
+| `loading` | "Loading…" in the pickers and the editor, Continue and Launch dimmed (`shell/onboarding.rs` `render_harness`, `area_lines`) | "Loading…" in the pickers and in place of the editor, Continue and Launch disabled (`views/onboarding.rs` `render_harness`, `render_instructions`) | not exercised: too brief to see |
+| `harnesses` | the Harness box (the selected one's label, its provider muted) and its picker's rows; ← → step through them (`picker.rs` `select_lines`, `harness_labels`, `render_menu` via `shell/onboarding.rs` `choices`) | the Harness picker's button (label, provider muted) and its menu rows (`views/harness_picker.rs` `picker_button`, `fields`, from `views/onboarding.rs` `render_harness`) | ✓ |
+| `models` | the Default model picker's rows, then "Custom model…" (typed in the box) (`shell/onboarding.rs` `choices`, `render_menu`) | the Default model menu's rows (`views/onboarding.rs` `render_harness`); a model already on disk is kept as a row, as the agent editor keeps it | not exercised: the menu wasn't opened |
+| `model_label` | the Default model box's text (`shell/onboarding.rs` `render_harness`) | the Default model button's label (`views/onboarding.rs` `render_harness`) | ✓ |
+| `model_enabled` | a disabled box, out of the Tab order (`shell/onboarding.rs` `items`, `render_harness`) | the button dimmed with no menu (`views/onboarding.rs` `render_harness`) | ✓ |
+| `model_note` | in place of the helper under Default model (`shell/onboarding.rs` `render_harness`) | in place of the helper under Default model (`views/onboarding.rs` `render_harness`) | ✓ |
+| `instructions` | the editor's text, kept in the page's `TextArea` (`shell/onboarding.rs` `area_lines`) | the editor's text, kept in its `TextareaState` (`views/onboarding.rs` `loaded`, `render_instructions`) | ✓ |
+| `error` | red, over the step's rule (`shell/onboarding.rs` `error_rows`) | red, over the step's rule (`views/onboarding.rs` `render_harness`, `render_instructions`) | not exercised: no error |
+| `busy` | "Saving…" / "Launching…" on a disabled button; keys and clicks wait (`shell/onboarding.rs` `render_harness`, `render_instructions`) | the same labels on disabled buttons (`views/onboarding.rs` `render_harness`, `render_instructions`) | ✓ |
 
 ### `HarnessOption`
 Built by `shelbi_app::harness_picker::HarnessPicker::harnesses` for the onboarding's Harness and the new-project flow's Default Harness.
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `kind` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`, `overlay/add_project.rs` `choose`) | not shown: what choosing the row selects; the row's selector (`views/harness_picker.rs` `fields`) |
-| `label` | box text and picker row (`picker.rs` `select_lines`, `harness_labels`) | button label and menu row (`views/harness_picker.rs` `picker_button`, `fields`) |
-| `provider` | muted after the label in the box and the row (`picker.rs` `select_lines`, `harness_labels`) | muted after the label on the button and the row (`views/harness_picker.rs` `picker_button`, `fields`) |
-| `selected` | the box's choice and the row's ✓ (`picker.rs` `render_menu`; `shell/onboarding.rs` `render_harness`, `overlay/add_project.rs` `defaults_rows`) | the button's choice and the row's selected fill (`views/harness_picker.rs` `fields`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `kind` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`, `overlay/add_project.rs` `choose`) | not shown: what choosing the row selects; the row's selector (`views/harness_picker.rs` `fields`) | not shown |
+| `label` | box text and picker row (`picker.rs` `select_lines`, `harness_labels`) | button label and menu row (`views/harness_picker.rs` `picker_button`, `fields`) | ✓ |
+| `provider` | muted after the label in the box and the row (`picker.rs` `select_lines`, `harness_labels`) | muted after the label on the button and the row (`views/harness_picker.rs` `picker_button`, `fields`) | ✓ |
+| `selected` | the box's choice and the row's ✓ (`picker.rs` `render_menu`; `shell/onboarding.rs` `render_harness`, `overlay/add_project.rs` `defaults_rows`) | the button's choice and the row's selected fill (`views/harness_picker.rs` `fields`) | ✓ |
 
 ### `ModelOption`
 Built by `shelbi_app::harness_picker::HarnessPicker::models` for both Default model pickers. OpenCode's rows are the models `shelbi_app::opencode_models` lists (none until it answers); both clients add "Custom model…" after the rows.
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `model` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`, `overlay/add_project.rs` `choose`) | not shown: what choosing the row selects (`views/harness_picker.rs` `fields`) |
-| `label` | picker row (`picker.rs` `model_labels`) | menu row (`views/harness_picker.rs` `fields`) |
-| `selected` | the row's ✓ (`picker.rs` `render_menu`) | the row's selected fill (`views/harness_picker.rs` `fields`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `model` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`, `overlay/add_project.rs` `choose`) | not shown: what choosing the row selects (`views/harness_picker.rs` `fields`) | not shown |
+| `label` | picker row (`picker.rs` `model_labels`) | menu row (`views/harness_picker.rs` `fields`) | not exercised: the menu wasn't opened |
+| `selected` | the row's ✓ (`picker.rs` `render_menu`) | the row's selected fill (`views/harness_picker.rs` `fields`) | not exercised: the menu wasn't opened |
 
 ### `NewTaskModel`
 The New task dialog (`new-task-dialog`), built by `shelbi_app::new_task::NewTaskForm::model`; the copy is in `shelbi_app::new_task`. TUI: `overlay/new_task.rs`. Desktop: `views/new_task.rs` (Figma `2730:10845`).
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `title` | the Title box's text, the caret while typed in (`overlay/new_task.rs` `title_field`; typing kept in the dialog's `TextArea`) | the Title field's text (`views/new_task.rs` `render`, kept in its `InputState`) |
-| `workflow` | the Workflow box's value (`overlay/new_task.rs` `pickers`) | the Workflow button's label (`views/new_task.rs` `render_pickers`) |
-| `workflows` | the Workflow picker's rows, the chosen one ✓ (`overlay/new_task.rs` `render_menu`) | the Workflow menu's rows, the chosen one checked (`views/new_task.rs` `menu_row`) |
-| `status` | the Status box's value (`overlay/new_task.rs` `pickers`) | the Status button's label (`views/new_task.rs` `render_pickers`) |
-| `status_category` | the status glyph before the Status value, in its category color (`overlay/new_task.rs` `select_lines`) | the status glyph in the Status button's Left Icon slot (`views/new_task.rs` `render_pickers`) |
-| `statuses` | the Status picker's rows, each with its glyph (`overlay/new_task.rs` `render_menu`) | the Status menu's rows, each with its glyph (`views/new_task.rs` `menu_row`) |
-| `priority` | the Priority box's value (`overlay/new_task.rs` `pickers`) | the Priority button's label (`views/new_task.rs` `render_pickers`) |
-| `priorities` | the Priority picker's rows (`overlay/new_task.rs` `render_menu`) | the Priority menu's rows (`views/new_task.rs` `menu_row`) |
-| `description` | the Description box's wrapped text, the placeholder while empty (`overlay/new_task.rs` `description_field`) | the Description box's text, the placeholder while empty (`views/new_task.rs` `render_description`) |
-| `write_up` | `( ● )` / `( ○ )` on the write-up card (`overlay/new_task.rs` `write_up`) | the Switch on the write-up card (`views/new_task.rs` `render_write_up`, `controls::switch`) |
-| `focus` | the lit box, label or button (`overlay/new_task.rs` `title_field`, `pickers`, `write_up`, `footer`) | the field with the keyboard, the focus ring on the rest once the keyboard is used (`views/new_task.rs` `sync_focus`, `ring`) |
-| `menu` | the open picker's rows dropped below its box, the keyboard's row lit (`overlay/new_task.rs` `render_menu`) | the open menu under its button, the keyboard's row selected (`views/new_task.rs` `render_pickers`) |
-| `can_create` | Create Task enabled or dimmed (`overlay/new_task.rs` `footer`) | Create Task enabled or disabled (`views/new_task.rs` `render_footer`) |
-| `creating` | "Creating…" on a disabled Create Task, Cancel disabled (`overlay/new_task.rs` `footer`) | "Creating…" with a spinner, Cancel disabled (`views/new_task.rs` `render_footer`) |
-| `error` | red, over the footer's rule (`overlay/new_task.rs` `lines`) | red, over the footer (`views/new_task.rs` `render`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `title` | the Title box's text, the caret while typed in (`overlay/new_task.rs` `title_field`; typing kept in the dialog's `TextArea`) | the Title field's text (`views/new_task.rs` `render`, kept in its `InputState`) | ✓ |
+| `workflow` | the Workflow box's value (`overlay/new_task.rs` `pickers`) | the Workflow button's label (`views/new_task.rs` `render_pickers`) | ✓ |
+| `workflows` | the Workflow picker's rows, the chosen one ✓ (`overlay/new_task.rs` `render_menu`) | the Workflow menu's rows, the chosen one checked (`views/new_task.rs` `menu_row`) | ✓ |
+| `status` | the Status box's value (`overlay/new_task.rs` `pickers`) | the Status button's label (`views/new_task.rs` `render_pickers`) | ✓ |
+| `status_category` | the status glyph before the Status value, in its category color (`overlay/new_task.rs` `select_lines`) | the status glyph in the Status button's Left Icon slot (`views/new_task.rs` `render_pickers`) | ✓ |
+| `statuses` | the Status picker's rows, each with its glyph (`overlay/new_task.rs` `render_menu`) | the Status menu's rows, each with its glyph (`views/new_task.rs` `menu_row`) | ✓ |
+| `priority` | the Priority box's value (`overlay/new_task.rs` `pickers`) | the Priority button's label (`views/new_task.rs` `render_pickers`) | ✓ |
+| `priorities` | the Priority picker's rows (`overlay/new_task.rs` `render_menu`) | the Priority menu's rows (`views/new_task.rs` `menu_row`) | ✓ |
+| `description` | the Description box's wrapped text, the placeholder while empty (`overlay/new_task.rs` `description_field`) | the Description box's text, the placeholder while empty (`views/new_task.rs` `render_description`) | ✓ |
+| `write_up` | `( ● )` / `( ○ )` on the write-up card (`overlay/new_task.rs` `write_up`) | the Switch on the write-up card (`views/new_task.rs` `render_write_up`, `controls::switch`) | ✓ |
+| `focus` | the lit box, label or button (`overlay/new_task.rs` `title_field`, `pickers`, `write_up`, `footer`) | the field with the keyboard, the focus ring on the rest once the keyboard is used (`views/new_task.rs` `sync_focus`, `ring`) | ✓ |
+| `menu` | the open picker's rows dropped below its box, the keyboard's row lit (`overlay/new_task.rs` `render_menu`) | the open menu under its button, the keyboard's row selected (`views/new_task.rs` `render_pickers`) | ✓ |
+| `can_create` | Create Task enabled or dimmed (`overlay/new_task.rs` `footer`) | Create Task enabled or disabled (`views/new_task.rs` `render_footer`) | ✓ |
+| `creating` | "Creating…" on a disabled Create Task, Cancel disabled (`overlay/new_task.rs` `footer`) | "Creating…" with a spinner, Cancel disabled (`views/new_task.rs` `render_footer`) | not exercised: too brief to see |
+| `error` | red, over the footer's rule (`overlay/new_task.rs` `lines`) | red, over the footer (`views/new_task.rs` `render`) | not exercised: no error |
 
 ### `NewTaskOption`
-| Field | TUI | Desktop |
-|---|---|---|
-| `label` | the picker row's text (`overlay/new_task.rs` `render_menu`) | the menu row's text (`views/new_task.rs` `menu_row`) |
-| `category` | a status row's glyph (`overlay/new_task.rs` `render_menu`) | a status row's glyph (`views/new_task.rs` `menu_row`) |
-| `selected` | the row's ✓ (`overlay/new_task.rs` `render_menu`) | the row's check mark (`views/new_task.rs` `menu_row`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `label` | the picker row's text (`overlay/new_task.rs` `render_menu`) | the menu row's text (`views/new_task.rs` `menu_row`) | ✓ |
+| `category` | a status row's glyph (`overlay/new_task.rs` `render_menu`) | a status row's glyph (`views/new_task.rs` `menu_row`) | ✓ |
+| `selected` | the row's ✓ (`overlay/new_task.rs` `render_menu`) | the row's check mark (`views/new_task.rs` `menu_row`) | ✓ |
 
 ### `ErrorLogModel`
 Neither client consumes `ErrorLogModel`. Both render `shelbi_state::read_errors_with_unread` rows (`(ErrorLogEntry, bool)`) through the shared `shelbi_app::overlay::error_log::Viewer`. Mapped to that datum:
 
-| Field | TUI | Desktop |
-|---|---|---|
-| `entries` | `viewer.rows`, newest first, "No errors logged." when empty (`overlay/error_log.rs` `build_lines` / `render`) | `viewer.rows`, same empty text, "Loading…" before the read lands (`views/overlay/error_log.rs` `render`) |
-| `unread` | not shown in the overlay; the sidebar's unread button count comes from `SidebarModel.unread_errors` instead (`shell/sidebar.rs`) | not shown in the overlay; sidebar count comes from `SidebarModel.unread_errors` (`views/sidebar.rs`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `entries` | `viewer.rows`, newest first, "No errors logged." when empty (`overlay/error_log.rs` `build_lines` / `render`) | `viewer.rows`, same empty text, "Loading…" before the read lands (`views/overlay/error_log.rs` `render`) | ✓ |
+| `unread` | not shown in the overlay; the sidebar's unread button count comes from `SidebarModel.unread_errors` instead (`shell/sidebar.rs`) | not shown in the overlay; sidebar count comes from `SidebarModel.unread_errors` (`views/sidebar.rs`) | not shown |
 
 ### `ErrorRow`
-| Field | TUI | Desktop |
-|---|---|---|
-| `timestamp` | local `YYYY-MM-DD HH:MM` via `format_ts` (`overlay/error_log.rs` `build_lines`) | same via `format_ts` (`views/overlay/error_log.rs` `render`); also in Copy text (`Viewer::text`) |
-| `message` | message, word-wrapped under its column (`overlay/error_log.rs` `build_lines`) | message in a flex column (`views/overlay/error_log.rs` `render`); also in Copy text |
-| `source` | not shown: stored on the entry, never rendered | not shown: never rendered (nor in Copy text) |
-| `unread` | bold `●` marker (`overlay/error_log.rs` `build_lines`) | bold `●` marker (`views/overlay/error_log.rs` `render`) |
+| Field | TUI | Desktop | Omarchy |
+|---|---|---|---|
+| `timestamp` | local `YYYY-MM-DD HH:MM` via `format_ts` (`overlay/error_log.rs` `build_lines`) | same via `format_ts` (`views/overlay/error_log.rs` `render`); also in Copy text (`Viewer::text`) | not exercised: no errors logged |
+| `message` | message, word-wrapped under its column (`overlay/error_log.rs` `build_lines`) | message in a flex column (`views/overlay/error_log.rs` `render`); also in Copy text | not exercised: no errors logged |
+| `source` | not shown: stored on the entry, never rendered | not shown: never rendered (nor in Copy text) | not shown |
+| `unread` | bold `●` marker (`overlay/error_log.rs` `build_lines`) | bold `●` marker (`views/overlay/error_log.rs` `render`) | not exercised: no errors logged |

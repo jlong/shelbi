@@ -78,7 +78,7 @@ fn the_tab_bar_spans_the_window_over_the_sidebar(cx: &mut TestAppContext) {
     // Nothing at the bar's right end: Search is the sidebar header's.
     assert_no_tab_bar_search(&mut h);
     let shown = h.window.read_with(&h.cx, |w, _| w.palette_chord.clone());
-    assert_eq!(shown, "⌘K", "the Mac palette chord, not the TUI's ⌃P");
+    assert_eq!(shown, if crate::keys::MAC { "⌘K" } else { "Ctrl+Shift+K" }, "the app's palette chord, not the TUI's ⌃P");
 
     let beta = bounds(&mut h, "tab-beta");
     let plus = bounds(&mut h, "tab-plus");
@@ -248,17 +248,23 @@ fn the_plus_opens_a_new_tab_not_a_menu(cx: &mut TestAppContext) {
 fn command_digits_pick_the_tabs_and_holding_command_shows_them(cx: &mut TestAppContext) {
     let mut h = open(cx, &["alpha", "beta", "gamma"], &["beta", "alpha", "gamma"]);
     h.take_calls();
-    h.key("cmd-1");
+    h.key(&crate::keys::test_keys::app_spec("cmd-1"));
     assert_eq!(h.take_calls(), [HostCall::SwitchProject("beta".into())]);
-    h.key("cmd-2");
+    h.key(&crate::keys::test_keys::app_spec("cmd-2"));
     assert!(h.take_calls().is_empty(), "alpha shows already");
-    h.key("cmd-3");
+    h.key(&crate::keys::test_keys::app_spec("cmd-3"));
     assert_eq!(h.take_calls(), [HostCall::SwitchProject("gamma".into())]);
-    h.key("cmd-4");
+    h.key(&crate::keys::test_keys::app_spec("cmd-4"));
     assert!(h.take_calls().is_empty(), "no fourth tab");
 
     assert!(!drawn(&mut h, "tab-hotkey-beta"), "hidden at rest");
-    h.cx.simulate_modifiers_change(Modifiers::command());
+    // ⌘, or Ctrl+Shift on Linux.
+    let app = if crate::keys::MAC {
+        Modifiers::command()
+    } else {
+        Modifiers { control: true, shift: true, ..Modifiers::none() }
+    };
+    h.cx.simulate_modifiers_change(app);
     for badge in ["tab-hotkey-beta", "tab-hotkey-alpha", "tab-hotkey-gamma"] {
         assert!(drawn(&mut h, badge), "{badge} while ⌘ is held");
     }
@@ -274,15 +280,15 @@ fn command_digits_pick_the_tabs_and_holding_command_shows_them(cx: &mut TestAppC
 #[gpui::test]
 fn a_users_own_control_digit_binding_stays_theirs(cx: &mut TestAppContext) {
     let _ = cx;
-    let chord = shelbi_state::keymap::KeyChord::parse("ctrl-1").unwrap();
+    let chord = shelbi_state::keymap::KeyChord::parse(&crate::keys::test_keys::row_spec("ctrl-1")).unwrap();
     let defaults = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
     assert_eq!(window_chord(&defaults, &chord), Some(NavChord::Row(1)));
-    let (custom, diags) =
-        shelbi_state::keymap::validate_keymaps_yaml("defaults:\n  global:\n    zen_toggle: ctrl-1\n", None);
+    let yaml = format!("defaults:\n  global:\n    zen_toggle: {}\n", crate::keys::test_keys::row_spec("ctrl-1"));
+    let (custom, diags) = shelbi_state::keymap::validate_keymaps_yaml(&yaml, None);
     assert!(diags.is_empty(), "{diags:?}");
     assert_eq!(window_chord(&custom, &chord), None, "the keys.yaml binding wins");
     // A tab chord isn't the user's to take (keys.yaml has no ⌘ digits).
-    let tab = shelbi_state::keymap::KeyChord::parse("super-1").unwrap();
+    let tab = crate::keys::app_chord("super-1");
     assert_eq!(window_chord(&custom, &tab), Some(NavChord::Tab(1)));
 }
 
@@ -381,7 +387,8 @@ fn tooltip_on_hover(h: &mut Harness, selector: &'static str) -> bool {
 fn the_sidebar_search_opens_the_palette_and_names_its_chord(cx: &mut TestAppContext) {
     let mut h = open(cx, &["alpha", "beta"], &[]);
     let chord = h.window.read_with(&h.cx, |w, _| w.palette_chord.clone());
-    assert_eq!(sidebar::search_tip(&chord), "Search (⌘K)", "the tooltip's text");
+    let want = if crate::keys::MAC { "Search (⌘K)" } else { "Search (Ctrl+Shift+K)" };
+    assert_eq!(sidebar::search_tip(&chord), want, "the tooltip's text");
     assert!(tooltip_on_hover(&mut h, "sidebar-search"), "the button shows its tooltip");
     h.cx.simulate_mouse_move(point(px(700.0), px(400.0)), None, Modifiers::none());
     h.click_selector("sidebar-search");
@@ -602,9 +609,9 @@ fn dragging_a_tab_opens_a_slot_where_it_lands_and_the_order_sticks(cx: &mut Test
     assert_eq!(saved, order(&h), "saved with the window's state");
     assert!(h.take_calls().is_empty(), "a drag doesn't switch to the tab");
     // ⌘1 to ⌘3 follow the new order.
-    h.key("cmd-1");
+    h.key(&crate::keys::test_keys::app_spec("cmd-1"));
     assert_eq!(h.take_calls(), [HostCall::SwitchProject("gamma".into())]);
-    h.key("cmd-3");
+    h.key(&crate::keys::test_keys::app_spec("cmd-3"));
     assert_eq!(h.take_calls(), [HostCall::SwitchProject("beta".into())]);
 
     // gamma over beta's right half: the gap after the last tab.

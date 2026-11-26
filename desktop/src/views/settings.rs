@@ -40,7 +40,8 @@
 //!   View Diff open, each picked from a Select ([`ToolSelect`]) over the
 //!   shared model ([`GeneralForm`]): the default, the installed CLI tools and
 //!   apps (detected off the UI thread), the current setting, Browse… (a
-//!   native open panel in `/Applications`) and Other command… (a typed
+//!   native open panel in `/Applications`, the portal's file chooser in
+//!   `/usr/bin` on Linux) and Other command… (a typed
 //!   command line, saved on Return). A pick saves only its key at once,
 //!   shown pending until the write lands; a failed write puts the picker
 //!   back and says why. The window then refreshes what the Workspace and
@@ -85,7 +86,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, point, prelude::*, px, App, Context, Div, Entity, EventEmitter, Focusable, Image, ImageFormat,
+    div, point, prelude::*, px, App, Context, Div, Entity, EventEmitter, Focusable, Image,
     PathPromptOptions, ScrollHandle, SharedString, Subscription, Window,
 };
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
@@ -127,6 +128,31 @@ use crate::theme::window::{self as translucency, Translucency, WindowLook, BLUR_
 use crate::theme::contrast::{self, CONTRAST_RANGE};
 use crate::theme::{rgb_hsla, Theme};
 
+/// General's App icon help: where the picked icon shows. macOS draws it in
+/// the Dock; Linux saves it into the user's icon theme, ahead of the
+/// package's own (`platform::dock_icon`).
+const APP_ICON_HELP: &str = if crate::keys::MAC {
+    "Shown in the Dock while Shelbi runs and in About. Finder, and the Dock before launch, show the app's \
+     own icon, Command Grille."
+} else {
+    "Shown in the app launcher, the window switcher and About, from your icon theme \
+     (~/.local/share/icons). Command Grille is the package's own."
+};
+
+/// General's Notifications help.
+const NOTIFICATIONS_HELP: &str = if crate::keys::MAC {
+    "Not shown for what’s already on screen in the front window. macOS asks for permission the first time."
+} else {
+    "Not shown for what’s already on screen in the front window. Sent to your notification daemon \
+     (mako on Omarchy)."
+};
+
+/// Terminal's Show scrollbar help: what Automatic follows.
+const SCROLLBAR_HELP: &str = if crate::keys::MAC {
+    "Automatic follows Show scroll bars in System Settings ▸ Appearance."
+} else {
+    "Automatic follows the desktop’s overlay scroll bars setting."
+};
 
 /// The terminal font size a fresh install uses, in whole points.
 const DEFAULT_SIZE: u16 = DEFAULT_FONT_SIZE as u16;
@@ -1468,8 +1494,8 @@ impl SettingsView {
             paths
                 .into_iter()
                 .filter_map(|p| {
-                    let png = crate::platform::app_icons::png(&p, tool_select::APP_ICON_PX)?;
-                    Some((p, Arc::new(Image::from_bytes(ImageFormat::Png, png))))
+                    let (format, bytes) = crate::platform::app_icons::image(&p, tool_select::APP_ICON_PX)?;
+                    Some((p, Arc::new(Image::from_bytes(format, bytes))))
                 })
                 .collect::<Vec<_>>()
         });
@@ -1502,13 +1528,14 @@ impl SettingsView {
     }
 
     /// Choose an app or a program for `setting` in a native open panel
-    /// starting in `/Applications` ([`Self::browse_picked`]).
+    /// starting in `/Applications` (`/usr/bin` on Linux, in the portal's
+    /// file chooser) ([`Self::browse_picked`]).
     fn browse_tool(&mut self, setting: ToolSetting, window: &mut Window, cx: &mut Context<Self>) {
         let message = match setting {
             ToolSetting::Editor => "Choose an editor: an app, or a program to run in a pane.",
             ToolSetting::DiffTool => "Choose a diff tool: an app, or a program to run in a pane.",
         };
-        let picked = crate::platform::open_panel::choose_file(Path::new("/Applications"), message);
+        let picked = crate::platform::open_panel::choose_file(Path::new(crate::platform::os::BROWSE_START), message);
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Some(path)) = picked.await else {
                 return;
@@ -1895,7 +1922,7 @@ impl Render for SettingsView {
                         .child(motion::origin_probe(&self.theme_track))
                         .children(theme_chip.map(floating))
                         .children(THEMES.map(|t| chip(theme_label(t), t, current, cx))),
-                    Some("Shared with the TUI, which picks it up when it starts or opens Settings.".into()),
+                    Some(theme_helper(theme.follows_omarchy().then(crate::theme::omarchy::current_name).flatten()).into()),
                     &theme,
                 ))
                 .child(controls::labeled_control(
@@ -1922,11 +1949,7 @@ impl Render for SettingsView {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.set_app_icon(icon, cx)))
                     })),
-                    Some(
-                        "Shown in the Dock while Shelbi runs and in About. Finder, and the Dock before \
-                         launch, show the app's own icon, Command Grille."
-                            .into(),
-                    ),
+                    Some(APP_ICON_HELP.into()),
                     &theme,
                 ))
                 .child(controls::labeled_control(
@@ -1951,11 +1974,7 @@ impl Render for SettingsView {
                             Switch::OrchestratorWaiting,
                             cx,
                         )),
-                    Some(
-                        "Not shown for what’s already on screen in the front window. \
-                         macOS asks for permission the first time."
-                            .into(),
-                    ),
+                    Some(NOTIFICATIONS_HELP.into()),
                     &theme,
                 )),
             // The Keybindings frame (2252:28172): its own view, the list
@@ -1994,7 +2013,9 @@ impl Render for SettingsView {
                             .child(controls::labeled_control("Terminal font", self.font_family.clone(), None, &theme))
                             .child(controls::labeled_control("Terminal font size", stepper, None, &theme))
                             .child(self.render_ansi(&theme, window, cx))
-                            .child(
+                            // Linux has no Option key setting: Alt is always Meta
+                            // in a terminal (`option_as_meta` is macOS's).
+                            .when(crate::keys::MAC, |column| column.child(
                                 controls::labeled_control(
                                     "Option key in terminals",
                                     controls::segmented_track(&theme)
@@ -2028,7 +2049,7 @@ impl Render for SettingsView {
                                             &theme,
                                         )),
                                 ),
-                            )
+                            ))
                             .child(controls::labeled_control(
                                 "Show scrollbar",
                                 controls::segmented_track(&theme)
@@ -2037,10 +2058,7 @@ impl Render for SettingsView {
                                     .child(scrollbar_chip(TerminalScrollbar::Auto, cx))
                                     .child(scrollbar_chip(TerminalScrollbar::Scrolling, cx))
                                     .child(scrollbar_chip(TerminalScrollbar::Always, cx)),
-                                Some(
-                                    "Automatic follows Show scroll bars in System Settings ▸ Appearance."
-                                        .into(),
-                                ),
+                                Some(SCROLLBAR_HELP.into()),
                                 &theme,
                             )),
                     )
@@ -2118,6 +2136,14 @@ impl SettingsView {
     fn render_translucency(&self, theme: &Theme, cx: &App) -> impl IntoElement {
         let reduced = WindowLook::current(cx).reduce_transparency;
         let help = |text: &'static str| (!reduced).then(|| SharedString::from(text));
+        let adjustable = crate::platform::blur::radius_adjustable();
+        let opacity_help = if adjustable {
+            "How much of the desktop shows through the window. 100% is opaque."
+        } else {
+            // The compositor blurs it (Hyprland's `decoration:blur`).
+            "How much of the desktop shows through the window. 100% is opaque. \
+             Your compositor blurs what shows through."
+        };
         div()
             .flex()
             .flex_col()
@@ -2125,25 +2151,23 @@ impl SettingsView {
             .child(controls::labeled_control(
                 "Window transparency",
                 self.opacity_slider.clone(),
-                help("How much of the desktop shows through the window. 100% is opaque."),
+                help(opacity_help),
                 theme,
             ))
-            .child(controls::labeled_control(
-                "Background blur",
-                self.blur_slider.clone(),
-                help("Blurs what shows through. 0 is a clear see-through."),
-                theme,
-            ))
+            .when(adjustable, |d| {
+                d.child(controls::labeled_control(
+                    "Background blur",
+                    self.blur_slider.clone(),
+                    help("Blurs what shows through. 0 is a clear see-through."),
+                    theme,
+                ))
+            })
             .when(reduced, |d| {
                 d.child(
                     div()
                         .debug_selector(|| "settings-reduce-transparency".into())
                         .mt(px(-18.0))
-                        .child(controls::helper(
-                            "Reduce Transparency is on (System Settings ▸ Accessibility ▸ Display), \
-                             so windows are opaque.",
-                            theme,
-                        )),
+                        .child(controls::helper(crate::platform::blur::opaque_note(), theme)),
                 )
             })
     }
@@ -2309,9 +2333,10 @@ impl SettingsView {
 /// `~/bin` on a shell whose `PATH` lacks it) gets the line that fixes that.
 /// The app never edits shell startup files itself.
 pub fn cli_help(running: Option<(PathBuf, bool)>, home: Option<PathBuf>) -> String {
-    let mut help = String::from(
-        "The `shelbi` binary the app runs, found on your login PATH, in Homebrew, \
-         ~/.cargo/bin, or ~/bin unless you pick one. Takes effect on the next launch.",
+    let mut help = format!(
+        "The `shelbi` binary the app runs, found on your login PATH, {} unless you pick one. \
+         Takes effect on the next launch.",
+        crate::platform::os::KNOWN_CLI_PLACES,
     );
     if let Some((cli, false)) = running {
         let dir = cli.parent().map(|d| d.to_path_buf()).unwrap_or_default();
@@ -2355,6 +2380,17 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
         SettingsPage::Orchestrator => "settings-page-orchestrator",
         SettingsPage::Properties => "settings-page-properties",
         SettingsPage::Issues => "settings-page-issues",
+    }
+}
+
+/// The Theme row's helper: on Omarchy, `Auto` paints from the active
+/// Omarchy theme (named when known), and says so.
+fn theme_helper(omarchy: Option<String>) -> String {
+    let shared = "Shared with the TUI, which picks it up when it starts or opens Settings.";
+    match omarchy {
+        Some(name) if !name.is_empty() => format!("Auto follows the Omarchy theme ({name}). {shared}"),
+        Some(_) => format!("Auto follows the Omarchy theme. {shared}"),
+        None => shared.to_string(),
     }
 }
 

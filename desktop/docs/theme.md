@@ -19,6 +19,9 @@ doesn't read them.
   (`DiffColors`, `syntax_color`). Derived, since Figma has no diff frame yet.
 - `src/theme/motion.rs`: the motion: the easing curve, the spring the
   selection chip slides on, and the fades every hover and press runs.
+- `src/theme/omarchy.rs`: the active Omarchy theme as a palette (the
+  mapping, the contrast pass, the terminal colors and font, the live
+  follow). See [Omarchy themes](#omarchy-themes).
 - `src/theme/mod.rs`: the resolved `Theme` global (views read `theme.muted`,
   `theme.sidebar`, ...), the mapping from the shared view models' meanings
   onto Figma colors, the terminal palette, and gpui-kit's widget colors
@@ -26,7 +29,8 @@ doesn't read them.
 
 Views read roles, never a hue or a hex value. The `theme:` setting (`auto`,
 `dark`, `light` in `~/.shelbi/config.yaml`) picks the palette, and `auto`
-follows the system appearance live.
+follows the system appearance live. On Omarchy, `auto` paints from the
+active Omarchy theme instead ([below](#omarchy-themes)).
 
 ## The look
 
@@ -293,6 +297,117 @@ the windows see-through. The opacity is applied when the theme resolves
   math offscreen).
 - **Reduce Transparency** keeps every window opaque, read at launch and each
   time a window comes forward.
+
+## Omarchy themes (`src/theme/omarchy.rs`)
+
+On Omarchy, every app takes its colors from one theme. `omarchy-theme-set
+<name>` swaps the theme's files into `~/.local/state/omarchy/current/theme/`
+(the theme's name is in `current/theme.name`), and its `colors.toml` names
+the colors: `background` and three shades of it, `foreground` and three
+shades of it, `accent`, `selection`, `muted`, the six ANSI hues and their
+bright variants, and `mode` (`dark` or `light`).
+
+While `theme:` is `auto` and that file exists, the desktop paints from it:
+the palette runs in the theme's `mode` whatever the window's appearance, and
+Settings ▸ General's Theme row names the theme. `dark` and `light` keep the
+built-in palette, as does a machine without the file (off Omarchy, or a
+theme that ships no `colors.toml`, like `osaka-jade`). The app checks the
+file four times a second (`stat` only), so a switch recolors every open
+window within about a quarter second, and Omarchy's theme going away brings
+the built-in palette back. The contrast slider and the window's opacity
+apply over an Omarchy palette as over the built-in one.
+
+### The mapping
+
+Each role comes from one Omarchy color, or is derived from them where
+Omarchy has nothing for it. The neutral hue below is the secondary-text gray:
+halfway from `dark_foreground` to `foreground`.
+
+| Roles | Dark theme | Light theme |
+|---|---|---|
+| `canvas`, `well`, `keycap`, `nav_selected` | `background` | `background` |
+| `sidebar` | `dark_background` | `dark_background` |
+| `card`, `textbox` | `darker_background` | `background` |
+| `raised` | `lighter_background` | `dark_background` |
+| `code_bg` | `darker_background` | `dark_background` |
+| `workflow_badge` | `lighter_background` | `darker_background` |
+| `text_loud`, `link_hover` | `bright_foreground` | `bright_foreground` |
+| `foreground`, `form_text`, `code_fg`, `workflow_badge_text` | `foreground` | `foreground` |
+| `muted`, `form_hint`, `dark_gray` | `dark_foreground` | `dark_foreground` |
+| `gray`, `icon`, `log_text`, `table_text` | the neutral | the neutral |
+| `button_icon` | three quarters from `dark_foreground` to `foreground` | the same |
+| `text_on_color` (a checked box's mark) | `background` | `background` |
+| `accent`, `progress`, `link`, `focus_ring`, `check_fill`, `select_label`, `primary_label` | `accent` | `accent` |
+| `success`, `success_label`, `success_focus_ring`, `green`, `theme_green`, `icon_green` | `green` | `green` |
+| `warning`, `yellow`, `icon_yellow` | `yellow` | `yellow` |
+| `info`, `blue` | `blue` | `blue` |
+| `error`, `red`, `theme_red`, `danger_focus_ring` | `red` | `red` |
+| `magenta`, `icon_purple` | `magenta` | `magenta` |
+| `cyan`, `theme_cyan`, `icon_cyan` | `cyan` | `cyan` |
+
+Derived:
+
+- **Neutral fills** are the neutral hue as a tint, at the built-in
+  palette's opacities: `background` / `_hover` / `_active` 18 / 28 / 40%
+  (Light 12 / 22 / 32%), `toolbar` 10% (8%), `search` and `search_match`
+  25% (16%), `divider` 10%, `divider_strong` 20%, `input_border` 30% (50%),
+  `check_border` 20% (50%), `ring` 10% (6%). As tints they work over every
+  surface and over the window's glass.
+- **Hued fills** (`select_fill*`, `primary_fill*` in the accent,
+  `success_fill*` and `zen` in green, `danger_fill*` in red) step 14 / 20 /
+  26% (Light 10 / 16 / 22%), lighter than the neutral steps: the label is
+  the same hue, and at 40% it can't reach AA on its pressed fill without
+  washing out. The chip tints and `notice` are their hue at the neutral rest
+  opacity (18%, Light 12%).
+- **Selection**: Omarchy's `selection` as the least opaque tint that paints
+  it over `background` (`selection`, `text_selection`, and `row_selected` in
+  Light; Dark's selected row is the rest fill, as in the built-in palette),
+  so a translucent window shows through it.
+- **Glows** are the ring's hue at the built-in percentages (`focus_glow` and
+  `check_glow` the accent at 20%, the success and danger glows green and red
+  at 20 / 15% and 25 / 10%); `search_current` is `yellow` at 40%.
+- **Elevation**: `shadow`, `shadow_ring` and `palette_shadow` keep the
+  built-in values; `pane_shadow` and `button_keycap_edge` are
+  `darker_background` at 55% (Light: `dark_foreground` at 60%); the
+  `scrim` is `darker_background` at 35% (Light: `foreground` at 40%).
+
+### Contrast on Omarchy
+
+Omarchy's colors are designed for its terminals and editors, not for every
+pairing this app draws, so after the mapping a contrast pass
+(`meet_contrast`) walks the same pairings the [Contrast](#contrast) tests
+check and moves whatever falls short just far enough to meet its minimum:
+AA (4.5:1) for text, 3:1 for icons, rings and edges. A role moves toward
+white when it is lighter than what it sits on and toward black when darker
+(the other way if that end can't reach it), its alpha toward opaque as it
+goes. Only the role drawn in front moves: surfaces and fills are always the
+theme's own, and a role that already passes keeps its color. Unlike the
+built-in palette, an Omarchy palette has **no exceptions**:
+`every_shipped_theme_passes_every_contrast_pairing` holds every theme
+Omarchy ships (their `colors.toml` files are kept under
+`src/theme/omarchy_themes/`) to every pairing. In low-contrast themes the
+quiet text rises toward the body text to stay readable on the selected row,
+and a hued button's label lightens (Dark) or darkens (Light) on its pressed
+fill.
+
+### Terminal on Omarchy
+
+The terminal takes the theme's terminal colors as Omarchy's own Alacritty
+and Ghostty templates lay them out: the default foreground and background
+`foreground` and `background`, bold text and the cursor `bright_foreground`,
+ANSI black `background`, white `foreground`, bright black `muted`, bright
+white `bright_foreground`, the other twelve the theme's hues and bright hues
+unchanged (so a program's colors match the user's other terminals). Dim text
+is the palette's `muted` after the contrast pass; the selection and the find
+highlights are the palette's. The user's own ANSI colors
+(`desktop.terminal_colors`) still go over them.
+
+The font is Omarchy's monospace font: `omarchy-font-set` points fontconfig's
+`monospace` alias at the family, and the app reads it the way
+`omarchy-font-current` does (`fc-match monospace`, the first family name),
+again whenever `~/.config/fontconfig/fonts.conf` changes. It is the default:
+a family set in Settings ▸ Terminal (`desktop.terminal_font_family`) wins.
+The size stays the app's own setting.
 
 ## Contrast (`src/theme/contrast.rs`)
 

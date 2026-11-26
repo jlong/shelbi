@@ -1,4 +1,10 @@
-//! The native macOS menu bar.
+//! The native macOS menu bar, and the app's fixed chords on every platform.
+//!
+//! Linux has no global menu bar: [`install`] still builds the tree there (gpui
+//! keeps it, showing nothing), the fixed chords are bound in their Linux form
+//! (Ctrl+Shift where macOS has ⌘, [`tree::fixed_chord`]), and the window
+//! lists the tree's client actions in the command palette
+//! ([`tree::client_entries`]).
 //!
 //! [`tree`] builds the menus as plain data from the active window's command
 //! model and keymaps; this module turns a [`MenuTree`] into gpui menus and
@@ -85,12 +91,11 @@ struct MenuBar {
 
 impl Global for MenuBar {}
 
-/// Bind the macOS-standard shortcuts and the app-level handlers. Called once
-/// at startup, before the first [`install`].
+/// Bind the platform's standard shortcuts and the app-level handlers. Called
+/// once at startup, before the first [`install`].
 pub fn init(cx: &mut App) {
     let binding = |command: AppCommand, context: Option<&str>| {
-        let (_, spec) = FIXED_SHORTCUTS.iter().find(|(c, _)| *c == command)?;
-        let chord = shelbi_state::keymap::KeyChord::parse(spec).ok()?;
+        let chord = tree::fixed_chord(command)?;
         let keys = tree::keystroke(&chord)?;
         Some(match command {
             AppCommand::Settings => KeyBinding::new(&keys, OpenSettings, context),
@@ -122,6 +127,7 @@ pub fn init(cx: &mut App) {
         })
         .collect();
     cx.bind_keys(bindings);
+    cx.bind_keys(linux_text_bindings());
 
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &Hide, cx| cx.hide());
@@ -140,6 +146,31 @@ pub fn init(cx: &mut App) {
         }
     });
     cx.set_global(MenuBar::default());
+}
+
+/// On Linux, the app's Edit chords (Ctrl+Shift+C, V, X, A) in gpui-kit's
+/// text fields and text views too, beside their own plain Ctrl ones, so the
+/// chord is the same in every view: a terminal pane's copy is Ctrl+Shift+C,
+/// and so is a text field's. Omarchy's Super+C / Super+V send Ctrl+Shift+C /
+/// V to a window tagged a terminal (README, Linux). None on macOS.
+pub(crate) fn linux_text_bindings() -> Vec<KeyBinding> {
+    if crate::keys::MAC {
+        return Vec::new();
+    }
+    use gpui_kit::base::input;
+    const INPUT: &str = "Input";
+    const TEXT_VIEW: &str = "TextView";
+    vec![
+        KeyBinding::new("ctrl-shift-c", input::Copy, Some(INPUT)),
+        KeyBinding::new("ctrl-shift-x", input::Cut, Some(INPUT)),
+        KeyBinding::new("ctrl-shift-v", input::Paste, Some(INPUT)),
+        KeyBinding::new("ctrl-shift-a", input::SelectAll, Some(INPUT)),
+        KeyBinding::new("ctrl-shift-c", input::Copy, Some(TEXT_VIEW)),
+        // gpui-kit's component inspector takes Ctrl+Shift+I on Linux (⌥⌘I on
+        // the Mac); here it is Issues' chord (⌘I), so the inspector's binding
+        // is suppressed. Bound after `gpui_kit::init`, so it outranks it.
+        KeyBinding::new("ctrl-shift-i", gpui::NoAction, None),
+    ]
 }
 
 /// Run a registry command that needs no project window (About Shelbi and
@@ -259,8 +290,9 @@ pub fn install(tree: MenuTree, cx: &mut App) {
 fn uses_invoke(action: &MenuAction) -> bool {
     match action {
         MenuAction::Command(_) => true,
-        MenuAction::App(command) => !FIXED_SHORTCUTS.iter().any(|(c, _)| c == command)
-            && !matches!(command, AppCommand::ShowAll | AppCommand::Zoom),
+        MenuAction::App(command) => {
+            !FIXED_SHORTCUTS.iter().any(|(c, _)| c == command) && !matches!(command, AppCommand::ShowAll | AppCommand::Zoom)
+        }
     }
 }
 
@@ -330,6 +362,25 @@ mod tests {
                 crate::keys::chord_from_keystroke(&parsed).map(|c| c.canonical()),
                 Some(chord.canonical()),
                 "{spec} -> {keys}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_platform_chord_binds_as_the_key_arrives() {
+        // The fixed chords, New Window, the font zoom and the palette chord,
+        // as this platform spells them: each gpui keystroke reads back as
+        // its chord (on Linux through `keys::normalized`, since gpui reports
+        // Ctrl+Shift+, as `ctrl-<`).
+        let mut chords: Vec<KeyChord> = FIXED_SHORTCUTS.iter().filter_map(|(c, _)| tree::fixed_chord(*c)).collect();
+        chords.extend(crate::keys::app_shortcuts().into_iter().map(|s| s.chord));
+        for chord in chords {
+            let keys = tree::keystroke(&chord).unwrap();
+            let parsed = gpui::Keystroke::parse(&keys).unwrap_or_else(|e| panic!("{keys}: {e:?}"));
+            assert_eq!(
+                crate::keys::chord_from_keystroke(&parsed).map(|c| c.canonical()),
+                Some(chord.canonical()),
+                "{keys}"
             );
         }
     }
