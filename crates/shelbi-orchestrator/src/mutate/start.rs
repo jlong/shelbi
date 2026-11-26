@@ -121,6 +121,10 @@ pub(crate) fn start(
     crate::migration::ensure_workspace_dispatchable(project, &workspace_name)
         .map_err(MutateError::backend)?;
 
+    // The client's view, checked before this start's first write (the claim,
+    // the branch cut), so a start refused as changed elsewhere leaves no trace.
+    recheck()?;
+
     // Ownership gate: on a remote tracker, start only an issue assigned to the
     // user (or claim it first on an explicit `--take`). Checked before the
     // branch cut so a refused start leaves no trace.
@@ -137,9 +141,24 @@ pub(crate) fn start(
 
     // Cut the branch on the hub if it hasn't been already (depends_on aware). An
     // explicit `--branch` override bypasses the cut and points sync at that ref.
+    // The state this start's own `branch:` write landed at, when it made one:
+    // a card that never had a branch (one just assigned, typically) gets it
+    // here, which moves its revision past the one the client sent.
+    let mut own_write = None;
     if branch_arg.is_none() {
         let updated = crate::lifecycle::ensure_branch_for_in_progress(&project_yaml, id)
             .map_err(MutateError::backend)?;
+        if updated.task.branch != tf.task.branch {
+            // The write is a targeted one, so it keeps a move made elsewhere
+            // since the recheck above: that is still a change elsewhere.
+            if updated.task.column != tf.task.column {
+                return Err(MutateError::Stale {
+                    expected: super::state_of(&tf.task),
+                    actual: super::state_of(&updated.task),
+                });
+            }
+            own_write = Some(super::state_of(&updated.task));
+        }
         tf = updated;
     }
     let branch = match branch_arg
@@ -168,8 +187,20 @@ pub(crate) fn start(
     // not moved on since the client looked at it. Under the daemon's per-issue
     // lock this is what makes a second concurrent `start` of the same issue
     // abort (the first already moved it to `in_progress`) instead of launching a
-    // second agent on the same branch.
-    recheck()?;
+    // second agent on the same branch. Once this start has written the branch,
+    // the client's view was checked before that write (above), and what must
+    // still hold is the state the write landed at: the client's revision
+    // predates it, and comparing against that would refuse this start's own
+    // write as a change made elsewhere.
+    match own_write {
+        None => recheck()?,
+        Some(own) => {
+            let actual = super::current_state(project, id)?;
+            if super::is_stale_change(project, &own, &actual) {
+                return Err(MutateError::Stale { expected: own, actual });
+            }
+        }
+    }
 
     // Persist the in_progress move BEFORE spawning (F7). `original` snapshots the
     // pre-move frontmatter so a spawn failure can roll back.

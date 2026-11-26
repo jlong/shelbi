@@ -1342,3 +1342,108 @@ fn dispatch_guard_lets_a_dev_slot_take_new_work_after_a_handoff() {
     std::env::remove_var("SHELBI_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The daemon's recheck (`run_job` in `shelbi-cli`'s control server): re-read
+/// the issue and refuse when it moved on from what the client sent.
+fn daemon_recheck(
+    project: &'static str,
+    id: &'static str,
+    expected: ExpectedState,
+) -> impl FnMut() -> Result<(), MutateError> {
+    move || {
+        let actual = current_state(project, id)?;
+        if is_stale_change(project, &expected, &actual) {
+            return Err(MutateError::Stale { expected: expected.clone(), actual });
+        }
+        Ok(())
+    }
+}
+
+/// `desktop-board-start-right-after-assign-is-refused-as-changed-elsewhere`:
+/// a card just assigned has no branch, so its first start cuts one and writes
+/// `branch:`, which moves its revision past the one the client sent (the
+/// assign's landed state). That write is the start's own, not a change made
+/// elsewhere, so the start goes on instead of being refused. The client's
+/// pre-assign view is still refused, before the start writes anything.
+#[test]
+fn start_right_after_assign_is_not_refused_for_its_own_branch_write() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    let repo = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-q", "--allow-empty", "-m", "init"]);
+    // The workspace's runner isn't declared, so the launch fails (and rolls
+    // back) once the start is past its recheck: no agent is spawned.
+    std::fs::write(
+        shelbi_state::projects_dir().unwrap().join("s.yaml"),
+        format!(
+            "name: s\nrepo: {repo}\ndefault_branch: main\n\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n  - name: local\n    kind: local\n    work_dir: {repo}\n\
+             workspaces:\n  - {{ name: dev, machine: local, runner: no-such-runner }}\n",
+            repo = repo.path().display()
+        ),
+    )
+    .unwrap();
+    shelbi_state::save_task("s", &task(Column::todo(), "t"), "body").unwrap();
+    let read = current_state("s", "t").unwrap();
+
+    // Assign, as the board sends it: against the card's read.
+    let mut sink = RecordingSink::default();
+    let note = apply(
+        "s",
+        "t",
+        &MutationKind::Assign { to: "dev".into(), force: false },
+        &mut sink,
+        &mut daemon_recheck("s", "t", read.clone()),
+    )
+    .unwrap();
+    let landed = note.state().expect("the assign reports its landed state");
+    assert_ne!(landed, read, "the assign moved the revision");
+    assert_eq!(shelbi_state::load_task("s", "t").unwrap().task.branch, None);
+
+    let start = MutationKind::Start {
+        workspace: None,
+        branch: None,
+        reason: None,
+        force: false,
+        take: false,
+    };
+    // The read from before the assign is stale, and a refused start leaves
+    // no trace: no branch cut, none written.
+    let err = apply("s", "t", &start, &mut sink, &mut daemon_recheck("s", "t", read)).unwrap_err();
+    assert!(matches!(err, MutateError::Stale { .. }), "{err}");
+    assert_eq!(shelbi_state::load_task("s", "t").unwrap().task.branch, None);
+
+    // Start right after, against the state the assign landed at: it cuts and
+    // writes the branch, then gets past the recheck to the launch.
+    let mut rechecks = 0;
+    let mut inner = daemon_recheck("s", "t", landed);
+    let mut counted = || {
+        rechecks += 1;
+        inner()
+    };
+    let result = apply("s", "t", &start, &mut sink, &mut counted);
+    assert!(
+        !matches!(result, Err(MutateError::Stale { .. })),
+        "the start's own branch write isn't a change made elsewhere: {result:?}"
+    );
+    assert!(matches!(result, Err(MutateError::LaunchSpawn(_))), "{result:?}");
+    assert_eq!(rechecks, 1, "the client's view is checked once, before any write");
+    let after = shelbi_state::load_task("s", "t").unwrap().task;
+    assert!(after.branch.is_some(), "the branch was cut and written");
+    assert_eq!(after.column, Column::todo(), "the failed launch rolled the card back");
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
