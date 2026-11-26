@@ -63,6 +63,9 @@ impl Element for DocElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // The fences show by the same test the caret paints by.
+        let focused = self.editor.read(cx).focus.is_focused(window);
+        let (hidden, spans) = self.editor.update(cx, |e, _| e.code_view(focused));
         let e = self.editor.read(cx);
         let doc = e.model.doc().clone();
         let field = e.field;
@@ -78,7 +81,11 @@ impl Element for DocElement {
                 _ => None,
             });
             let width = width.unwrap_or(px(600.0));
-            let l = layout::layout(&doc, field, width, marked.clone(), &theme, window, cx);
+            let code = layout::Code {
+                hidden: &hidden,
+                spans: &spans,
+            };
+            let l = layout::layout(&doc, field, width, marked.clone(), code, &theme, window, cx);
             let h = l.height;
             *out.borrow_mut() = Some(Rc::new(l));
             size(width, h)

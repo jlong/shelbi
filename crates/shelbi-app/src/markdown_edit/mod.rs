@@ -11,17 +11,23 @@
 //! render (tables, HTML, footnotes) shows as the source it is rather than
 //! being dropped or rewritten.
 //!
+//! Fenced code blocks draw as rendered code ([`code`]): highlighted in the
+//! language their fence names, the fence lines hidden until the caret is in
+//! the block.
+//!
 //! A client draws the rows ([`blocks::Row`]: display text, styles, the
 //! source each display offset stands for), turns pointer and keys into these
 //! operations, and hands the text to the issue's draft
 //! ([`crate::issue_edit`]) to save.
 
 pub mod blocks;
+pub mod code;
 pub mod editor;
 mod history;
 pub mod inline;
 
 pub use blocks::{Chunk, Doc, Gap, Item, Marker, Row, RowKind};
+pub use code::{fence_language, CodeHighlights};
 pub use editor::{
     next_boundary, prev_boundary, word_left, word_right, BlockKind, Editor, LinkTarget,
 };

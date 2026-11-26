@@ -1849,17 +1849,16 @@ impl TerminalPane {
             MouseOutcome::Copy(text) => {
                 // A finished selection copies, as in the TUI. On Linux it is
                 // the primary selection too, for a middle click anywhere.
-                if !crate::keys::MAC {
-                    cx.write_to_primary(ClipboardItem::new_string(text.clone()));
-                }
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                cx.write_to_primary(ClipboardItem::new_string(text.clone()));
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 cx.notify();
             }
             // A middle click the program doesn't take pastes the primary
             // selection, as every Linux terminal does.
-            MouseOutcome::Ignored
-                if !crate::keys::MAC && action == MouseAction::Press && button == MouseButton::Middle =>
-            {
+            // (gpui has the primary selection only where Linux does.)
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            MouseOutcome::Ignored if action == MouseAction::Press && button == MouseButton::Middle => {
                 if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
                     if !text.is_empty() && self.search.is_none() {
                         self.paste(text, cx);

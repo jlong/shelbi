@@ -16,6 +16,12 @@
 //! (so `s`, `a`, `e`, `h`/`j`/`k`/`l` and the arrows never reach the
 //! board), typed text arrives through the platform's input method
 //! (compositions included), and Esc hands the keys back to the pane.
+//!
+//! A fenced code block reads as rendered code: its lines highlighted in the
+//! language its fence names, the fence lines left out unless the editor has
+//! the keys and the selection is in the block
+//! (`shelbi_app::markdown_edit::code`). Moving the caret in (an arrow, a
+//! click on a code line) shows them to be edited; moving out hides them.
 
 mod element;
 pub mod layout;
@@ -29,7 +35,8 @@ use gpui::{
     Pixels, Point, Role, ScrollHandle, SharedString, Subscription, Task, UTF16Selection, Window,
 };
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
-use shelbi_app::markdown_edit::{word_left, word_right, BlockKind, Editor, MarkKind};
+use shelbi_app::diff::highlight::SyntaxSpan;
+use shelbi_app::markdown_edit::{word_left, word_right, BlockKind, CodeHighlights, Editor, MarkKind};
 
 use self::element::DocElement;
 use self::layout::{DocLayout, Field};
@@ -89,6 +96,10 @@ pub struct DocEditor {
     /// The scroll the editor sits in.
     scroll: Option<ScrollHandle>,
     link: Option<LinkPrompt>,
+    /// The body's code blocks' highlights, a block at a time.
+    code: CodeHighlights,
+    /// Each row's spans, for the text revision they were read at.
+    code_spans: Option<(u64, Rc<Vec<Vec<SyntaxSpan>>>)>,
     _subs: Vec<Subscription>,
     _blink: Task<()>,
 }
@@ -143,6 +154,13 @@ impl DocEditor {
                 break;
             }
         });
+        // A body with a code block will want the grammars: load them off the
+        // UI thread before the first paint asks.
+        if field == Field::Body && (text.contains("```") || text.contains("~~~")) {
+            cx.background_executor()
+                .spawn(async { shelbi_app::diff::highlight::warm() })
+                .detach();
+        }
         DocEditor {
             model: if field == Field::Title {
                 Editor::plain(text)
@@ -161,6 +179,8 @@ impl DocEditor {
             reveal: false,
             scroll,
             link: None,
+            code: CodeHighlights::default(),
+            code_spans: None,
             _subs: subs,
             _blink: blink,
         }
@@ -168,6 +188,29 @@ impl DocEditor {
 
     pub fn text(&self) -> &str {
         self.model.text()
+    }
+
+    /// How the doc's code shows: the rows left out (each fenced block's
+    /// fences, unless the editor has the keys, `focused`, and the selection
+    /// is in the block) and each row's syntax spans (read again only when the
+    /// text changes, and then only the blocks that changed).
+    fn code_view(&mut self, focused: bool) -> (Rc<Vec<bool>>, Rc<Vec<Vec<SyntaxSpan>>>) {
+        let doc = self.model.doc();
+        let hidden = Rc::new(doc.hidden_rows(focused.then(|| self.model.selection())));
+        let rev = self.model.revision();
+        let spans = match &self.code_spans {
+            Some((at, spans)) if *at == rev => spans.clone(),
+            _ => {
+                let spans = Rc::new(if self.model.is_plain() {
+                    Vec::new()
+                } else {
+                    self.code.rows(doc)
+                });
+                self.code_spans = Some((rev, spans.clone()));
+                spans
+            }
+        };
+        (hidden, spans)
     }
 
     pub fn is_focused(&self) -> bool {
@@ -863,6 +906,37 @@ impl DocEditor {
         let (row, d) = self.model.doc().locate(src);
         let c = p.layout.caret(&visuals, row, d);
         Some(p.bounds.origin + c.center())
+    }
+
+    /// The text of each row painted (left-out rows aren't), top to bottom.
+    pub fn shown_rows(&self) -> Vec<String> {
+        let Some(p) = self.painted.as_ref() else {
+            return Vec::new();
+        };
+        self.model
+            .doc()
+            .rows
+            .iter()
+            .zip(&p.layout.rows)
+            .filter(|(_, l)| !l.hidden)
+            .map(|(r, _)| r.display.clone())
+            .collect()
+    }
+
+    /// The colors the row showing `text` is set in (its runs, with the
+    /// highlights last painted).
+    pub fn row_colors(&self, text: &str, cx: &App) -> Vec<gpui::Hsla> {
+        let doc = self.model.doc();
+        let Some(i) = doc.rows.iter().position(|r| r.display == text) else {
+            return Vec::new();
+        };
+        let spans = self.code_spans.as_ref().and_then(|(_, s)| s.get(i).cloned()).unwrap_or_default();
+        layout::run_colors(&doc.rows[i], self.field, &spans, &self.theme(cx))
+    }
+
+    /// The height painted.
+    pub fn painted_height(&self) -> Pixels {
+        self.painted.as_ref().map_or(px(0.0), |p| p.layout.height)
     }
 }
 

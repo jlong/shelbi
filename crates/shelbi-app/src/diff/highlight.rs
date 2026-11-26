@@ -16,6 +16,10 @@
 //! fetching whole files to avoid that isn't worth a round trip per file on a
 //! remote worktree. This runs on the session's worker thread, a file at a
 //! time, and a client paints plain text until a file's highlights arrive.
+//!
+//! The Markdown editor's fenced code blocks use the same grammars and classes
+//! ([`highlight_code`]): a block is read as one run from its first line, its
+//! grammar named by the fence's info string (`yaml`, `rs`, `Rust`, ...).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -84,6 +88,58 @@ fn syntax_for(set: &'static SyntaxSet, path: &str) -> Option<&'static SyntaxRefe
         let ext = path.extension()?.to_str()?;
         set.find_syntax_by_extension(ext)
     })
+}
+
+/// Load the grammar bundle now (on a background thread, say), so the first
+/// block highlighted on the UI thread doesn't wait on it.
+pub fn warm() {
+    syntaxes();
+}
+
+/// The grammar a fence's info string names: a file extension or a grammar's
+/// name, any case (`yml`, `yaml`, `rs`, `Rust`, `sh`, `json`, `toml`), and a
+/// few names GitHub knows that the bundle spells otherwise.
+fn syntax_for_language(set: &'static SyntaxSet, lang: &str) -> Option<&'static SyntaxReference> {
+    let lang = lang.trim().trim_start_matches('.').to_ascii_lowercase();
+    if lang.is_empty() {
+        return None;
+    }
+    let lang = match lang.as_str() {
+        "shell" | "console" | "shellsession" | "zsh" => "sh",
+        "jsonc" | "json5" => "json",
+        "golang" => "go",
+        "rust,ignore" | "rust,no_run" => "rust",
+        other => other,
+    };
+    set.find_syntax_by_token(lang)
+}
+
+/// The spans of a block of code in `lang`, a line at a time, the grammar's
+/// state carried from each line to the next (a string or comment opened on
+/// one line runs on). `None` when no grammar knows `lang`, or the block is
+/// past [`MAX_LINES`]. A line past [`MAX_LINE_LEN`], and every line after a
+/// line the grammar fails on, is plain.
+pub fn highlight_code<'a>(lang: &str, lines: impl IntoIterator<Item = &'a str>) -> Option<Vec<Vec<SyntaxSpan>>> {
+    let set = syntaxes();
+    let syntax = syntax_for_language(set, lang)?;
+    let lines: Vec<&str> = lines.into_iter().collect();
+    if lines.len() > MAX_LINES {
+        return None;
+    }
+    let mut classifier = Classifier { cache: HashMap::new() };
+    let mut state = ParseState::new(syntax);
+    let mut stack = ScopeStack::new();
+    let mut out = vec![Vec::new(); lines.len()];
+    for (at, line) in lines.iter().enumerate() {
+        if line.len() > MAX_LINE_LEN {
+            continue;
+        }
+        match classifier.line(set, &mut state, &mut stack, line) {
+            Some(spans) => out[at] = spans,
+            None => break,
+        }
+    }
+    Some(out)
 }
 
 /// The class a scope names, from its dotted name.
@@ -269,6 +325,36 @@ mod tests {
                 assert!(line.text.get(s.range.start as usize..s.range.end as usize).is_some(), "{s:?}");
             }
         }
+    }
+
+    #[test]
+    fn code_blocks_pick_their_grammar_from_the_fence() {
+        let class = |lang: &str, text: &str, word: &str| {
+            let spans = highlight_code(lang, [text]).unwrap();
+            class_at(text, &spans[0], word)
+        };
+        let y = "runs-on: ubuntu-latest # ci";
+        for lang in ["yaml", "yml", "YAML"] {
+            assert_eq!(class(lang, y, "runs-on"), Some(SyntaxClass::Tag), "{lang}");
+            assert_eq!(class(lang, y, "ci"), Some(SyntaxClass::Comment), "{lang}");
+        }
+        assert_eq!(class("rust", "fn main() {}", "fn"), Some(SyntaxClass::Keyword));
+        assert_eq!(class("rs", "let x = 1;", "let"), Some(SyntaxClass::Keyword));
+        assert_eq!(class("sh", "echo \"hi\"", "hi"), Some(SyntaxClass::String));
+        assert_eq!(class("bash", "echo \"hi\"", "hi"), Some(SyntaxClass::String));
+        assert_eq!(class("shell", "echo \"hi\"", "hi"), Some(SyntaxClass::String));
+        assert_eq!(class("json", "{\"a\": 12}", "12"), Some(SyntaxClass::Number));
+        assert_eq!(class("toml", "name = \"x\"", "\"x\""), Some(SyntaxClass::String));
+        assert!(highlight_code("nosuchlang", ["x"]).is_none());
+        assert!(highlight_code("", ["x"]).is_none());
+    }
+
+    #[test]
+    fn a_code_blocks_state_runs_across_its_lines() {
+        let lines = ["/* opens", "still a comment */", "let x = 1;"];
+        let spans = highlight_code("rust", lines).unwrap();
+        assert_eq!(class_at(lines[1], &spans[1], "still"), Some(SyntaxClass::Comment));
+        assert_eq!(class_at(lines[2], &spans[2], "let"), Some(SyntaxClass::Keyword));
     }
 
     #[test]

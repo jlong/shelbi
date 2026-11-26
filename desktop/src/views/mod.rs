@@ -126,6 +126,9 @@ pub mod pane_session;
 pub mod pane_split;
 pub mod pane_width;
 pub mod palette;
+// Installed only off macOS (`main`), where gpui has no native alert; its
+// tests still run on a Mac.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub mod prompt;
 pub mod properties;
 pub mod project_menu;

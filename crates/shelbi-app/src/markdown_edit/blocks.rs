@@ -27,8 +27,9 @@ pub enum RowKind {
     Heading(u8),
     Item(Item),
     Quote,
-    /// A code fence's line (` ``` ` / `~~~`), shown as written; `open` for
-    /// the opening one.
+    /// A code fence's line (` ``` ` / `~~~`), as written; `open` for the
+    /// opening one. A view hides it while the caret is outside its block
+    /// ([`Doc::hidden_rows`]).
     Fence {
         open: bool,
     },
