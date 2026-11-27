@@ -696,7 +696,7 @@ impl WorkflowEditor {
                     .map(|s| {
                         let id = s.id.clone();
                         style::menu_row(format!("builder-add-status-{id}"), false, &theme)
-                            .child(status_icon(s.category, &theme))
+                            .child(style::status_icon(s.category, &theme))
                             .child(s.name.clone())
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.add_status(&id, window, cx)))
                             .into_any_element()
@@ -1106,17 +1106,6 @@ fn handle_element(id: &str, r: Rect, side: Side, hot: bool, zoom: f32, theme: &T
         .into_any_element()
 }
 
-/// A status's icon in a 20pt frame.
-fn status_icon(category: StatusCategory, theme: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(20.0))
-        .child(style::status_icon_large(category, theme))
-}
-
 // ---------------------------------------------------------------------------
 // The inspector
 
@@ -1225,7 +1214,7 @@ impl WorkflowEditor {
                         let sid = s.id.clone();
                         let pick = pick.clone();
                         style::menu_row(format!("{id}-{sid}"), s.id == current, &theme)
-                            .child(status_icon(s.category, &theme))
+                            .child(style::status_icon(s.category, &theme))
                             .child(s.name.clone())
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                 this.menu = None;
