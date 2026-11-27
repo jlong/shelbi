@@ -9,6 +9,96 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### November 27, 2026
+
+**v0.15.0. OpenCode as a runner, projects in tabs, jobs and reminders, Linear, and the desktop app on Linux.**
+
+**OpenCode joins Claude Code and Codex.** Any agent can now run on OpenCode
+2.3 or later, in its own terminal pane like the other runners. Workers resume
+exactly their own session, launch on the effort level you pick, show Paused
+when a provider limit hits, and get Shelbi's messages confirmed delivered. An
+OpenCode orchestrator reacts to board events as they land
+([#2400](https://github.com/jlong/shelbi/pull/2400),
+[#2412](https://github.com/jlong/shelbi/pull/2412),
+[#2415](https://github.com/jlong/shelbi/pull/2415),
+[#2417](https://github.com/jlong/shelbi/pull/2417),
+[#2418](https://github.com/jlong/shelbi/pull/2418),
+[#2419](https://github.com/jlong/shelbi/pull/2419),
+[#2420](https://github.com/jlong/shelbi/pull/2420)).
+
+**Projects open in tabs.** The desktop window holds every project as a tab
+across the top, remote ones included. Drag tabs to reorder them, drag one out
+into its own window or into another, and right-click to close it or the
+others. The + opens a New tab with the launch screen, and a project's dot
+pulses while its work runs
+([#2265](https://github.com/jlong/shelbi/pull/2265),
+[#2288](https://github.com/jlong/shelbi/pull/2288),
+[#2306](https://github.com/jlong/shelbi/pull/2306),
+[#2325](https://github.com/jlong/shelbi/pull/2325),
+[#2354](https://github.com/jlong/shelbi/pull/2354)).
+
+**Jobs and reminders.** `shelbi job run` runs a long command in its own
+terminal and reports back when it ends; `shelbi job watch` does the same for a
+PR, a commit's CI or a process. Jobs and issues take estimates, show a
+progress bar and raise an overdue alert. `shelbi remind` sets a reminder,
+durations accept days, and one Jobs and Reminders screen shows both. A worker
+parked on its own job reads as Waiting, with the job named, instead of asking
+for your input
+([#2303](https://github.com/jlong/shelbi/pull/2303),
+[#2305](https://github.com/jlong/shelbi/pull/2305),
+[#2309](https://github.com/jlong/shelbi/pull/2309),
+[#2311](https://github.com/jlong/shelbi/pull/2311),
+[#2426](https://github.com/jlong/shelbi/pull/2426),
+[#2432](https://github.com/jlong/shelbi/pull/2432),
+[#2433](https://github.com/jlong/shelbi/pull/2433),
+[#2434](https://github.com/jlong/shelbi/pull/2434)).
+
+**An orchestrator that runs on notifications.** Instead of polling on a
+heartbeat, the orchestrator can be told about each board event, job, reminder
+and overdue issue as it happens, and hears nothing on a quiet board
+([#2255](https://github.com/jlong/shelbi/pull/2255)).
+
+**Linear, and connecting a tracker.** Linear is a first-class issue tracker
+next to GitHub. Connect to an issue tracker walks you through it step by step,
+offers to move your local issues, and the new-project wizard uses the same
+screens. Its settings now have their own Issues page in Settings
+([#2333](https://github.com/jlong/shelbi/pull/2333),
+[#2369](https://github.com/jlong/shelbi/pull/2369),
+[#2389](https://github.com/jlong/shelbi/pull/2389),
+[#2395](https://github.com/jlong/shelbi/pull/2395),
+[#2437](https://github.com/jlong/shelbi/pull/2437)).
+
+**The desktop app on Linux.** The desktop app was walked through on Omarchy
+and fixed wherever it read like a Mac, and under Hyprland Background blur
+turns the compositor's blur on or off per window
+([#2438](https://github.com/jlong/shelbi/pull/2438),
+[#2448](https://github.com/jlong/shelbi/pull/2448)).
+
+**Around the desktop app.** Right-click a board card for its actions, delete
+an issue from its More menu, and a wide task pane puts its properties beside
+the body. Settings gains a Properties page. Changelog entries carry images,
+which open in a lightbox and group into galleries. Code blocks in Markdown are
+syntax highlighted. Shelbi checks for the tools it needs at launch
+([#2359](https://github.com/jlong/shelbi/pull/2359),
+[#2356](https://github.com/jlong/shelbi/pull/2356),
+[#2360](https://github.com/jlong/shelbi/pull/2360),
+[#2283](https://github.com/jlong/shelbi/pull/2283),
+[#2317](https://github.com/jlong/shelbi/pull/2317),
+[#2383](https://github.com/jlong/shelbi/pull/2383),
+[#2445](https://github.com/jlong/shelbi/pull/2445),
+[#2297](https://github.com/jlong/shelbi/pull/2297)).
+
+**Steadier underneath.** Orchestrator handoff notes survive every quit and
+restart, new workspaces come with their hook scripts, `issue edit` no longer
+hangs in scripts, and a start right after a move is no longer refused. A
+rebase that fails without unmerged paths is no longer reported as a merge
+conflict
+([#2352](https://github.com/jlong/shelbi/pull/2352),
+[#2350](https://github.com/jlong/shelbi/pull/2350),
+[#2254](https://github.com/jlong/shelbi/pull/2254),
+[#2440](https://github.com/jlong/shelbi/pull/2440),
+[#2446](https://github.com/jlong/shelbi/pull/2446)).
+
 ### November 9, 2026
 
 **v0.14.0. Shelbi's own diff view, one way to add a project, PRs on the task, and a faster start and quit.**
