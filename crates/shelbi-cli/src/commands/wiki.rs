@@ -1699,6 +1699,7 @@ mod tests {
             name: path.rsplit('/').next().unwrap().into(),
             title: path.into(),
             kind,
+            icon: None,
             children,
         };
         let nodes = vec![

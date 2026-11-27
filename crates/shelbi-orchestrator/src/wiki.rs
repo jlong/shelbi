@@ -323,6 +323,11 @@ fn answer_for(svc: &WikiService, source_kind: WikiSource, project: Option<&str>,
             Some(h) => svc.update(&path, source(by), |c| compose::remove_section(c, &h).map_err(section_error)),
         }
         .map(|()| WikiReply::Done),
+        WikiRequest::Trash { path, by } => svc.trash(&path, source(by)).map(|token| WikiReply::Trashed { token }),
+        WikiRequest::Untrash { token, by } => svc.untrash(&token, source(by)).map(|_| WikiReply::Done),
+        WikiRequest::Reorder { folder, order, by } => {
+            svc.set_folder_order(&folder, &order, source(by)).map(|()| WikiReply::Done)
+        }
         WikiRequest::Search { query, folder, regex } => search(svc.root(), &query, folder, regex).map(WikiReply::Matches),
         WikiRequest::List { path } => list(svc.root(), path.as_deref().unwrap_or("")).map(WikiReply::Entries),
         WikiRequest::Tasks { path, section, pending } => {
@@ -662,7 +667,9 @@ fn build_level(root: &Path, under: &str, folder_name: &str) -> Result<Vec<WikiNo
     let mut out = Vec::new();
     for folder in shelbi_wiki::fs::tree::build_children(root, Some(root), under).map_err(fail)? {
         let children = build_level(root, &folder.relative_path, &folder.name)?;
+        let icon = shelbi_wiki::fs::folder::folder_icon(&root.join(&folder.relative_path));
         out.push(WikiNode {
+            icon,
             path: folder.relative_path,
             title: folder.name.clone(),
             name: folder.name,
@@ -678,6 +685,7 @@ fn build_level(root: &Path, under: &str, folder_name: &str) -> Result<Vec<WikiNo
             path: rel,
             title: doc.title,
             kind: NodeKind::Document,
+            icon: None,
             children: Vec::new(),
         });
     }

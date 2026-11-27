@@ -182,7 +182,7 @@ fn subscriber_loop(
     }
 }
 
-enum StreamEnd {
+pub(crate) enum StreamEnd {
     Disconnected,
     ReceiverGone,
 }
@@ -190,7 +190,7 @@ enum StreamEnd {
 /// Open the hub socket, send the subscribe `frame`, and hand each complete
 /// line to `on_line` until the stream ends, `stop` is raised, or `on_line`
 /// reports its receiver gone (`Err`).
-fn stream_lines(
+pub(crate) fn stream_lines(
     frame: &str,
     stop: &AtomicBool,
     connected: &AtomicBool,
@@ -278,7 +278,7 @@ fn any_wake_for(line: &[u8]) -> Option<(String, ChangeWake)> {
     Some((project, wake))
 }
 
-fn sleep_slice(stop: &AtomicBool) {
+pub(crate) fn sleep_slice(stop: &AtomicBool) {
     for _ in 0..5 {
         if stop.load(Ordering::SeqCst) {
             return;

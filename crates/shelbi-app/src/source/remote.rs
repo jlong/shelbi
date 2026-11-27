@@ -515,6 +515,27 @@ pub fn subscribe_layout(link: Arc<dyn RelayLink>, project: &str) -> (LayoutSubsc
     (LayoutSubscription::remote(stop, handle, open), rx)
 }
 
+/// Subscribe to `project`'s wiki changes on `link`'s host, from the far
+/// hub's `changes` lines ([`crate::wiki_sub`]).
+pub fn subscribe_wiki(
+    link: Arc<dyn RelayLink>,
+    project: &str,
+) -> (ChangeSubscription, Receiver<crate::wiki_sub::WikiWake>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let open = OpenStream::default();
+    let handles = {
+        let (project, stop, open) = (project.to_string(), stop.clone(), open.clone());
+        spawn("shelbi-remote-wiki", move || {
+            let connected = AtomicBool::new(false);
+            line_loop(&*link, &project, &stop, &open, &connected, |buf| {
+                crate::wiki_sub::drain_lines(buf, &project, &tx)
+            })
+        })
+    };
+    (ChangeSubscription::remote(stop, handles.into_iter().collect(), vec![open]), rx)
+}
+
 fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> Option<JoinHandle<()>> {
     match thread::Builder::new().name(name.to_string()).spawn(body) {
         Ok(handle) => Some(handle),

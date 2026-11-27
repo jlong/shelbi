@@ -496,3 +496,46 @@ fn diff_and_log_answer_wiki_relative_paths_in_folder_mode() {
     assert_eq!(intro[0].paths, vec!["intro.md".to_string()]);
     assert!(svc.log(Some("../main.txt"), 5).is_err());
 }
+
+/// A trashed document or folder (empty subfolders too) comes back where it
+/// was on undo, once; a path taken since refuses it.
+#[test]
+fn a_trashed_folder_is_put_back_by_its_token() {
+    let fx = Fixture::new();
+    let (svc, _) = WikiService::start(fx.spec(fx.branch_layout(), false), Arc::new(Recorder::default())).unwrap();
+    svc.write("Plans/a.md", "# A\n", ChangeSource::Local).unwrap();
+    svc.write("Plans/Deep/b.md", "# B\n", ChangeSource::Local).unwrap();
+    svc.create_folder("Plans/Empty", ChangeSource::Local).unwrap();
+    let token = svc.trash("Plans", ChangeSource::Local).unwrap();
+    assert!(svc.read("Plans/a.md").is_err());
+
+    assert_eq!(svc.untrash(&token, ChangeSource::Local).unwrap(), "Plans");
+    assert_eq!(svc.read("Plans/a.md").unwrap(), "# A\n");
+    assert_eq!(svc.read("Plans/Deep/b.md").unwrap(), "# B\n");
+    assert!(svc.resolve_path("Plans/Empty").unwrap().is_dir());
+    assert!(svc.untrash(&token, ChangeSource::Local).is_err(), "an undo runs once");
+
+    let token = svc.trash("Plans/a.md", ChangeSource::Local).unwrap();
+    svc.write("Plans/a.md", "# Someone else's\n", ChangeSource::Local).unwrap();
+    assert!(svc.untrash(&token, ChangeSource::Local).is_err());
+    assert_eq!(svc.read("Plans/a.md").unwrap(), "# Someone else's\n");
+}
+
+/// A folder order lands in `folderOrder`, keeping the settings' other keys.
+#[test]
+fn a_folder_order_is_written_to_the_space_settings() {
+    let fx = Fixture::new();
+    let (svc, _) = WikiService::start(fx.spec(fx.branch_layout(), false), Arc::new(Recorder::default())).unwrap();
+    svc.create_folder("Plans/B", ChangeSource::Local).unwrap();
+    svc.create_folder("Plans/A", ChangeSource::Local).unwrap();
+    let before = shelbi_wiki::fs::settings::load_space_settings(svc.root()).unwrap();
+    svc.set_folder_order("Plans", &["B".into(), "A".into()], ChangeSource::Local).unwrap();
+    let after = shelbi_wiki::fs::settings::load_space_settings(svc.root()).unwrap();
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.folder_order.unwrap()["Plans"], vec!["B".to_string(), "A".to_string()]);
+    assert!(svc.set_folder_order("Plans", &["x/y".into()], ChangeSource::Local).is_err());
+    assert!(svc.set_folder_order("Nope", &["A".into()], ChangeSource::Local).is_err());
+    svc.set_folder_order("Plans", &[], ChangeSource::Local).unwrap();
+    let cleared = shelbi_wiki::fs::settings::load_space_settings(svc.root()).unwrap();
+    assert!(cleared.folder_order.is_none_or(|m| !m.contains_key("Plans")));
+}
