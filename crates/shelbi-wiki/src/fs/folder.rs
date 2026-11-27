@@ -246,6 +246,18 @@ pub fn delete_folder(folder_path: &Path) -> Result<(), FsError> {
     crate::fs::paths::delete_to_trash(folder_path)
 }
 
+/// A folder's emoji icon from its `.contextstore/settings.yml`, when it
+/// sets one. Shelbi addition (the tree's folder rows); a missing or
+/// unreadable file has none.
+pub fn folder_icon(folder_root: &Path) -> Option<String> {
+    read_optional_metadata(folder_root)
+        .ok()
+        .flatten()
+        .and_then(|m| m.icon)
+        .map(|icon| icon.trim().to_string())
+        .filter(|icon| !icon.is_empty())
+}
+
 fn read_optional_metadata(folder_root: &Path) -> Result<Option<FolderMetadata>, FsError> {
     let path = folder_metadata_path(folder_root);
     let raw = match std::fs::read_to_string(&path) {

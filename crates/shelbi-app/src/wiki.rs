@@ -82,6 +82,22 @@ pub enum WikiRequest {
         section: Option<String>,
         by: Author,
     },
+    /// Remove a document or folder, keeping it in the hub's memory so
+    /// [`WikiRequest::Untrash`] can put it back (a client's Delete with its
+    /// undo). Answers [`WikiReply::Trashed`].
+    Trash { path: String, by: Author },
+    /// Put back what [`WikiRequest::Trash`] answered `token` for. Refused
+    /// once its path is taken again, or when the hub has forgotten it (it
+    /// keeps the last few, until it restarts).
+    Untrash { token: String, by: Author },
+    /// Order `folder`'s subfolders (wiki-relative, `""` the root) as
+    /// `order` names them: the wiki's `folderOrder`. Names it leaves out
+    /// sort after, by name.
+    Reorder {
+        folder: String,
+        order: Vec<String>,
+        by: Author,
+    },
     /// One folder's entries (subfolders, then documents, with their
     /// counts), or a document's headings. Answers [`WikiReply::Entries`].
     List { path: Option<String> },
@@ -175,6 +191,8 @@ pub enum WikiReply {
     Conflict(WikiConflict),
     /// A write (or move, copy, remove) was made.
     Done,
+    /// [`WikiRequest::Trash`] removed it; `token` undoes it.
+    Trashed { token: String },
     Failed(WikiFailure),
 }
 
@@ -254,6 +272,10 @@ pub struct WikiNode {
     /// A document's first H1 (else its file name); a folder's name.
     pub title: String,
     pub kind: NodeKind,
+    /// A folder's emoji icon, from its `.contextstore/settings.yml`, when
+    /// it sets one. Absent from an older hub's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     /// A folder's subfolders (in `folderOrder`), then its documents (pinned
     /// first, then by title). Empty for a document.
     pub children: Vec<WikiNode>,

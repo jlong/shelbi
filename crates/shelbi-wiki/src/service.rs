@@ -20,7 +20,7 @@
 //!
 //! Std threads only, matching the daemon.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -192,6 +192,31 @@ struct Shared {
     engine: Mutex<Engine>,
     sched: Mutex<Sched>,
     wake: Condvar,
+    /// What [`WikiService::trash`] took, so a client's undo can put it back.
+    trash: Mutex<Trash>,
+}
+
+/// The removals an undo can still restore, newest last, at most
+/// [`TRASH_KEEP`]. In memory only: a hub restart forgets them (the wiki's
+/// history still has every committed version).
+#[derive(Default)]
+struct Trash {
+    next: u64,
+    items: VecDeque<(String, Trashed)>,
+}
+
+/// How many removals [`WikiService::untrash`] can still restore.
+const TRASH_KEEP: usize = 32;
+
+/// One removal: the path it was at and every file and folder under it.
+struct Trashed {
+    path: String,
+    /// The path's own bytes (a document), or nothing (a folder).
+    file: Option<Vec<u8>>,
+    /// A folder's contents, relative to it: folders (so empty ones come
+    /// back too), then files.
+    dirs: Vec<PathBuf>,
+    files: Vec<(PathBuf, Vec<u8>)>,
 }
 
 struct Sched {
@@ -252,6 +277,7 @@ impl WikiService {
                 running: false,
             }),
             wake: Condvar::new(),
+            trash: Mutex::new(Trash::default()),
         });
         let watcher = watch(&root, Arc::downgrade(&shared));
         let thread_shared = shared.clone();
@@ -501,6 +527,96 @@ impl WikiService {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(OpError::NotFound(path.to_string())),
                 Err(e) => Err(OpError::Failed(format!("removing `{path}`: {e}"))),
             }
+        })
+    }
+
+    /// Remove a document or folder as [`Self::remove`] does, keeping what
+    /// it held so [`Self::untrash`] can put it back (a client's undo).
+    /// Answers the token the undo names it by.
+    pub fn trash(&self, path: &str, source: ChangeSource) -> Result<String, OpError> {
+        let abs = self.resolve_path(path)?;
+        if abs == self.shared.root {
+            return Err(OpError::Invalid("can't remove the wiki itself".into()));
+        }
+        let mut kept = None;
+        self.mutate(source, || {
+            let item = collect_trashed(&abs, path)?;
+            let result = if abs.is_dir() {
+                std::fs::remove_dir_all(&abs)
+            } else {
+                std::fs::remove_file(&abs)
+            };
+            result.map_err(|e| OpError::Failed(format!("removing `{path}`: {e}")))?;
+            kept = Some(item);
+            Ok(())
+        })?;
+        let mut trash = lock(&self.shared.trash);
+        trash.next += 1;
+        let token = format!("t{}", trash.next);
+        if let Some(item) = kept {
+            trash.items.push_back((token.clone(), item));
+        }
+        while trash.items.len() > TRASH_KEEP {
+            trash.items.pop_front();
+        }
+        Ok(token)
+    }
+
+    /// Put back what [`Self::trash`] took under `token`, where it was.
+    /// Refused when something else has taken its path since, or the token
+    /// is unknown (too old, or the hub restarted).
+    pub fn untrash(&self, token: &str, source: ChangeSource) -> Result<String, OpError> {
+        let item = {
+            let mut trash = lock(&self.shared.trash);
+            let at = trash.items.iter().position(|(t, _)| t == token).ok_or_else(|| {
+                OpError::NotFound("that removal can no longer be undone".to_string())
+            })?;
+            trash.items.remove(at).map(|(_, item)| item)
+        };
+        let Some(item) = item else {
+            return Err(OpError::NotFound("that removal can no longer be undone".to_string()));
+        };
+        let abs = self.resolve_path(&item.path)?;
+        let path = item.path.clone();
+        self.mutate(source, || {
+            if abs.exists() {
+                return Err(OpError::Exists(item.path.clone()));
+            }
+            restore_trashed(&abs, &item).map_err(|e| OpError::Failed(format!("restoring `{}`: {e}", item.path)))
+        })?;
+        Ok(path)
+    }
+
+    /// Set the order of `parent`'s subfolders (wiki-relative, `""` the
+    /// root): the space's `folderOrder`, as ContextStore writes it. Names
+    /// not listed sort after the listed ones, by name; an empty `order`
+    /// drops the parent's entry.
+    pub fn set_folder_order(&self, parent: &str, order: &[String], source: ChangeSource) -> Result<(), OpError> {
+        use crate::fs::settings::{load_space_settings, save_space_settings, SpaceSettings};
+        let parent = parent.trim_matches('/').to_string();
+        if !parent.is_empty() && !self.resolve_path(&parent)?.is_dir() {
+            return Err(OpError::NotFound(parent));
+        }
+        if order.iter().any(|name| name.is_empty() || name.contains('/')) {
+            return Err(OpError::Invalid("a folder order lists names, not paths".into()));
+        }
+        let root = self.shared.root.clone();
+        self.mutate(source, || {
+            let mut settings = match load_space_settings(&root) {
+                Ok(s) => s,
+                Err(crate::fs::FsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                    SpaceSettings::default()
+                }
+                Err(e) => return Err(OpError::Failed(e.to_string())),
+            };
+            let mut map = settings.folder_order.take().unwrap_or_default();
+            if order.is_empty() {
+                map.remove(&parent);
+            } else {
+                map.insert(parent.clone(), order.to_vec());
+            }
+            settings.folder_order = (!map.is_empty()).then_some(map);
+            save_space_settings(&root, &settings).map_err(|e| OpError::Failed(e.to_string()))
         })
     }
 
@@ -845,6 +961,57 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
         std::fs::copy(src, dst).map(|_| ())
     }
+}
+
+/// What removing `abs` (wiki-relative `path`) would take.
+fn collect_trashed(abs: &Path, path: &str) -> Result<Trashed, OpError> {
+    let fail = |e: std::io::Error| OpError::Failed(format!("reading `{path}`: {e}"));
+    let meta = std::fs::symlink_metadata(abs).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => OpError::NotFound(path.to_string()),
+        _ => fail(e),
+    })?;
+    let mut item = Trashed {
+        path: path.trim_matches('/').to_string(),
+        file: None,
+        dirs: Vec::new(),
+        files: Vec::new(),
+    };
+    if !meta.is_dir() {
+        item.file = Some(std::fs::read(abs).map_err(fail)?);
+        return Ok(item);
+    }
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        for entry in std::fs::read_dir(abs.join(&rel)).map_err(fail)? {
+            let entry = entry.map_err(fail)?;
+            let child = rel.join(entry.file_name());
+            if entry.file_type().map_err(fail)?.is_dir() {
+                item.dirs.push(child.clone());
+                stack.push(child);
+            } else {
+                item.files.push((child.clone(), std::fs::read(abs.join(&child)).map_err(fail)?));
+            }
+        }
+    }
+    Ok(item)
+}
+
+/// Write `item` back at `abs`.
+fn restore_trashed(abs: &Path, item: &Trashed) -> std::io::Result<()> {
+    if let Some(bytes) = &item.file {
+        if let Some(dir) = abs.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        return std::fs::write(abs, bytes);
+    }
+    std::fs::create_dir_all(abs)?;
+    for dir in &item.dirs {
+        std::fs::create_dir_all(abs.join(dir))?;
+    }
+    for (rel, bytes) in &item.files {
+        std::fs::write(abs.join(rel), bytes)?;
+    }
+    Ok(())
 }
 
 fn one_line(s: &str) -> String {

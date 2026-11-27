@@ -197,6 +197,40 @@ pub fn save(store: &dyn ConfigStore, config: &WorkflowConfig) -> Result<Workflow
         .map_err(|e| e.to_string())
 }
 
+/// A set-up wiki's status line at `now`: its sync state, how long since it
+/// last synced, and Paused or Manual. The Wiki page's status row and the
+/// Wiki sidebar's footer read the same.
+pub fn status_line(s: &WikiStatus, now: DateTime<Utc>) -> StatusLine {
+    let (tone, word) = match &s.state {
+        SyncState::Synced => (Tone::Good, "Synced".to_string()),
+        SyncState::Syncing => (Tone::Busy, "Syncing".to_string()),
+        SyncState::Pending => (Tone::Busy, "Changes waiting to sync".to_string()),
+        SyncState::Offline => (Tone::Muted, "Offline".to_string()),
+        SyncState::Conflict => (
+            Tone::Bad,
+            match s.conflicts.len() {
+                1 => "1 file held for a conflict".to_string(),
+                n => format!("{n} files held for a conflict"),
+            },
+        ),
+        SyncState::Error(detail) => (Tone::Bad, format!("Sync failed: {detail}")),
+    };
+    let mut text = word;
+    if let Some(at) = s.last_synced.as_deref().and_then(|t| DateTime::parse_from_rfc3339(t).ok()) {
+        if matches!(s.state, SyncState::Synced | SyncState::Pending | SyncState::Offline) {
+            text.push_str(" · ");
+            text.push_str(&crate::jobs::age_label(at.with_timezone(&Utc), now));
+        }
+    }
+    let tone = if s.paused && tone == Tone::Good { Tone::Muted } else { tone };
+    if s.paused {
+        text.push_str(" · Paused");
+    } else if !s.auto {
+        text.push_str(" · Manual");
+    }
+    StatusLine { tone, text }
+}
+
 /// How a status line reads: its color's role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
@@ -682,34 +716,7 @@ impl WikiForm {
                 },
             );
         }
-        let (tone, word) = match &s.state {
-            SyncState::Synced => (Tone::Good, "Synced".to_string()),
-            SyncState::Syncing => (Tone::Busy, "Syncing".to_string()),
-            SyncState::Pending => (Tone::Busy, "Changes waiting to sync".to_string()),
-            SyncState::Offline => (Tone::Muted, "Offline".to_string()),
-            SyncState::Conflict => (
-                Tone::Bad,
-                match s.conflicts.len() {
-                    1 => "1 file held for a conflict".to_string(),
-                    n => format!("{n} files held for a conflict"),
-                },
-            ),
-            SyncState::Error(detail) => (Tone::Bad, format!("Sync failed: {detail}")),
-        };
-        let mut text = word;
-        if let Some(at) = s.last_synced.as_deref().and_then(|t| DateTime::parse_from_rfc3339(t).ok()) {
-            if matches!(s.state, SyncState::Synced | SyncState::Pending | SyncState::Offline) {
-                text.push_str(" · ");
-                text.push_str(&crate::jobs::age_label(at.with_timezone(&Utc), now));
-            }
-        }
-        let tone = if s.paused && tone == Tone::Good { Tone::Muted } else { tone };
-        if s.paused {
-            text.push_str(" · Paused");
-        } else if !s.auto {
-            text.push_str(" · Manual");
-        }
-        StatusLine { tone, text }
+        status_line(s, now)
     }
 
     /// Folder mode's rolling pull request, once one is open.

@@ -418,6 +418,15 @@ impl ProjectLink {
         }
     }
 
+    /// Subscribe to the project's wiki changes: documents changed, the sync
+    /// status, a `shelbi wiki open` ([`crate::wiki_sub`]).
+    pub fn subscribe_wiki(&self) -> (ChangeSubscription, Receiver<crate::wiki_sub::WikiWake>) {
+        match &self.relay {
+            None => crate::wiki_sub::spawn(&self.key.name),
+            Some(relay) => remote::subscribe_wiki(relay.clone(), &self.key.name),
+        }
+    }
+
     /// Whether this link reaches a project on another machine.
     pub fn is_remote(&self) -> bool {
         self.relay.is_some()

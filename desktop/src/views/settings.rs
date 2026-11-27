@@ -739,7 +739,7 @@ impl SettingsView {
     }
 
     /// The Wiki page's view.
-    #[cfg(any(test, feature = "visual-check"))]
+    #[cfg(test)]
     pub(crate) fn wiki(&self) -> Entity<WikiSettingsPage> {
         self.wiki.clone()
     }
