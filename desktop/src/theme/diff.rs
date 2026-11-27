@@ -94,29 +94,31 @@ pub fn syntax_color(theme: &Theme, class: SyntaxClass) -> Option<Hsla> {
     })
 }
 
+/// The WCAG ratio of `text` over `tint` over `canvas` (for the code views'
+/// legibility tests).
+#[cfg(test)]
+pub(crate) fn contrast(text: Hsla, tint: Hsla, canvas: Hsla) -> f32 {
+    let lum = |c: gpui::Rgba| {
+        let f = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+    };
+    let over = |top: gpui::Rgba, under: gpui::Rgba| gpui::Rgba {
+        r: top.r * top.a + under.r * (1.0 - top.a),
+        g: top.g * top.a + under.g * (1.0 - top.a),
+        b: top.b * top.a + under.b * (1.0 - top.a),
+        a: 1.0,
+    };
+    let surface = over(tint.into(), canvas.into());
+    let text = over(text.into(), surface);
+    let (a, b) = (lum(surface), lum(text));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::WindowAppearance;
     use shelbi_app::theme::ThemePreference;
-
-    /// The WCAG ratio of `text` over `tint` over `canvas`.
-    fn contrast(text: Hsla, tint: Hsla, canvas: Hsla) -> f32 {
-        let lum = |c: gpui::Rgba| {
-            let f = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
-            0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
-        };
-        let over = |top: gpui::Rgba, under: gpui::Rgba| gpui::Rgba {
-            r: top.r * top.a + under.r * (1.0 - top.a),
-            g: top.g * top.a + under.g * (1.0 - top.a),
-            b: top.b * top.a + under.b * (1.0 - top.a),
-            a: 1.0,
-        };
-        let surface = over(tint.into(), canvas.into());
-        let text = over(text.into(), surface);
-        let (a, b) = (lum(surface), lum(text));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
 
     #[test]
     fn code_stays_legible_on_every_tint_in_both_themes() {

@@ -4272,6 +4272,68 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_fenced_code_block_reads_highlighted_and_shows_its_fences_only_to_edit(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let src = "Intro.\n\n```yaml\nopencode-plugin:\n  runs-on: ubuntu-latest # ci\n```\n\nAfter.";
+        let mut a = issue("A", "todo");
+        a.body = src.into();
+        let (view, mut cx) = open_board_sized(cx, vec![a], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let (_, body) = editors(&view, &mut cx);
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            assert!(drawn(cx, "pane-body-editor"));
+            body.read_with(cx, |b, _| b.shown_rows())
+        };
+        let code = ["Intro.", "opencode-plugin:", "  runs-on: ubuntu-latest # ci", "After."];
+        let fenced = ["Intro.", "```yaml", "opencode-plugin:", "  runs-on: ubuntu-latest # ci", "```", "After."];
+
+        // Read: no fences, and the line in more than one color (key,
+        // value, comment).
+        assert_eq!(shown(&mut cx), code);
+        let read_height = body.read_with(&cx, |b, _| b.painted_height());
+        let colors = body.read_with(&cx, |b, cx| b.row_colors("  runs-on: ubuntu-latest # ci", cx));
+        assert!(colors.len() >= 2, "highlighted: {colors:?}");
+
+        // A click on a code line puts the caret in the block: the fences show,
+        // taking their room.
+        let at = body.read_with(&cx, |b, _| b.point_of(src.find("runs-on").unwrap())).unwrap();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        assert!(body.read_with(&cx, |b, _| b.is_focused()));
+        assert_eq!(shown(&mut cx), fenced);
+        assert!(body.read_with(&cx, |b, _| b.painted_height()) > read_height);
+
+        // Up through the opening fence and out: hidden again.
+        cx.simulate_keystrokes("up");
+        assert_eq!(shown(&mut cx), fenced);
+        cx.simulate_keystrokes("up");
+        assert_eq!(shown(&mut cx), fenced, "on the opening fence");
+        cx.simulate_keystrokes("up");
+        assert!(body.read_with(&cx, |b, _| b.model.head()) <= "Intro.".len(), "on the line above");
+        assert_eq!(shown(&mut cx), code);
+
+        // Down from the line above lands on the first code line: in again.
+        cx.simulate_keystrokes("down");
+        assert_eq!(shown(&mut cx), fenced);
+        let head = body.read_with(&cx, |b, _| b.model.head());
+        assert!(head >= src.find("opencode").unwrap() && head <= src.find("  runs").unwrap(), "{head}");
+
+        // The fence is edited like any text, and reading it back changes
+        // nothing else.
+        cx.simulate_keystrokes("up end");
+        cx.simulate_input("x");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), src.replace("```yaml", "```yamlx"));
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), src);
+
+        // Without the keys the fences never show.
+        cx.simulate_keystrokes("escape");
+        assert!(!body.read_with(&cx, |b, _| b.is_focused()));
+        assert_eq!(shown(&mut cx), code);
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), src);
+    }
+
+    #[gpui::test]
     fn a_checkbox_is_clicked_checked_without_editing(cx: &mut gpui::TestAppContext) {
         use crate::views::board_state::tests::issue;
         cx.update(|cx| cx.set_reduce_motion(true));

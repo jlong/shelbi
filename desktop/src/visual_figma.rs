@@ -41,6 +41,7 @@
 //! the sidebar states no frame draws (`state-sidebar-*`: sections
 //! collapsed, the project switcher open, Zen off, the sidebar hidden), the task pane's
 //! (`state-task-pane-*`: its More menu, a long body scrolled, an empty body,
+//! a fenced yaml block read and with the caret in it,
 //! a task no longer on the board, another card picked beside it) and the task panels'
 //! (`state-review-*`, `state-workspace-*`: More opening the task detail
 //! over the screen, each view's ⌘N, Approve
@@ -4669,6 +4670,30 @@ impl Run {
         let handle = self.open_pane();
         self.save(handle, "state-task-pane-empty");
 
+        // A fenced yaml block, read: highlighted, its fences hidden. Then
+        // with the caret in it: the fences shown to be edited.
+        save_task_body(CODE_BODY);
+        let handle = self.open_pane();
+        self.save(handle, "state-task-pane-code");
+        let handle = self.open_pane();
+        let body = self.views(handle).0.and_then(|b| {
+            b.read_with(&self.cx, |v, _| v.pane_editors.as_ref().map(|e| e.body.clone()))
+        });
+        if let Some(body) = body {
+            let at = CODE_BODY.find("runs-on").unwrap_or(0);
+            self.cx
+                .update_window(handle.into(), |_, window, cx| {
+                    body.update(cx, |b, cx| {
+                        b.focus_at(false, window, cx);
+                        b.model.move_to(at, false);
+                        cx.notify();
+                    })
+                })
+                .unwrap();
+        }
+        self.settle(handle);
+        self.save(handle, "state-task-pane-code-editing");
+
         // A task the board doesn't have (deleted since it was opened).
         let handle = self.open_pane();
         if let (Some(board), _, _) = self.views(handle) {
@@ -4795,6 +4820,11 @@ fn save_pane_task(column: Column, started: bool) {
         shelbi_state::save_task(PROJECT, &file.task, &file.body).expect("save the pane's task");
     }
 }
+
+/// A body holding a fenced yaml block (`state-task-pane-code`).
+const CODE_BODY: &str = "Run the plugin's unit tests in CI:\n\n```yaml\nopencode-plugin:\n  runs-on: ubuntu-latest\n  \
+timeout-minutes: 10 # node is quick\n  steps:\n    - uses: actions/checkout@v4\n    - run: npm test\n      \
+working-directory: \"plugins/opencode\"\n```\n\nThen require the job on main.";
 
 /// Give the pane's task a new body.
 fn save_task_body(body: &str) {

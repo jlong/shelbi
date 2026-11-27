@@ -4,14 +4,22 @@
 //!
 //! Offsets here are display offsets of a row unless named `src`; positions
 //! are relative to the editor element's origin.
+//!
+//! A fenced code block's lines take their syntax colors ([`Code::spans`],
+//! the diff view's classes and colors, `theme::diff::syntax_color`), and its
+//! fence rows are left out while the caret is elsewhere ([`Code::hidden`]):
+//! a hidden row takes no room and no visual line, so the caret and the
+//! pointer can't land in it, and the block's padding wraps what's shown.
 
 use gpui::{
     font, point, px, size, App, Bounds, Font, FontStyle, FontWeight, Hsla, Pixels, Point, SharedString,
     StrikethroughStyle, TextRun, UnderlineStyle, Window, WrappedLine,
 };
+use shelbi_app::diff::highlight::{SyntaxClass, SyntaxSpan};
 use shelbi_app::markdown_edit::{Doc, Gap, Marker, Row, RowKind, Style};
 
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
+use crate::theme::diff::syntax_color;
 use crate::theme::style::{Type, UI_FAMILY};
 use crate::theme::Theme;
 
@@ -41,6 +49,25 @@ pub enum Gutter {
     Check(bool),
 }
 
+/// How a doc's code shows: one entry per row in each (empty for none).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Code<'a> {
+    /// Rows left out (a block's fences, the caret elsewhere).
+    pub hidden: &'a [bool],
+    /// Each row's syntax spans, in display offsets.
+    pub spans: &'a [Vec<SyntaxSpan>],
+}
+
+impl Code<'_> {
+    fn hidden(&self, row: usize) -> bool {
+        self.hidden.get(row).copied().unwrap_or(false)
+    }
+
+    fn spans(&self, row: usize) -> &[SyntaxSpan] {
+        self.spans.get(row).map_or(&[], Vec::as_slice)
+    }
+}
+
 pub struct RowLayout {
     /// The top of the row's text.
     pub top: Pixels,
@@ -51,6 +78,8 @@ pub struct RowLayout {
     /// shaping.
     pub lines: Vec<(usize, WrappedLine)>,
     pub gutter: Option<(Gutter, Bounds<Pixels>)>,
+    /// Left out: no lines, no height, no visual line.
+    pub hidden: bool,
 }
 
 pub struct DocLayout {
@@ -106,6 +135,20 @@ fn face(field: Field, row: &Row, theme: &Theme) -> Face {
     }
 }
 
+/// The color a code line's token paints, or `None` for the code's own: the
+/// diff view's ([`syntax_color`]), but a comment is the code's text faded
+/// rather than the muted role, which falls under 3:1 on a block in the light
+/// theme at low contrast.
+fn code_color(theme: &Theme, class: SyntaxClass) -> Option<Hsla> {
+    match class {
+        SyntaxClass::Comment => Some(Hsla {
+            a: theme.foreground.a * 0.66,
+            ..theme.foreground
+        }),
+        _ => syntax_color(theme, class),
+    }
+}
+
 /// The room above a row.
 fn gap(g: Gap) -> f32 {
     match g {
@@ -117,12 +160,25 @@ fn gap(g: Gap) -> f32 {
 }
 
 /// The runs that set `row`'s display in `f`, `marked` (display offsets)
-/// underlined for an input method's composition.
-fn runs(row: &Row, f: &Face, marked: Option<std::ops::Range<usize>>, theme: &Theme) -> Vec<TextRun> {
+/// underlined for an input method's composition, `syntax` (a code line's
+/// highlights) in their classes' colors.
+fn runs(
+    row: &Row,
+    f: &Face,
+    marked: Option<std::ops::Range<usize>>,
+    syntax: &[SyntaxSpan],
+    theme: &Theme,
+) -> Vec<TextRun> {
     let len = row.display.len();
     let mut cuts = vec![0, len];
     for (r, _) in &row.styles {
         cuts.extend([r.start, r.end]);
+    }
+    for s in syntax {
+        let (a, b) = (s.range.start as usize, s.range.end as usize);
+        if b <= len && row.display.is_char_boundary(a) && row.display.is_char_boundary(b) {
+            cuts.extend([a, b]);
+        }
     }
     if let Some(m) = &marked {
         cuts.extend([m.start.min(len), m.end.min(len)]);
@@ -159,6 +215,13 @@ fn runs(row: &Row, f: &Face, marked: Option<std::ops::Range<usize>>, theme: &The
         if s.raw {
             color = theme.muted;
         }
+        if let Some(c) = syntax
+            .iter()
+            .find(|s| (s.range.start as usize) <= a && a < s.range.end as usize)
+            .and_then(|s| code_color(theme, s.class))
+        {
+            color = c;
+        }
         let in_marked = marked
             .as_ref()
             .is_some_and(|m| m.start <= a && b <= m.end && m.start < m.end);
@@ -191,13 +254,27 @@ fn runs(row: &Row, f: &Face, marked: Option<std::ops::Range<usize>>, theme: &The
     out
 }
 
+/// The distinct colors `row` is set in, with `syntax` its highlights.
+#[cfg(test)]
+pub fn run_colors(row: &Row, field: Field, syntax: &[SyntaxSpan], theme: &Theme) -> Vec<Hsla> {
+    let mut out: Vec<Hsla> = Vec::new();
+    for run in runs(row, &face(field, row, theme), None, syntax, theme) {
+        if !out.contains(&run.color) {
+            out.push(run.color);
+        }
+    }
+    out
+}
+
 /// Lay `doc` out at `width`. `marked` is the composition, in source
-/// offsets.
+/// offsets; `code` the rows left out and the code lines' highlights.
+#[allow(clippy::too_many_arguments)]
 pub fn layout(
     doc: &Doc,
     field: Field,
     width: Pixels,
     marked: Option<std::ops::Range<usize>>,
+    code: Code<'_>,
     theme: &Theme,
     window: &mut Window,
     _cx: &mut App,
@@ -209,14 +286,37 @@ pub fn layout(
     let mut rules = Vec::new();
     // Each level's running number in an ordered list (`None` for bullets).
     let mut numbers: Vec<Option<u64>> = Vec::new();
+    // The room a left-out row would have had above it, for the next one
+    // shown (an opening fence's gap above its block).
+    let mut carried = 0.0f32;
+    let mut shown_any = false;
+    // The block of the row shown before or after `ri`, past left-out rows.
+    let prev_block = |ri: usize| (0..ri).rev().find(|&i| !code.hidden(i)).and_then(|i| doc.rows[i].block);
+    let next_block = |ri: usize| (ri + 1..doc.rows.len()).find(|&i| !code.hidden(i)).and_then(|i| doc.rows[i].block);
     for (ri, row) in doc.rows.iter().enumerate() {
         let f = face(field, row, theme);
         let lh = px(f.line_height);
-        if ri > 0 {
-            y += px(gap(row.gap));
+        if code.hidden(ri) {
+            if shown_any {
+                carried = carried.max(gap(row.gap));
+            }
+            rows.push(RowLayout {
+                top: y,
+                left: px(CODE_INSET),
+                line_height: lh,
+                lines: Vec::new(),
+                gutter: None,
+                hidden: true,
+            });
+            continue;
         }
-        let new_block = row.block.is_some() && (ri == 0 || doc.rows[ri - 1].block != row.block);
-        let ends_block = row.block.is_some() && doc.rows.get(ri + 1).is_none_or(|n| n.block != row.block);
+        if shown_any {
+            y += px(gap(row.gap).max(carried));
+        }
+        carried = 0.0;
+        shown_any = true;
+        let new_block = row.block.is_some() && prev_block(ri) != row.block;
+        let ends_block = row.block.is_some() && next_block(ri) != row.block;
         if new_block {
             y += px(CODE_PAD);
         }
@@ -267,7 +367,13 @@ pub fn layout(
         let text: SharedString = row.display.clone().into();
         let shaped = window
             .text_system()
-            .shape_text(text, px(f.size), &runs(row, &f, marked_here, theme), Some(text_w), None)
+            .shape_text(
+                text,
+                px(f.size),
+                &runs(row, &f, marked_here, code.spans(ri), theme),
+                Some(text_w),
+                None,
+            )
             .map(|v| v.into_iter().collect::<Vec<_>>())
             .unwrap_or_default();
         let mut lines = Vec::with_capacity(shaped.len());
@@ -311,6 +417,7 @@ pub fn layout(
             line_height: lh,
             lines,
             gutter,
+            hidden: false,
         });
         y += height;
         if ends_block {
@@ -358,6 +465,9 @@ impl DocLayout {
     pub fn visuals(&self) -> Vec<Visual> {
         let mut out = Vec::new();
         for (ri, r) in self.rows.iter().enumerate() {
+            if r.hidden {
+                continue;
+            }
             if r.lines.is_empty() {
                 out.push(Visual {
                     row: ri,
@@ -537,5 +647,54 @@ pub fn check_box(gutter: Bounds<Pixels>) -> Bounds<Pixels> {
             gutter.origin.y + (gutter.size.height - px(CHECK)) / 2.0,
         ),
         size: size(px(CHECK), px(CHECK)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::WindowAppearance;
+    use shelbi_app::diff::highlight::SyntaxClass;
+    use shelbi_app::theme::ThemePreference;
+
+    use super::code_color;
+    use crate::theme::diff::contrast;
+    use crate::theme::Theme;
+
+    /// A code block's highlights read on its background in light and dark,
+    /// at every contrast and window opacity (the editor paints from the
+    /// opaque theme, so the glass never shows through the block).
+    #[test]
+    fn code_block_highlights_read_on_the_block_in_every_theme() {
+        let classes = [
+            SyntaxClass::Comment,
+            SyntaxClass::String,
+            SyntaxClass::Number,
+            SyntaxClass::Keyword,
+            SyntaxClass::Function,
+            SyntaxClass::Type,
+            SyntaxClass::Tag,
+            SyntaxClass::Heading,
+        ];
+        for system in [WindowAppearance::Dark, WindowAppearance::Light] {
+            for level in [0, 25, 50, 75, 100] {
+                for opacity in [1.0, 0.6] {
+                    let theme = Theme::resolve_with(ThemePreference::Auto, level, system)
+                        .with_opacity(opacity)
+                        .opaque();
+                    for class in classes {
+                        let color = code_color(&theme, class).unwrap();
+                        let ratio = contrast(color, theme.background, theme.canvas);
+                        assert!(
+                            ratio >= 3.0,
+                            "{system:?} contrast {level} opacity {opacity}: {class:?} is only {ratio}:1"
+                        );
+                        if class == SyntaxClass::Comment {
+                            let text = contrast(theme.foreground, theme.background, theme.canvas);
+                            assert!(ratio < text * 0.8, "{system:?} {level}: a comment reads quieter than code");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
