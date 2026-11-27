@@ -671,17 +671,7 @@ fn stdin_ready(_wait: std::time::Duration) -> bool {
     true
 }
 
-/// The editor command for `file`: $EDITOR, else $VISUAL, else `vi`, split
-/// on whitespace so `code --wait` works.
-pub fn editor_argv(file: &std::path::Path, editor: Option<&str>, visual: Option<&str>) -> Vec<String> {
-    let editor = editor
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| visual.filter(|s| !s.trim().is_empty()))
-        .unwrap_or("vi");
-    let mut argv: Vec<String> = editor.split_whitespace().map(String::from).collect();
-    argv.push(file.to_string_lossy().into_owned());
-    argv
-}
+pub use shelbi_app::wiki::editor_argv;
 
 /// Run one command against `hub` and answer what it prints.
 pub fn execute(hub: &dyn Hub, input: &dyn Input, cmd: WikiCmd, json: bool) -> Outcome {

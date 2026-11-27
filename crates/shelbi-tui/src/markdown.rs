@@ -20,6 +20,8 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::theme::palette;
 
 /// Inline `code` spans: the theme's `code_fg` on `code_bg`, a tint just off
@@ -327,6 +329,198 @@ fn toks_to_line(toks: &[Tok]) -> Line<'static> {
     Line::from(spans)
 }
 
+// ---- whole documents (the Wiki) ---------------------------------------------
+
+/// Render a whole Markdown document (a wiki page) into pre-wrapped lines for
+/// a pane `width` cells wide: headings, lists and task lists, quotes, code
+/// blocks and rules as blocks, and inside them the inline styles. The rows
+/// come from the shared Markdown model the desktop's document editor lays
+/// out ([`shelbi_app::markdown_edit::Doc`]), so both clients read a document
+/// the same way; what it doesn't render (a table, HTML) shows as written,
+/// muted. A leading frontmatter block is left out.
+pub fn render_document(src: &str, width: usize) -> Vec<Line<'static>> {
+    use shelbi_app::markdown_edit::{Doc, Gap, Marker, RowKind};
+    let width = width.max(8);
+    let body = strip_frontmatter(src);
+    let doc = Doc::parse(body);
+    let p = palette();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for row in &doc.rows {
+        let spaced = matches!(row.gap, Gap::Block | Gap::Heading | Gap::List);
+        if spaced && !out.is_empty() && !matches!(row.kind, RowKind::Fence { .. }) {
+            out.push(Line::default());
+        }
+        let segs = || styled_segments(&row.display, &row.styles);
+        match &row.kind {
+            RowKind::Empty => out.push(Line::default()),
+            RowKind::Paragraph => wrap_segments(segs(), width, "", "", Style::default(), &mut out),
+            RowKind::Heading(level) => {
+                let mut base = Style::default().add_modifier(Modifier::BOLD);
+                if *level <= 2 {
+                    base = base.fg(p.ansi_cyan);
+                }
+                let start = out.len();
+                wrap_segments(segs(), width, "", "", base, &mut out);
+                if *level == 1 {
+                    let w = out[start..].iter().map(Line::width).max().unwrap_or(0).max(1);
+                    out.push(Line::from(Span::styled("─".repeat(w.min(width)), Style::default().fg(p.ansi_dark_gray))));
+                }
+            }
+            RowKind::Item(item) => {
+                let indent = "  ".repeat(row.level);
+                let marker = match (&item.task, &item.marker) {
+                    (Some(true), _) => "☑ ".to_string(),
+                    (Some(false), _) => "☐ ".to_string(),
+                    (None, Marker::Bullet(_)) => "• ".to_string(),
+                    (None, Marker::Ordered { number, delim }) => format!("{number}{delim} "),
+                };
+                let first = format!("{indent}{marker}");
+                let rest = " ".repeat(UnicodeWidthStr::width(first.as_str()));
+                let base = if item.task == Some(true) {
+                    Style::default().fg(p.ansi_gray).add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    Style::default()
+                };
+                wrap_segments(segs(), width, &first, &rest, base, &mut out);
+            }
+            RowKind::Quote => {
+                let base = Style::default().fg(p.ansi_gray).add_modifier(Modifier::ITALIC);
+                wrap_segments(segs(), width, "│ ", "│ ", base, &mut out);
+            }
+            // The fences themselves don't show; the code between them does.
+            RowKind::Fence { .. } => {}
+            RowKind::Code => {
+                let text: String = format!("  {}", row.display.replace('\t', "    "));
+                let shown = crate::panel::truncate_right(&text, width);
+                let pad = width.saturating_sub(UnicodeWidthStr::width(shown.as_str()));
+                out.push(Line::from(Span::styled(format!("{shown}{}", " ".repeat(pad)), code_style())));
+            }
+            RowKind::Rule => out.push(Line::from(Span::styled("─".repeat(width), Style::default().fg(p.ansi_dark_gray)))),
+            RowKind::Raw => {
+                let base = Style::default().fg(p.ansi_gray);
+                wrap_segments(vec![(row.display.clone(), Style::default())], width, "", "", base, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// `src` without a leading `---` frontmatter block (YAML), which a reader
+/// doesn't need and the block model would take for a rule and a heading.
+pub(crate) fn strip_frontmatter(src: &str) -> &str {
+    let Some(rest) = src.strip_prefix("---\n").or_else(|| src.strip_prefix("---\r\n")) else {
+        return src;
+    };
+    let mut at = 0;
+    for line in rest.split_inclusive('\n') {
+        at += line.len();
+        if line.trim_end() == "---" {
+            return rest[at..].trim_start_matches(['\n', '\r']);
+        }
+    }
+    src
+}
+
+/// A row's display text cut into `(text, style)` runs by its inline styles.
+fn styled_segments(display: &str, styles: &[(std::ops::Range<usize>, shelbi_app::markdown_edit::Style)]) -> Vec<(String, Style)> {
+    let p = palette();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (range, s) in styles {
+        let (start, end) = (range.start.min(display.len()), range.end.min(display.len()));
+        if start > at {
+            out.push((display[at..start].to_string(), Style::default()));
+        }
+        if end > start {
+            let mut style = if s.code { code_style() } else { Style::default() };
+            if s.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if s.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if s.strike {
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            if s.link {
+                style = style.fg(p.ansi_cyan).add_modifier(Modifier::UNDERLINED);
+            }
+            if s.raw {
+                style = style.fg(p.ansi_gray);
+            }
+            out.push((display[start..end].to_string(), style));
+        }
+        at = at.max(end);
+    }
+    if at < display.len() {
+        out.push((display[at..].to_string(), Style::default()));
+    }
+    out
+}
+
+/// Word-wrap styled `segs` to `width`, the first line led by `first`, the
+/// rest by `rest`, each segment's style over `base`.
+fn wrap_segments(segs: Vec<(String, Style)>, width: usize, first: &str, rest: &str, base: Style, out: &mut Vec<Line<'static>>) {
+    // Words (runs of non-space, possibly across segments) and the spaces
+    // between them, each a list of styled pieces.
+    let mut words: Vec<(bool, Vec<(String, Style)>)> = Vec::new();
+    for (text, style) in segs {
+        let style = base.patch(style);
+        let mut piece = String::new();
+        let mut space = None;
+        for ch in text.chars() {
+            let is_space = ch == ' ';
+            if space != Some(is_space) && !piece.is_empty() {
+                push_piece(&mut words, space.unwrap_or(false), std::mem::take(&mut piece), style);
+            }
+            space = Some(is_space);
+            piece.push(ch);
+        }
+        if !piece.is_empty() {
+            push_piece(&mut words, space.unwrap_or(false), piece, style);
+        }
+    }
+    let lead = |n: usize| if n == 0 { first } else { rest };
+    let mut line: Vec<Span<'static>> = vec![Span::raw(first.to_string())];
+    let mut col = UnicodeWidthStr::width(first);
+    let mut count = 0;
+    let mut has_text = false;
+    for (space, pieces) in words {
+        let w: usize = pieces.iter().map(|(t, _)| UnicodeWidthStr::width(t.as_str())).sum();
+        if space {
+            // A space at a break is dropped.
+            if has_text && col + w < width {
+                col += w;
+                line.extend(pieces.into_iter().map(|(t, s)| Span::styled(t, s)));
+            }
+            continue;
+        }
+        if has_text && col + w > width {
+            // Trailing spaces at the break go too.
+            while line.len() > 1 && line.last().is_some_and(|s| !s.content.is_empty() && s.content.trim().is_empty()) {
+                line.pop();
+            }
+            out.push(Line::from(std::mem::take(&mut line)));
+            count += 1;
+            line.push(Span::raw(lead(count).to_string()));
+            col = UnicodeWidthStr::width(lead(count));
+        }
+        for (t, s) in pieces {
+            col += UnicodeWidthStr::width(t.as_str());
+            line.push(Span::styled(t, s));
+        }
+        has_text = true;
+    }
+    out.push(Line::from(line));
+}
+
+fn push_piece(words: &mut Vec<(bool, Vec<(String, Style)>)>, space: bool, text: String, style: Style) {
+    match words.last_mut() {
+        Some((was_space, pieces)) if *was_space == space => pieces.push((text, style)),
+        _ => words.push((space, vec![(text, style)])),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +683,49 @@ mod tests {
             Paragraph::new(lines).render(area, &mut buf);
             crate::theme::assert_light_readable("markdown", &buf);
         });
+    }
+
+    // ---- whole documents -------------------------------------------------
+
+    fn doc_text(src: &str, width: usize) -> Vec<String> {
+        render_document(src, width).iter().map(line_text).collect()
+    }
+
+    #[test]
+    fn a_document_draws_its_blocks() {
+        let src = "---\ntags: [a]\n---\n# Plan\n\nSome **bold** text.\n\n## Goals\n\n- [ ] ship it\n- [x] plan it\n- a point\n\n1. first\n\n> quoted\n\n```rust\nfn main() {}\n```\n\n---\n";
+        let lines = doc_text(src, 30);
+        assert_eq!(lines[0], "Plan");
+        assert_eq!(lines[1], "────");
+        assert!(lines.contains(&"Some bold text.".to_string()), "{lines:?}");
+        assert!(lines.contains(&"Goals".to_string()));
+        assert!(lines.contains(&"☐ ship it".to_string()));
+        assert!(lines.contains(&"☑ plan it".to_string()));
+        assert!(lines.contains(&"• a point".to_string()));
+        assert!(lines.contains(&"1. first".to_string()));
+        assert!(lines.contains(&"│ quoted".to_string()));
+        assert!(lines.iter().any(|l| l.starts_with("  fn main() {}")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("```") || l.contains("tags")), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), &"─".repeat(30));
+        // Bold stays bold, its asterisks gone.
+        let rendered = render_document("Some **bold** text.", 30);
+        let bold = rendered[0].spans.iter().find(|s| s.content == "bold").unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn document_lines_wrap_under_their_marker() {
+        let lines = doc_text("- one two three four five six", 14);
+        assert_eq!(lines, ["• one two", "  three four", "  five six"]);
+        for l in render_document("A long paragraph that has to wrap somewhere", 12) {
+            assert!(l.width() <= 12, "{:?}", line_text(&l));
+        }
+    }
+
+    #[test]
+    fn frontmatter_is_left_out_only_when_closed() {
+        assert_eq!(strip_frontmatter("---\na: 1\n---\n\n# T\n"), "# T\n");
+        assert_eq!(strip_frontmatter("---\nnot closed\n"), "---\nnot closed\n");
+        assert_eq!(strip_frontmatter("# T\n"), "# T\n");
     }
 }

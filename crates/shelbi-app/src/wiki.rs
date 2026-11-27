@@ -406,6 +406,19 @@ pub fn ask(link: &ProjectLink, req: WikiRequest) -> WikiReply {
     }
 }
 
+/// The editor command for `file`: $EDITOR, else $VISUAL, else `vi`, split
+/// on whitespace so `code --wait` works. `shelbi wiki edit` and the TUI's
+/// Wiki `e` both run it, and wait for it to exit.
+pub fn editor_argv(file: &std::path::Path, editor: Option<&str>, visual: Option<&str>) -> Vec<String> {
+    let editor = editor
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| visual.filter(|s| !s.trim().is_empty()))
+        .unwrap_or("vi");
+    let mut argv: Vec<String> = editor.split_whitespace().map(String::from).collect();
+    argv.push(file.to_string_lossy().into_owned());
+    argv
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
