@@ -37,6 +37,8 @@ pub mod env;
 pub mod feedback;
 pub mod font_smoothing;
 #[cfg(not(target_os = "macos"))]
+pub mod hyprland;
+#[cfg(not(target_os = "macos"))]
 pub mod icon_theme;
 pub mod install;
 pub mod launch;

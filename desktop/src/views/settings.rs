@@ -1142,15 +1142,16 @@ impl SettingsView {
     }
 
     /// The installed look changed: show its setting (once the config is
-    /// read), and disable the sliders under Reduce Transparency.
+    /// read), and disable the sliders under Reduce Transparency, and the blur
+    /// one while the compositor blurs nothing (Hyprland's global blur off).
     fn follow_window_look(&mut self, cx: &mut Context<Self>) {
         let look = WindowLook::current(cx);
         if self.loaded && look.setting != self.translucency {
             self.show_translucency(look.setting, cx);
         }
-        for slider in [&self.opacity_slider, &self.blur_slider] {
-            slider.update(cx, |s, cx| s.set_disabled(look.reduce_transparency, cx));
-        }
+        let reduced = look.reduce_transparency;
+        self.opacity_slider.update(cx, |s, cx| s.set_disabled(reduced, cx));
+        self.blur_slider.update(cx, |s, cx| s.set_disabled(reduced || look.compositor_blur_off, cx));
         cx.notify();
     }
 
@@ -1703,6 +1704,17 @@ impl SettingsView {
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 /// The setting a tool change writes.
+/// Background blur's helper: what it does here, or, while the compositor
+/// blurs nothing (Hyprland's global blur off), why it is disabled and how to
+/// turn the blur on.
+pub fn blur_help(look: WindowLook) -> &'static str {
+    if look.compositor_blur_off {
+        crate::platform::blur::BLUR_OFF_HELP
+    } else {
+        crate::platform::blur::blur_help()
+    }
+}
+
 fn tool_setting_of(change: &Change) -> ToolSetting {
     match change {
         Change::DiffTool(_) => ToolSetting::DiffTool,
@@ -2134,16 +2146,20 @@ impl SettingsView {
     /// in place of their helpers while Reduce Transparency holds the
     /// windows opaque.
     fn render_translucency(&self, theme: &Theme, cx: &App) -> impl IntoElement {
-        let reduced = WindowLook::current(cx).reduce_transparency;
+        let look = WindowLook::current(cx);
+        let reduced = look.reduce_transparency;
         let help = |text: &'static str| (!reduced).then(|| SharedString::from(text));
         let adjustable = crate::platform::blur::radius_adjustable();
         let opacity_help = if adjustable {
             "How much of the desktop shows through the window. 100% is opaque."
         } else {
-            // The compositor blurs it (Hyprland's `decoration:blur`).
+            // A compositor other than Hyprland blurs by its own rules.
             "How much of the desktop shows through the window. 100% is opaque. \
              Your compositor blurs what shows through."
         };
+        // Hyprland's global blur is off: the slider is disabled, and its
+        // helper says how to turn the blur on (the app never does).
+        let blur_off = look.compositor_blur_off;
         div()
             .flex()
             .flex_col()
@@ -2155,12 +2171,16 @@ impl SettingsView {
                 theme,
             ))
             .when(adjustable, |d| {
-                d.child(controls::labeled_control(
-                    "Background blur",
-                    self.blur_slider.clone(),
-                    help("Blurs what shows through. 0 is a clear see-through."),
-                    theme,
-                ))
+                d.child(
+                    div()
+                        .when(blur_off, |d| d.debug_selector(|| "settings-blur-off".into()))
+                        .child(controls::labeled_control(
+                            "Background blur",
+                            self.blur_slider.clone(),
+                            help(blur_help(look)),
+                            theme,
+                        )),
+                )
             })
             .when(reduced, |d| {
                 d.child(

@@ -1291,8 +1291,72 @@ fn reduce_transparency_makes_the_window_opaque_and_disables_the_sliders(cx: &mut
     assert!(!s.read(|_, cx| opacity.read(cx).is_disabled()));
 }
 
-/// On Linux the compositor blurs (Hyprland's `decoration:blur`), at a radius
-/// the app can't set: Settings shows the transparency slider and no blur one.
+/// Under Hyprland the slider shows (it turns Hyprland's blur on and off for
+/// the app's windows), with a helper saying the strength is Hyprland's, and
+/// moving it applies to the window and saves, as on macOS.
+#[gpui::test]
+fn hyprland_shows_the_blur_slider(cx: &mut TestAppContext) {
+    use crate::theme::window::{Translucency, WindowLook};
+    crate::platform::blur::test_hyprland(true);
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let mut cfg = shelbi_state::UserConfig::default();
+    (cfg.desktop.window_opacity, cfg.desktop.window_blur) = (Some(80), Some(20));
+    let view = general_page(&mut s, cfg);
+    assert!(s.drawn("settings-window-opacity"));
+    assert!(s.drawn("settings-window-blur"), "Hyprland's blur is the app's to turn off");
+    assert!(!s.drawn("settings-blur-off"));
+    let look = s.h.cx.update(|_, cx| WindowLook::current(cx));
+    assert_eq!(crate::views::settings::blur_help(look), crate::platform::blur::HYPRLAND_HELP);
+    assert_eq!(window_applied(&mut s), Translucency { opacity: 80, blur: 20 });
+    s.click("settings-window-blur");
+    s.key("home");
+    let saved = s.read(|_, cx| view.read(cx).saved().desktop.clone());
+    assert_eq!(saved.window_blur, None, "0, the default, isn't written");
+    assert_eq!(window_applied(&mut s), Translucency { opacity: 80, blur: 0 }, "a clear see-through");
+    crate::platform::blur::test_hyprland(false);
+}
+
+/// With Hyprland's global blur off (Omarchy's default), Background blur shows
+/// disabled, with a helper saying why and how to turn it on; a config reload
+/// that turns it on enables the slider again. The app never changes it.
+#[gpui::test]
+fn hyprland_s_global_blur_off_disables_the_blur_slider(cx: &mut TestAppContext) {
+    use crate::theme::window::{self as translucency, WindowLook};
+    crate::platform::blur::test_hyprland(true);
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let mut cfg = shelbi_state::UserConfig::default();
+    (cfg.desktop.window_opacity, cfg.desktop.window_blur) = (Some(80), Some(20));
+    let view = general_page(&mut s, cfg);
+    let blur = s.read(|_, cx| view.read(cx).blur_slider());
+    let opacity = s.read(|_, cx| view.read(cx).opacity_slider());
+
+    s.update(|_, _, cx| translucency::set_compositor_blur_off(true, cx));
+    s.settle();
+    assert!(s.drawn("settings-window-blur"), "shown, not hidden");
+    assert!(s.drawn("settings-blur-off"), "the helper says why");
+    assert!(s.read(|_, cx| blur.read(cx).is_disabled()));
+    assert!(!s.read(|_, cx| opacity.read(cx).is_disabled()), "transparency still works");
+    let look = s.h.cx.update(|_, cx| WindowLook::current(cx));
+    let help = crate::views::settings::blur_help(look);
+    assert!(help.contains("global blur setting (decoration:blur:enabled) is off"), "{help}");
+    assert!(help.contains("omarchy hyprland window transparency glassy"), "{help}");
+    s.click("settings-window-blur");
+    s.key("home");
+    assert_eq!(s.read(|_, cx| blur.read(cx).value()), 20, "a disabled slider doesn't move");
+    assert_eq!(s.read(|_, cx| view.read(cx).saved().desktop.window_blur), Some(20), "the setting is kept");
+
+    s.update(|_, _, cx| translucency::set_compositor_blur_off(false, cx));
+    s.settle();
+    assert!(!s.drawn("settings-blur-off"));
+    assert!(!s.read(|_, cx| blur.read(cx).is_disabled()));
+    crate::platform::blur::test_hyprland(false);
+}
+
+/// Another Linux compositor blurs by its own rules, at a radius the app
+/// can't set or turn off: Settings shows the transparency slider and no blur
+/// one.
 #[gpui::test]
 fn a_compositor_blur_leaves_only_the_transparency_slider(cx: &mut TestAppContext) {
     crate::platform::blur::test_radius_adjustable(false);

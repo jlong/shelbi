@@ -203,7 +203,8 @@ Seen while running it; none of these block the build:
 - ~~**The traffic-light gap.**~~ Done in `dl-parity`:
   `sidebar::TRAFFIC_LIGHTS_RIGHT` is 0 off macOS, so the tabs and the
   collapsed sidebar's toggle start at the window's edge.
-- ~~**No blur.**~~ Done in `dl-windowing` (below): Hyprland blurs.
+- ~~**No blur.**~~ Done in `dl-windowing` (below): Hyprland blurs, and
+  Background blur turns it on or off for the app's windows.
 - **Fonts.** The bundled faces load through gpui (`assets::load_fonts`), but
   the CoreText fallback registration is macOS-only. (The installed-font list,
   `terminal::fonts::installed`, reads fontconfig on Linux since `dl-parity`,
@@ -231,13 +232,40 @@ Seen while running it; none of these block the build:
   works around (alphas adding up to opaque) doesn't exist here: a fill over
   the glass tints it. Should a surface offer no premultiplied mode, gpui falls
   back to `Inherit`, then whatever is first.
-- **Hyprland blurs; the app can't set the radius.** Hyprland blurs whatever
-  shows through a translucent window (`decoration:blur`, on by default; a
-  `windowrule = noblur, class:^(dev\.shelbi\.Desktop)$` turns it off). gpui's
-  `WindowBackgroundAppearance::Blurred` asks through `org_kde_kwin_blur`,
-  which Hyprland doesn't implement, and no protocol carries a radius. So on
-  Linux `platform::blur` sets nothing, and Settings shows only the
-  transparency slider (`blur::radius_adjustable`).
+- **Hyprland blurs; the app turns it on or off, not the radius.** Hyprland
+  blurs whatever shows through a translucent window by its global
+  `decoration:blur` settings. gpui's `WindowBackgroundAppearance::Blurred`
+  asks through `org_kde_kwin_blur`, which Hyprland doesn't implement, and no
+  protocol carries a radius. What Hyprland 0.56 offers one window (checked
+  in its source, v0.56.2):
+  - `no_blur`, a window property settable at run time over the instance
+    socket (`hl.dsp.window.set_prop` under a Lua config, `setprop` under
+    hyprlang), with `unset` handing it back to the user's window rules.
+  - No per-window size or passes: `decoration:blur:size` and `passes` are
+    global only.
+  - No per-window "on": `IHyprRenderer::shouldBlur` returns false for every
+    window while `decoration:blur:enabled` is off, before it looks at the
+    window's rules. That includes `ext-background-effect-v1`, which Hyprland
+    implements, but which only marks a region to blur (no radius) and sits
+    behind the same switch.
+
+  So under Hyprland (`HYPRLAND_INSTANCE_SIGNATURE`) Settings shows
+  Background blur, and `platform::hyprland` maps it onto `no_blur` for the
+  app's own windows (the clients whose `pid` is the app's): 0 sets
+  `no_blur`, anything above leaves Hyprland's blur on at Hyprland's size,
+  so the slider is on/off, not a strength. A worker thread does the IPC and
+  follows the event socket (`openwindow`, `configreloaded`), so windows
+  opened later get the setting too. It never touches the global settings or
+  another app's windows. **Limit:** with `decoration:blur:enabled` off
+  (Omarchy's stock `looknfeel.lua`; Omarchy's "glassy" mode,
+  `omarchy hyprland window transparency glassy`, turns it on) nothing
+  blurs, so Settings shows Background blur disabled, with a helper saying
+  the global setting is off and how to turn it on
+  (`WindowLook::compositor_blur_off`). The app reads the switch
+  (`j/getoption decoration:blur:enabled`) at start and again on every
+  `configreloaded`, so the control follows the user's config, but never
+  sets it. On another compositor the slider stays hidden
+  (`blur::radius_adjustable`): it blurs by its own rules.
 - **Opaque when it can't be translucent.** Reduce Transparency on Linux is
   the desktop asking for high contrast (the settings portal's
   `org.freedesktop.appearance` `contrast` = 1, or GNOME's `high-contrast`),
