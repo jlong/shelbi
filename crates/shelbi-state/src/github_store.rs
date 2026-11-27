@@ -9231,6 +9231,24 @@ mod tests {
             .is_ok());
     }
 
+    /// `---` rules at the top of a body and inside it are prose to the
+    /// metadata split, with or without a metadata block after them.
+    #[test]
+    fn a_body_of_rules_round_trips_through_the_meta_block() {
+        let prose = "---\n\n**Hold in review**\n\n---\n\nUmbrella.\n\n---\n\n## Subtasks";
+        let meta = ShelbiMeta {
+            priority: Some(2),
+            ..Default::default()
+        };
+        for meta in [meta, ShelbiMeta::default()] {
+            let body = build_body(prose, &meta);
+            assert!(body.starts_with(prose), "{body:?}");
+            let (back, parsed) = split_shelbi_meta(&body);
+            assert_eq!(back, prose);
+            assert_eq!(parsed.unwrap().priority, meta.priority);
+        }
+    }
+
     #[test]
     fn build_body_round_trips_through_split_shelbi_meta() {
         let meta = ShelbiMeta {

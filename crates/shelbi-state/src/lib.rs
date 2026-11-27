@@ -4799,6 +4799,46 @@ mod tests {
         assert_eq!(body, "hello body\n");
     }
 
+    /// A body that opens with `---` rules (or holds them) is body text: the
+    /// file's own fence ends the frontmatter, and the body round-trips byte for
+    /// byte through render and parse.
+    #[test]
+    fn a_body_of_rules_round_trips_through_the_task_file() {
+        let now = chrono::Utc::now();
+        let task = Issue {
+            id: "t".into(),
+            title: "T".into(),
+            column: Column::backlog(),
+            priority: 0,
+            assigned_to: None,
+            workflow: None,
+            branch: Some("feat/x".into()),
+            pr: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            launch: None,
+            created_at: now,
+            updated_at: now,
+            params: Default::default(),
+        };
+        for body in [
+            "---\n\n**Hold in review**\n\n---\n\nUmbrella.\n",
+            "---\nlooks: like yaml\n---\nmore\n",
+            "---\n",
+            "Prose.\n\n---\n\nMore prose.\n---\n",
+        ] {
+            let tf = IssueFile {
+                task: task.clone(),
+                body: body.to_string(),
+                tracker_assignees: Vec::new(),
+            };
+            let back = parse_task_file(&render_task_file(&tf).unwrap()).unwrap();
+            assert_eq!(back.body, body);
+            assert_eq!(back.task, task, "{body:?}");
+        }
+    }
+
     #[test]
     fn frontmatter_no_frontmatter_returns_none() {
         let s = "just a markdown file\n";
