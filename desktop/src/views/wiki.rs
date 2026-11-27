@@ -43,13 +43,12 @@
 //! form's Set up, [`WikiForm`]). The document itself shows read-only here;
 //! the in-place editor is `wiki-desktop-doc`'s.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
+    div, prelude::*, px, AnyElement, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter, Focusable,
     FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Subscription, Task, Window,
 };
 use gpui_kit::base::text::TextViewState;
@@ -82,6 +81,20 @@ pub const UNDO_FOR: Duration = Duration::from_secs(8);
 const ACTIVE_EVERY: Duration = Duration::from_secs(60);
 /// The context menu's width.
 const MENU_W: f32 = 220.0;
+
+/// The hub (and config store) a test's or the visual check's Wiki uses
+/// instead of the window's link, set as a global before the Wiki is built.
+/// Under `cfg(test)` without one, the Wiki asks no hub at all: asking a
+/// real one would start a daemon on demand.
+#[cfg(any(test, feature = "visual-check"))]
+#[derive(Clone)]
+pub struct WikiPorts {
+    pub ask: Ask,
+    pub store: Store,
+}
+
+#[cfg(any(test, feature = "visual-check"))]
+impl gpui::Global for WikiPorts {}
 
 /// What the Wiki asks of the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +175,6 @@ pub struct WikiView {
     store: Store,
     /// The project's machine is this one (Reveal in Finder needs it).
     local: bool,
-    project: String,
     tree: WikiTree,
     /// The hub's answer to the last Status: `None` before one lands.
     status: Option<Result<WikiStatus, String>>,
@@ -210,10 +222,21 @@ impl WikiView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        #[cfg(any(test, feature = "visual-check"))]
+        if let Some(ports) = cx.try_global::<WikiPorts>().cloned() {
+            let mut view = Self::with_ask(ports.ask, ports.store, true, window, cx);
+            view.tree.set_expanded(expanded);
+            view.open = open;
+            return view;
+        }
         let link = handle.link.clone();
-        let ask: Ask = Arc::new(move |req| shelbi_app::wiki::ask(&link, req));
+        let ask: Ask = if cfg!(test) {
+            Arc::new(|_| WikiReply::failed(shelbi_app::wiki::FailureKind::Failed, "no hub in a test"))
+        } else {
+            Arc::new(move |req| shelbi_app::wiki::ask(&link, req))
+        };
         let store: Store = Arc::new(handle.clone());
-        let mut view = Self::with_ask(ask, store, handle.key().name.clone(), !handle.link.is_remote(), window, cx);
+        let mut view = Self::with_ask(ask, store, !handle.link.is_remote(), window, cx);
         view.handle = Some(handle.clone());
         view.tree.set_expanded(expanded);
         view.open = open;
@@ -221,7 +244,7 @@ impl WikiView {
     }
 
     /// A Wiki that asks `ask` (a test's fake hub) and follows nothing.
-    pub fn with_ask(ask: Ask, store: Store, project: String, local: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn with_ask(ask: Ask, store: Store, local: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
         let subs = vec![cx.subscribe_in(&filter, window, |this, input, event: &InputEvent, window, cx| {
             match event {
@@ -243,7 +266,6 @@ impl WikiView {
             ask,
             store,
             local,
-            project,
             tree: WikiTree::new(),
             status: None,
             tree_error: None,
@@ -273,10 +295,12 @@ impl WikiView {
         &self.focus
     }
 
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn tree(&self) -> &WikiTree {
         &self.tree
     }
 
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn status(&self) -> Option<&Result<WikiStatus, String>> {
         self.status.as_ref()
     }
@@ -291,19 +315,23 @@ impl WikiView {
         self.tree.expanded().map(str::to_string).collect()
     }
 
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn menu(&self) -> Option<&Menu> {
         self.menu.as_ref()
     }
 
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn undo(&self) -> Option<&Undo> {
         self.undo.as_ref()
     }
 
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }
 
     /// The path a rename in place is open on.
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn renaming(&self) -> Option<&str> {
         self.rename.as_ref().map(|r| r.path.as_str())
     }
@@ -340,6 +368,7 @@ impl WikiView {
         self.live = None;
     }
 
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn is_shown(&self) -> bool {
         self.shown
     }
@@ -1783,7 +1812,7 @@ impl WikiView {
                     .border_color(theme.divider)
                     .type_style(Type::XSmall)
                     .child(div().size(px(8.0)).rounded_full().flex_none().bg(color))
-                    .child(div().debug_selector(|| "wiki-status".into()).min_w_0().truncate().text_color(theme.muted).child(line.text)),
+                    .child(div().debug_selector(|| "wiki-sync-status".into()).min_w_0().truncate().text_color(theme.muted).child(line.text)),
             )
             .into_any_element()
     }
@@ -1933,8 +1962,488 @@ impl Render for WikiView {
     }
 }
 
-/// The open folders kept as a set, for tests.
-#[allow(dead_code)]
-fn as_set(paths: Vec<String>) -> BTreeSet<String> {
-    paths.into_iter().collect()
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use shelbi_app::wiki::{SyncState, WikiNode};
+
+    use super::*;
+
+    /// A hub over a flat list of entries (`Plans/a.md`, `Plans`), answering
+    /// what the Wiki asks and recording it.
+    #[derive(Default)]
+    pub(crate) struct FakeHub {
+        pub status: Option<WikiStatus>,
+        /// path → (folder?, title, text).
+        pub entries: BTreeMap<String, (bool, String, String)>,
+        pub icons: BTreeMap<String, String>,
+        pub asked: Vec<WikiRequest>,
+        trashed: Vec<(String, Vec<(String, (bool, String, String))>)>,
+    }
+
+    impl FakeHub {
+        pub(crate) fn sample() -> FakeHub {
+            let mut hub = FakeHub {
+                status: Some(WikiStatus {
+                    set_up: true,
+                    state: SyncState::Synced,
+                    auto: true,
+                    source: "branch".into(),
+                    branch: "docs/planning".into(),
+                    root: "/tmp/wiki".into(),
+                    ..WikiStatus::not_set_up()
+                }),
+                ..FakeHub::default()
+            };
+            for folder in ["Plans", "Plans/Archive", "Research"] {
+                hub.entries.insert(folder.into(), (true, edit::name_of(folder).into(), String::new()));
+            }
+            for (path, title) in [
+                ("Plans/awareness-v2.md", "Awareness v2"),
+                ("Plans/opencode-integration.md", "OpenCode integration"),
+                ("Plans/Archive/old.md", "Old plan"),
+                ("README.md", "Read me"),
+            ] {
+                hub.entries.insert(path.into(), (false, title.into(), format!("# {title}\n\nBody of {path}.\n")));
+            }
+            hub.icons.insert("Research".into(), "🔬".into());
+            hub
+        }
+
+        fn nodes(&self, under: &str) -> Vec<WikiNode> {
+            let mut folders = Vec::new();
+            let mut docs = Vec::new();
+            for (path, (folder, title, _)) in &self.entries {
+                if edit::folder_of(path) != under {
+                    continue;
+                }
+                let node = WikiNode {
+                    path: path.clone(),
+                    name: edit::name_of(path).into(),
+                    title: title.clone(),
+                    kind: if *folder { NodeKind::Folder } else { NodeKind::Document },
+                    icon: self.icons.get(path).cloned(),
+                    children: if *folder { self.nodes(path) } else { Vec::new() },
+                };
+                if *folder { folders.push(node) } else { docs.push(node) }
+            }
+            folders.extend(docs);
+            folders
+        }
+
+        fn under(&self, path: &str) -> Vec<String> {
+            self.entries
+                .keys()
+                .filter(|p| *p == path || p.starts_with(&format!("{path}/")))
+                .cloned()
+                .collect()
+        }
+
+        fn answer(&mut self, req: WikiRequest) -> WikiReply {
+            self.asked.push(req.clone());
+            let Some(status) = self.status.clone() else {
+                return WikiReply::failed(shelbi_app::wiki::FailureKind::Failed, "hub down");
+            };
+            match req {
+                WikiRequest::Status | WikiRequest::Sync(_) | WikiRequest::Init => WikiReply::Status(status),
+                WikiRequest::Tree { .. } => WikiReply::Tree(self.nodes("")),
+                WikiRequest::Read { path, .. } => match self.entries.get(&path) {
+                    Some((false, _, text)) => WikiReply::Doc { path, content: text.clone() },
+                    _ => WikiReply::failed(shelbi_app::wiki::FailureKind::NotFound, path),
+                },
+                WikiRequest::New { path, .. } => {
+                    let folder = !path.ends_with(".md");
+                    let title = edit::name_of(&path).trim_end_matches(".md").to_string();
+                    self.entries.insert(path, (folder, title.clone(), format!("# {title}\n")));
+                    WikiReply::Done
+                }
+                WikiRequest::Move { from, to, .. } | WikiRequest::Copy { from, to, .. } => {
+                    if self.entries.contains_key(&to) {
+                        return WikiReply::failed(shelbi_app::wiki::FailureKind::Exists, to);
+                    }
+                    let copy = matches!(self.asked.last(), Some(WikiRequest::Copy { .. }));
+                    for p in self.under(&from) {
+                        let entry = if copy { self.entries[&p].clone() } else { self.entries.remove(&p).unwrap() };
+                        self.entries.insert(edit::moved(&p, &from, &to), entry);
+                    }
+                    WikiReply::Done
+                }
+                WikiRequest::Trash { path, .. } => {
+                    let gone: Vec<_> = self.under(&path).into_iter().map(|p| {
+                        let e = self.entries.remove(&p).unwrap();
+                        (p, e)
+                    }).collect();
+                    self.trashed.push((path, gone));
+                    WikiReply::Trashed { token: format!("t{}", self.trashed.len()) }
+                }
+                WikiRequest::Untrash { token, .. } => {
+                    let ix: usize = token[1..].parse().unwrap();
+                    for (p, e) in self.trashed[ix - 1].1.clone() {
+                        self.entries.insert(p, e);
+                    }
+                    WikiReply::Done
+                }
+                _ => WikiReply::Done,
+            }
+        }
+    }
+
+    pub(crate) fn ask_of(hub: &Arc<Mutex<FakeHub>>) -> Ask {
+        let hub = hub.clone();
+        Arc::new(move |req| hub.lock().unwrap().answer(req))
+    }
+
+    struct T {
+        cx: VisualTestContext,
+        view: Entity<WikiView>,
+        hub: Arc<Mutex<FakeHub>>,
+    }
+
+    impl T {
+        fn open(cx: &mut TestAppContext, hub: FakeHub) -> T {
+            super::super::about::tests::init(cx);
+            let hub = Arc::new(Mutex::new(hub));
+            let ask = ask_of(&hub);
+            let store = shelbi_app::settings::store::Disk::store("alpha");
+            let mut slot = None;
+            let window = cx.add_window(|window, cx| {
+                let view = cx.new(|cx| WikiView::with_ask(ask, store, true, window, cx));
+                slot = Some(view.clone());
+                Host(view)
+            });
+            let mut cx = VisualTestContext::from_window(window.into(), cx);
+            let view = slot.unwrap();
+            cx.update(|window, cx| view.update(cx, |v, cx| {
+                v.show(window, cx);
+                v.focus.focus(window, cx);
+            }));
+            cx.run_until_parked();
+            T { cx, view, hub }
+        }
+
+        fn read<R>(&mut self, f: impl FnOnce(&WikiView) -> R) -> R {
+            self.view.read_with(&self.cx, |v, _| f(v))
+        }
+
+        fn update<R>(&mut self, f: impl FnOnce(&mut WikiView, &mut Window, &mut Context<WikiView>) -> R) -> R {
+            let view = self.view.clone();
+            let r = self.cx.update(|window, cx| view.update(cx, |v, cx| f(v, window, cx)));
+            self.cx.run_until_parked();
+            r
+        }
+
+        fn keys(&mut self, keys: &str) {
+            self.cx.simulate_keystrokes(keys);
+            self.cx.run_until_parked();
+        }
+
+        fn titles(&mut self) -> Vec<String> {
+            self.read(|v| v.tree.rows().iter().map(|r| r.title.clone()).collect())
+        }
+
+        fn selected(&mut self) -> Option<String> {
+            self.read(|v| v.tree.selected_path().map(str::to_string))
+        }
+
+        fn asked(&self) -> Vec<WikiRequest> {
+            std::mem::take(&mut self.hub.lock().unwrap().asked)
+        }
+
+        fn drawn(&mut self, selector: &str) -> bool {
+            self.cx.run_until_parked();
+            self.cx.debug_bounds(Box::leak(selector.to_string().into_boxed_str())).is_some()
+        }
+
+        fn click(&mut self, selector: &str) {
+            let b = self.cx.debug_bounds(Box::leak(selector.to_string().into_boxed_str())).unwrap_or_else(|| panic!("{selector} isn't drawn"));
+            self.cx.simulate_click(b.center(), Modifiers::none());
+            self.cx.run_until_parked();
+        }
+    }
+
+    /// The tree beside the main area, as the window lays them out.
+    struct Host(Entity<WikiView>);
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let main = self.0.update(cx, |v, cx| v.render_main(cx));
+            div()
+                .flex()
+                .flex_row()
+                .size_full()
+                .child(div().w(px(280.0)).h_full().child(self.0.clone()))
+                .child(div().flex_1().h_full().child(main))
+        }
+    }
+
+    #[gpui::test]
+    fn the_tree_shows_titles_folders_first_with_its_first_level_open(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        assert_eq!(
+            t.titles(),
+            ["Plans", "Archive", "Awareness v2", "OpenCode integration", "Research", "Read me"]
+        );
+        assert!(t.drawn("wiki-row-Plans/awareness-v2.md"));
+        assert!(t.drawn("wiki-sync-status"));
+        // Archive is closed: its document isn't drawn.
+        assert!(!t.drawn("wiki-row-Plans/Archive/old.md"));
+        assert_eq!(t.read(|v| v.expanded()), ["Plans", "Research"]);
+    }
+
+    #[gpui::test]
+    fn arrows_walk_and_fold_the_tree_and_enter_opens_a_document(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        assert_eq!(t.selected().as_deref(), Some("Plans"));
+        t.keys("down right");
+        assert_eq!(t.selected().as_deref(), Some("Plans/Archive"));
+        assert!(t.drawn("wiki-row-Plans/Archive/old.md"));
+        t.keys("left");
+        assert!(!t.drawn("wiki-row-Plans/Archive/old.md"));
+        t.keys("left");
+        assert_eq!(t.selected().as_deref(), Some("Plans"));
+        t.keys("left");
+        assert_eq!(t.titles(), ["Plans", "Research", "Read me"]);
+        t.keys("down down enter");
+        assert_eq!(t.read(|v| v.open_path().map(str::to_string)).as_deref(), Some("README.md"));
+        assert!(t.drawn("wiki-breadcrumb"));
+        assert!(t.drawn("wiki-doc-body"));
+        // Enter on the open document renames it in place.
+        t.keys("enter");
+        assert_eq!(t.read(|v| v.renaming().map(str::to_string)).as_deref(), Some("README.md"));
+        assert!(t.drawn("wiki-rename"));
+    }
+
+    #[gpui::test]
+    fn a_click_opens_a_document_and_a_folder_opens_or_closes(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        t.click("wiki-row-Plans/opencode-integration.md");
+        assert_eq!(t.read(|v| v.open_path().map(str::to_string)).as_deref(), Some("Plans/opencode-integration.md"));
+        assert!(t.drawn("wiki-open-row"));
+        t.click("wiki-row-Plans");
+        assert_eq!(t.titles(), ["Plans", "Research", "Read me"]);
+    }
+
+    #[gpui::test]
+    fn f2_renames_in_place_keeping_the_extension_and_esc_cancels(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        t.update(|v, window, cx| {
+            v.tree.select_path("Plans/awareness-v2.md");
+            v.open_doc("Plans/awareness-v2.md", window, cx);
+        });
+        t.asked();
+        t.keys("f2");
+        let input = t.read(|v| v.rename_input()).expect("the rename field");
+        assert_eq!(input.read_with(&t.cx, |s, _| s.value().to_string()), "awareness-v2");
+        t.cx.simulate_input("awareness");
+        t.keys("enter");
+        let moved = t.asked().into_iter().find(|r| matches!(r, WikiRequest::Move { .. }));
+        assert_eq!(
+            moved,
+            Some(WikiRequest::Move { from: "Plans/awareness-v2.md".into(), to: "Plans/awareness.md".into(), by: Author::Person })
+        );
+        assert_eq!(t.selected().as_deref(), Some("Plans/awareness.md"));
+        assert_eq!(t.read(|v| v.open_path().map(str::to_string)).as_deref(), Some("Plans/awareness.md"));
+
+        t.keys("f2");
+        t.cx.simulate_input("x");
+        t.keys("escape");
+        assert_eq!(t.read(|v| v.renaming().map(str::to_string)), None);
+        assert!(t.asked().iter().all(|r| !matches!(r, WikiRequest::Move { .. })));
+    }
+
+    #[gpui::test]
+    fn cmd_n_makes_a_document_in_the_selected_folder_and_renames_it(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        t.update(|v, _, _| {
+            v.tree.select_path("Plans/opencode-integration.md");
+        });
+        t.asked();
+        t.keys(if cfg!(target_os = "macos") { "cmd-n" } else { "ctrl-n" });
+        let asked = t.asked();
+        assert!(asked.contains(&WikiRequest::New {
+            path: "Plans/Untitled.md".into(),
+            content: None,
+            title: None,
+            by: Author::Person
+        }));
+        assert_eq!(t.read(|v| v.renaming().map(str::to_string)).as_deref(), Some("Plans/Untitled.md"));
+        assert_eq!(t.read(|v| v.open_path().map(str::to_string)).as_deref(), Some("Plans/Untitled.md"));
+        // ⇧⌘N: a folder, ahead of the window's New Window.
+        t.keys("escape");
+        t.keys(if cfg!(target_os = "macos") { "cmd-shift-n" } else { "ctrl-shift-n" });
+        assert!(t.asked().iter().any(|r| matches!(r, WikiRequest::New { path, .. } if path == "Plans/New Folder")));
+    }
+
+    #[gpui::test]
+    fn delete_trashes_and_undo_puts_it_back(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        t.update(|v, window, cx| {
+            v.tree.select_path("Plans/awareness-v2.md");
+            v.open_doc("Plans/awareness-v2.md", window, cx);
+        });
+        t.keys("delete");
+        assert!(!t.titles().contains(&"Awareness v2".to_string()));
+        assert!(t.drawn("wiki-undo"));
+        assert_eq!(t.read(|v| v.open_path().map(str::to_string)), None, "the open document went with it");
+        t.click("wiki-undo-button");
+        assert!(t.titles().contains(&"Awareness v2".to_string()));
+        assert!(t.asked().iter().any(|r| matches!(r, WikiRequest::Untrash { token, .. } if token == "t1")));
+        assert!(!t.drawn("wiki-undo"));
+    }
+
+    #[gpui::test]
+    fn the_context_menu_lists_its_actions_and_moves_to_a_folder(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        let b = t.cx.debug_bounds("wiki-row-README.md").unwrap();
+        t.cx.simulate_event(gpui::MouseDownEvent {
+            position: b.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        t.cx.run_until_parked();
+        for action in MenuAction::ALL {
+            assert!(t.drawn(&format!("wiki-menu-{}", action.slug())), "{action:?}");
+        }
+        assert_eq!(t.selected().as_deref(), Some("README.md"));
+        t.click("wiki-menu-move-to");
+        assert!(t.drawn("wiki-move-Plans/Archive"));
+        assert!(!t.drawn("wiki-move-"), "it's at the top level already");
+        t.asked();
+        t.click("wiki-move-Research");
+        assert!(t.asked().contains(&WikiRequest::Move {
+            from: "README.md".into(),
+            to: "Research/README.md".into(),
+            by: Author::Person
+        }));
+        assert_eq!(t.selected().as_deref(), Some("Research/README.md"));
+        assert!(t.read(|v| v.menu().is_none()));
+
+        // On the empty space: the top level's New and Reveal only.
+        t.update(|v, window, cx| v.open_menu(None, gpui::point(px(10.0), px(400.0)), window, cx));
+        assert!(t.drawn("wiki-menu-new-document"));
+        assert!(!t.drawn("wiki-menu-delete"));
+        t.keys("escape");
+        assert!(t.read(|v| v.menu().is_none()));
+    }
+
+    #[gpui::test]
+    fn duplicate_copies_beside_and_copy_path_takes_the_wiki_path(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        t.update(|v, window, cx| {
+            v.open_menu(Some("Plans/awareness-v2.md".into()), gpui::point(px(10.0), px(10.0)), window, cx);
+            v.menu_action(MenuAction::Duplicate, window, cx);
+        });
+        assert!(t.asked().contains(&WikiRequest::Copy {
+            from: "Plans/awareness-v2.md".into(),
+            to: "Plans/awareness-v2 copy.md".into(),
+            by: Author::Person
+        }));
+        t.update(|v, window, cx| {
+            v.open_menu(Some("Plans/awareness-v2.md".into()), gpui::point(px(10.0), px(10.0)), window, cx);
+            v.menu_action(MenuAction::CopyPath, window, cx);
+        });
+        let copied = t.cx.update(|_, cx| cx.read_from_clipboard()).and_then(|c| c.text());
+        assert_eq!(copied.as_deref(), Some("Plans/awareness-v2.md"));
+    }
+
+    #[gpui::test]
+    fn a_drop_moves_into_a_folder_and_between_folders_reorders(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        t.update(|v, window, cx| v.drop_on("README.md", "Plans", DropAt::Into, window, cx));
+        assert!(t.asked().contains(&WikiRequest::Move {
+            from: "README.md".into(),
+            to: "Plans/README.md".into(),
+            by: Author::Person
+        }));
+        t.update(|v, window, cx| v.drop_on("Research", "Plans", DropAt::Before, window, cx));
+        let asked = t.asked();
+        assert!(asked.contains(&WikiRequest::Reorder {
+            folder: String::new(),
+            order: vec!["Research".into(), "Plans".into()],
+            by: Author::Person
+        }), "{asked:?}");
+        t.update(|v, window, cx| v.drop_on("Plans", "Plans/Archive", DropAt::Into, window, cx));
+        assert!(t.read(|v| v.notice().is_some()), "a folder can't go into itself");
+    }
+
+    #[test]
+    fn a_rows_edges_drop_before_and_after_and_its_middle_drops_in() {
+        let b = gpui::Bounds::new(gpui::point(px(0.0), px(100.0)), gpui::size(px(200.0), px(20.0)));
+        assert_eq!(drop_at(px(102.0), b, true), DropAt::Before);
+        assert_eq!(drop_at(px(110.0), b, true), DropAt::Into);
+        assert_eq!(drop_at(px(118.0), b, true), DropAt::After);
+        assert_eq!(drop_at(px(108.0), b, false), DropAt::Before);
+        assert_eq!(drop_at(px(112.0), b, false), DropAt::After);
+    }
+
+    #[gpui::test]
+    fn the_filter_narrows_the_rows_and_esc_clears_it(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        t.keys(if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-f" });
+        t.cx.simulate_input("old");
+        assert_eq!(t.titles(), ["Plans", "Archive", "Old plan"]);
+        t.keys("escape");
+        assert_eq!(t.read(|v| v.tree.filter().to_string()), "");
+        assert!(t.titles().len() > 3);
+    }
+
+    #[gpui::test]
+    fn a_pushed_change_reads_the_tree_and_the_open_document_again(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        t.update(|v, window, cx| v.open_doc("README.md", window, cx));
+        {
+            let mut hub = t.hub.lock().unwrap();
+            hub.entries.insert("Plans/new.md".into(), (false, "From an agent".into(), "# From an agent\n".into()));
+            hub.entries.get_mut("README.md").unwrap().2 = "# Read me\n\nChanged.\n".into();
+        }
+        t.asked();
+        t.update(|v, window, cx| {
+            v.woke(vec![WikiWake::Changed { paths: vec!["Plans/new.md".into(), "README.md".into()] }], window, cx)
+        });
+        assert!(t.titles().contains(&"From an agent".to_string()));
+        let asked = t.asked();
+        assert!(asked.iter().any(|r| matches!(r, WikiRequest::Read { path, .. } if path == "README.md")), "{asked:?}");
+        assert_eq!(t.read(|v| v.doc.clone()), Some(Ok("# Read me\n\nChanged.\n".to_string())));
+        // A status change reads the status (its last-synced time) again.
+        t.update(|v, window, cx| v.woke(vec![WikiWake::Status("syncing".into())], window, cx));
+        assert!(t.asked().contains(&WikiRequest::Status));
+    }
+
+    #[gpui::test]
+    fn a_folders_emoji_stands_in_for_its_drawing(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        let icon = t.read(|v| v.tree.node("Research").and_then(|n| n.icon.clone()));
+        assert_eq!(icon.as_deref(), Some("🔬"));
+        assert!(t.drawn("wiki-row-Research"));
+    }
+
+    #[gpui::test]
+    fn a_project_without_a_wiki_offers_both_sources(cx: &mut TestAppContext) {
+        let mut hub = FakeHub::sample();
+        hub.status = Some(WikiStatus::not_set_up());
+        let mut t = T::open(cx, hub);
+        assert!(t.drawn("wiki-setup"));
+        assert!(t.drawn("wiki-setup-branch"));
+        assert!(t.drawn("wiki-setup-folder"));
+        assert!(t.drawn("wiki-tree-empty"));
+        assert!(!t.drawn("wiki-new-document"), "nothing to add to yet");
+    }
+
+    #[test]
+    fn tree_keys_read_as_vs_codes() {
+        let mac = cfg!(target_os = "macos");
+        let _ = mac;
+        assert_eq!(TreeKey::of("down", false, false, false), Some(TreeKey::Down));
+        assert_eq!(TreeKey::of("f2", false, false, false), Some(TreeKey::Rename));
+        assert_eq!(TreeKey::of("backspace", true, false, false), Some(TreeKey::Delete));
+        assert_eq!(TreeKey::of("backspace", false, false, false), None, "a plain ⌫ is the filter's");
+        assert_eq!(TreeKey::of("n", true, true, false), Some(TreeKey::NewFolder));
+        assert_eq!(TreeKey::of("n", false, false, false), None);
+        assert_eq!(TreeKey::of("down", false, false, true), None);
+    }
 }
