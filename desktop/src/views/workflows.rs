@@ -70,6 +70,13 @@ const NAME_COL_W: f32 = 316.0;
 const IDENTITY_W: f32 = 280.0;
 const ID_W: f32 = 200.0;
 const CATEGORY_W: f32 = 200.0;
+/// "Used in"'s share when the table is short of room (it grows past it).
+const USED_IN_BASIS: f32 = 120.0;
+/// The least the name, id and category columns shrink to in a narrow
+/// table (a window tiled at half a screen); "Used in" has no least width.
+const NAME_COL_MIN: f32 = 160.0;
+const ID_MIN: f32 = 80.0;
+const CATEGORY_MIN: f32 = 120.0;
 /// A row's 24pt icon buttons (edit, ⋮, delete).
 pub(super) const ROW_BUTTON: f32 = 24.0;
 /// The status icon's frame.
@@ -553,6 +560,40 @@ pub(super) fn table(headings: Div, rows: Vec<AnyElement>, theme: &Theme) -> Div 
         .child(headings.type_style(Type::SmallMedium).text_color(theme.form_hint))
         .child(div().h(px(1.0)).bg(theme.divider_strong))
         .children(rows)
+}
+
+/// The least a [`name_and_columns`] row's name takes beside its columns.
+pub(crate) const NAME_BASIS: f32 = 200.0;
+
+/// A table row (or its headings) whose name takes what its fixed columns
+/// leave (Settings ▸ Agents, ▸ Workspaces): `name` grows from
+/// [`NAME_BASIS`], and `columns` sit together at its right. A table too
+/// narrow for both (a window tiled at half a screen) wraps the columns onto
+/// a line of their own under the name, where a column that can shrink
+/// (`min_w_0`) gives way before the group runs past the edge. The headings,
+/// laid out the same way, wrap at the same width, so they stay over their
+/// columns.
+pub(super) fn name_and_columns<E: Styled + ParentElement>(
+    row: E,
+    name: Div,
+    columns: impl IntoIterator<Item = AnyElement>,
+) -> E {
+    row.flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap_x(px(24.0))
+        .gap_y(px(12.0))
+        .child(name.flex_grow_1().flex_basis(px(NAME_BASIS)).min_w_0())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(24.0))
+                .min_w_0()
+                .children(columns),
+        )
 }
 
 /// A header's button: the Button component at Small with a left icon.
@@ -1047,10 +1088,10 @@ impl WorkflowsPage {
             .gap(px(12.0))
             .px(px(8.0))
             .py(px(6.0))
-            .child(div().w(px(NAME_COL_W)).flex_none().child("Name"))
-            .child(div().w(px(ID_W)).flex_none().child("ID"))
-            .child(div().w(px(CATEGORY_W)).flex_none().child("Category"))
-            .child(div().flex_1().min_w_0().child("Used in"))
+            .child(div().w(px(NAME_COL_W)).min_w(px(NAME_COL_MIN)).child("Name"))
+            .child(div().w(px(ID_W)).min_w(px(ID_MIN)).child("ID"))
+            .child(div().w(px(CATEGORY_W)).min_w(px(CATEGORY_MIN)).child("Category"))
+            .child(used_in_cell().truncate().child("Used in"))
             .child(div().w(px(ROW_BUTTON)).flex_none());
         let mut rows: Vec<AnyElement> = self
             .state
@@ -1164,10 +1205,8 @@ impl WorkflowsPage {
         let identity = div()
             .flex()
             .flex_row()
-            .flex_none()
             .items_center()
             .gap(px(8.0))
-            .w(px(IDENTITY_W))
             .child(status_icon_box(s.category, theme))
             .children(name_field);
         let blocked = self.state.delete_status_blocked(&id);
@@ -1202,12 +1241,11 @@ impl WorkflowsPage {
             .on_drop(cx.listener(move |this, drag: &StatusDrag, window, cx| {
                 this.drop_status(&drag.id, &onto, window, cx)
             }))
-            .child(handle)
-            .child(identity)
+            .child(name_cell(handle, identity))
             .child(
                 div()
                     .w(px(ID_W))
-                    .flex_none()
+                    .min_w(px(ID_MIN))
                     .truncate()
                     .font_family(PRIMARY_FAMILY)
                     .text_size(px(14.0))
@@ -1217,9 +1255,7 @@ impl WorkflowsPage {
             )
             .child(self.category_picker(Some(id.clone()), s.category, theme, cx))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
+                used_in_cell()
                     .truncate()
                     .type_style(Type::Small)
                     .text_color(theme.form_text)
@@ -1240,10 +1276,8 @@ impl WorkflowsPage {
         let identity = div()
             .flex()
             .flex_row()
-            .flex_none()
             .items_center()
             .gap(px(8.0))
-            .w(px(IDENTITY_W))
             .child(status_icon_box(s.category, theme))
             .child(
                 div()
@@ -1269,12 +1303,11 @@ impl WorkflowsPage {
             .items_center()
             .gap(px(12.0))
             .p(px(12.0))
-            .child(div().w(px(20.0)).flex_none())
-            .child(identity)
+            .child(name_cell(div().w(px(20.0)).flex_none(), identity))
             .child(
                 div()
                     .w(px(ID_W))
-                    .flex_none()
+                    .min_w(px(ID_MIN))
                     .truncate()
                     .font_family(PRIMARY_FAMILY)
                     .text_size(px(14.0))
@@ -1284,9 +1317,7 @@ impl WorkflowsPage {
             )
             .child(self.category_picker(Some(id.clone()), s.category, theme, cx))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
+                used_in_cell()
                     .truncate()
                     .type_style(Type::Small)
                     .text_color(theme.form_text)
@@ -1316,15 +1347,13 @@ impl WorkflowsPage {
             .items_center()
             .gap(px(12.0))
             .p(px(12.0))
-            .child(div().w(px(20.0)).flex_none())
-            .child(
+            .child(name_cell(
+                div().w(px(20.0)).flex_none(),
                 div()
                     .flex()
                     .flex_row()
-                    .flex_none()
                     .items_center()
                     .gap(px(8.0))
-                    .w(px(IDENTITY_W))
                     .child(status_icon_box(category, theme))
                     .child(div().flex_1().min_w_0().child(self.draft_field(
                         "status-new-name",
@@ -1333,12 +1362,12 @@ impl WorkflowsPage {
                         window,
                         cx,
                     ))),
-            )
+            ))
             .child(
                 div()
                     .debug_selector(|| "status-new-id".into())
                     .w(px(ID_W))
-                    .flex_none()
+                    .min_w(px(ID_MIN))
                     .truncate()
                     .font_family(PRIMARY_FAMILY)
                     .text_size(px(14.0))
@@ -1348,9 +1377,7 @@ impl WorkflowsPage {
             )
             .child(self.category_picker(None, category, theme, cx))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
+                used_in_cell()
                     .type_style(Type::Small)
                     .text_color(theme.form_hint)
                     .child("Enter to add, Esc to cancel."),
@@ -1371,7 +1398,7 @@ impl WorkflowsPage {
         let button = {
             let target = target.clone();
             style::button_base(format!("status-category-{key}"), ButtonKind::Secondary, ButtonSize::Base, false, theme)
-                .w(px(CATEGORY_W))
+                .w_full()
                 .child(div().flex_1().min_w_0().truncate().child(category_label(category)))
                 .child(style::dropdown_slot(ButtonSize::Base, theme.button_icon))
                 .when(open, |d| d.child(style::anchor_probe(&self.menu_anchor)))
@@ -1392,8 +1419,33 @@ impl WorkflowsPage {
             let menu = popup("status-category-menu", theme).children(items);
             self.place_menu(menu, false, cx)
         });
-        div().relative().flex_none().child(button).children(menu)
+        div()
+            .relative()
+            .w(px(CATEGORY_W))
+            .min_w(px(CATEGORY_MIN))
+            .child(button)
+            .children(menu)
     }
+}
+
+/// A status row's name column ([`NAME_COL_W`], down to [`NAME_COL_MIN`]):
+/// the drag handle (or the space it takes) and the icon and name.
+fn name_cell(lead: impl IntoElement, identity: Div) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .w(px(NAME_COL_W))
+        .min_w(px(NAME_COL_MIN))
+        .child(lead)
+        .child(identity.flex_1().min_w_0())
+}
+
+/// The status table's "Used in" column: the rest of the row, shrinking
+/// with the others in a narrow one and past their least widths.
+fn used_in_cell() -> Div {
+    div().flex_grow_1().flex_basis(px(USED_IN_BASIS)).min_w_0()
 }
 
 /// A count column's cell.

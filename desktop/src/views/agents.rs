@@ -44,7 +44,9 @@ use super::agents_state::{
     StatusChip, Target, AGENTS_HELPER, NOT_ASSIGNED, NO_SHARED, PREVIEW_LINES, SHARED_FOOTNOTE, SHARED_HELPER,
     SHARED_TITLE, UNSET_RUNNER,
 };
-use super::workflows::{header_button, popup, row_button, row_error, section_header, table, MENU_GAP};
+use super::workflows::{
+    header_button, name_and_columns, popup, row_button, row_error, section_header, table, MENU_GAP,
+};
 use crate::assets::icons;
 use crate::elements::controls;
 use crate::elements::placed::placed;
@@ -52,7 +54,8 @@ use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// The table's columns (`Agent Row`, 2397:7514): the runner, the workflow
-/// statuses, the skill count and the buttons; the agent takes the rest.
+/// statuses, the skill count and the buttons; the agent takes the rest, and
+/// a narrow table wraps the columns under it ([`name_and_columns`]).
 const RUNNER_W: f32 = 140.0;
 const STATUSES_W: f32 = 268.0;
 const SKILLS_W: f32 = 56.0;
@@ -346,17 +349,16 @@ impl AgentsPage {
     fn render_agents(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let new_agent = header_button("agents-new", icons::PLUS, "New agent", theme)
             .on_click(cx.listener(|this, _, window, cx| this.open_draft(None, String::new(), window, cx)));
-        let headings = div()
-            .flex()
-            .flex_row()
-            .gap(px(24.0))
-            .px(px(12.0))
-            .py(px(6.0))
-            .child(div().flex_1().min_w_0().child("Agent"))
-            .child(div().w(px(RUNNER_W)).flex_none().child("Preferred runner"))
-            .child(div().w(px(STATUSES_W)).flex_none().child("Workflow statuses"))
-            .child(div().w(px(SKILLS_W)).flex_none().child("Skills"))
-            .child(div().w(px(ACTIONS_W)).flex_none());
+        let headings = name_and_columns(
+            div().px(px(12.0)).py(px(6.0)),
+            div().child("Agent"),
+            [
+                div().w(px(RUNNER_W)).flex_none().child("Preferred runner").into_any_element(),
+                div().w(px(STATUSES_W)).min_w_0().child("Workflow statuses").into_any_element(),
+                div().w(px(SKILLS_W)).flex_none().child("Skills").into_any_element(),
+                div().w(px(ACTIONS_W)).flex_none().into_any_element(),
+            ],
+        );
         let mut rows: Vec<AnyElement> = self
             .state
             .agents()
@@ -458,7 +460,7 @@ impl AgentsPage {
             .flex()
             .flex_row()
             .flex_wrap()
-            .flex_none()
+            .min_w_0()
             .items_center()
             .gap_x(px(12.0))
             .gap_y(px(4.0))
@@ -474,20 +476,15 @@ impl AgentsPage {
         let row = div()
             .id(row_id)
             .debug_selector(move || selector.to_string())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(24.0))
             .px(px(12.0))
             .py(px(16.0))
             .cursor_pointer()
-            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.emit(AgentsEvent::Edit(open.clone()))))
-            .child(
-                div()
+            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.emit(AgentsEvent::Edit(open.clone()))));
+        let row = name_and_columns(
+            row,
+            div()
                     .flex()
                     .flex_col()
-                    .flex_1()
-                    .min_w_0()
                     .gap(px(2.0))
                     .child(
                         div()
@@ -507,18 +504,16 @@ impl AgentsPage {
                     .children(a.description.clone().map(|d| {
                         div().type_style(Type::Small).text_color(theme.form_hint).child(d)
                     })),
-            )
-            .child(runner)
-            .child(statuses)
-            .child(
+            [
+                runner.into_any_element(),
+                statuses.into_any_element(),
                 div()
                     .w(px(SKILLS_W))
                     .flex_none()
                     .type_style(Type::Base)
                     .text_color(theme.form_hint)
-                    .child(a.skills.to_string()),
-            )
-            .child(
+                    .child(a.skills.to_string())
+                    .into_any_element(),
                 div()
                     .relative()
                     .flex()
@@ -529,8 +524,10 @@ impl AgentsPage {
                     .w(px(ACTIONS_W))
                     .child(edit)
                     .child(more)
-                    .children(menu),
-            );
+                    .children(menu)
+                    .into_any_element(),
+            ],
+        );
         let confirm = self
             .state
             .confirm

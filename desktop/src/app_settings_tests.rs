@@ -20,6 +20,7 @@ use shelbi_app::view::ReviewState;
 
 use super::smoke::Harness;
 use super::*;
+use crate::views::workflows::NAME_BASIS;
 use crate::elements::controls::Slider;
 use crate::views::column_swap::SLIDE;
 use crate::views::sidebar_reveal::REVEAL;
@@ -5088,4 +5089,79 @@ fn the_agent_editors_titlebar_moves_the_window_from_its_empty_space(cx: &mut Tes
     let _home = crate::views::agents_state::tests::home_for("ad-drag", "alpha");
     let mut s = Settings::open_agent(cx, "developer");
     assert_titlebar_drags(&mut s, "agent-editor");
+}
+
+// ---- A narrow window (`desktop-views-break-in-a-narrow-window`) -------------
+
+/// A window tiled at half a 1920pt screen, as Hyprland tiles a second one.
+const HALF_SCREEN: f32 = 940.0;
+
+impl Settings {
+    fn narrow(&mut self) {
+        self.h.cx.simulate_resize(gpui::size(px(HALF_SCREEN), px(1000.0)));
+        self.settle();
+    }
+
+    /// `inner` lies inside `outer` across.
+    fn assert_across(&mut self, inner: &'static str, outer: &'static str) {
+        let (i, o) = (self.bounds(inner).expect(inner), self.bounds(outer).expect(outer));
+        assert!(i.left() >= o.left() && i.right() <= o.right(), "{inner} {i:?} inside {outer} {o:?}");
+    }
+}
+
+#[gpui::test]
+fn the_agents_table_wraps_its_columns_under_the_name_in_a_narrow_window(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("narrow-agents", "alpha");
+    let mut s = Settings::open_agents(cx);
+    s.narrow();
+    let row = s.bounds("agent-row-developer").unwrap();
+    // One letter a line ran the row 880pt tall: the name, its description,
+    // then the columns under them.
+    assert!(row.size.height < px(160.0), "the row reads across: {row:?}");
+    s.assert_across("agent-row-developer", "agents-table");
+    s.assert_across("agent-edit-developer", "agents-table");
+    s.assert_across("agent-status-developer-in-progress", "agents-table");
+    let badge = s.bounds("agent-customized-orchestrator").unwrap();
+    let status = s.bounds("agent-status-orchestrator-backlog").unwrap();
+    assert!(status.top() > badge.bottom(), "the columns wrap under the name");
+}
+
+#[gpui::test]
+fn the_workspaces_table_wraps_its_columns_under_the_name_in_a_narrow_window(cx: &mut TestAppContext) {
+    let _home = Home::with_project("narrow-ws", "alpha");
+    write_pool("alpha", SMALL_POOL);
+    let mut s = Settings::open_workspaces(cx);
+    s.narrow();
+    let row = s.bounds("workspace-row-alpha").unwrap();
+    assert!(row.size.height < px(160.0), "the row reads across: {row:?}");
+    let name = s.bounds("workspace-name-alpha").unwrap();
+    assert!(name.size.width >= px(NAME_BASIS), "the name keeps its room: {name:?}");
+    s.assert_across("workspace-row-alpha", "workspaces-table");
+    s.assert_across("workspace-tags-alpha", "workspaces-table");
+    s.assert_across("workspace-slot-alpha", "workspaces-table");
+}
+
+#[gpui::test]
+fn the_statuses_table_fits_a_narrow_window(cx: &mut TestAppContext) {
+    let _home = Home::with_project("narrow-statuses", "alpha");
+    let mut s = Settings::open_workflows(cx);
+    s.narrow();
+    for selector in ["status-row-todo", "status-category-todo", "status-delete-todo", "status-name-todo"] {
+        s.assert_across(selector, "statuses-table");
+    }
+    let category = s.bounds("status-category-todo").unwrap();
+    assert!(category.size.width >= px(120.0), "the picker keeps its label: {category:?}");
+    let name = s.bounds("status-name-todo").unwrap();
+    assert!(name.size.width >= px(100.0), "the name field keeps its room: {name:?}");
+}
+
+#[gpui::test]
+fn the_keybindings_fit_a_narrow_window(cx: &mut TestAppContext) {
+    let mut s = Settings::open_keybindings(cx);
+    s.narrow();
+    s.assert_across("keybindings-group-global", "keybindings-list");
+    s.assert_across("keybinding-sidebar-nav_up", "keybindings-list");
+    s.assert_across("keybinding-sidebar-nav_up-key-0", "keybindings-list");
+    let window = s.bounds("keybindings").unwrap();
+    assert!(window.right() <= px(HALF_SCREEN), "the page is inside the window: {window:?}");
 }

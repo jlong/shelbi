@@ -42,6 +42,7 @@ own:
 | `dl-input` | Ctrl+Shift app chords, the Wayland clipboard, file and image drops, the menu bar's commands in the palette | [`../README.md`](../README.md#keys-clipboard-and-drops-on-linux) |
 | `dl-packaging` | The Linux release archive and the AUR packages `shelbi-bin` and `shelbi-desktop-bin` | [`../README.md`](../README.md#on-linux-1), `packaging/aur/README.md` |
 | `dl-parity` | The parity walk on a packaged install on Omarchy, and what it fixed and filed | [`status/dl-parity.md`](status/dl-parity.md), the Omarchy columns in [`parity.md`](parity.md) |
+| `narrow-window` | The onboarding and the Settings tables lay out at half a screen (940pt): columns at most their width, Agents and Workspaces wrap their columns under the name, the Statuses and Keybindings columns shrink | [`status/narrow-window.md`](status/narrow-window.md) |
 
 ## Status docs by phase
 
