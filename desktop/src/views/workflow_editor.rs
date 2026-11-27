@@ -1756,7 +1756,7 @@ impl WorkflowEditor {
                     .map(|s| {
                         let id = s.id.clone();
                         style::menu_row(format!("workflow-initial-status-{id}"), initial.as_ref().is_some_and(|i| i.id == id), &theme)
-                            .child(status_icon(s.category, &theme))
+                            .child(style::status_icon(s.category, &theme))
                             .child(s.name.clone())
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                 this.change(Change::InitialStatus(id.clone()), window, cx)
@@ -1839,7 +1839,7 @@ impl WorkflowEditor {
                         .map(|s| {
                             let id = s.id.clone();
                             style::menu_row(format!("workflow-add-status-{id}"), false, &theme)
-                                .child(status_icon(s.category, &theme))
+                                .child(style::status_icon(s.category, &theme))
                                 .child(s.name.clone())
                                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                     this.change(Change::AddStatus(id.clone()), window, cx)
@@ -2119,7 +2119,7 @@ impl WorkflowEditor {
                             let id = s.id.clone();
                             let make = make.clone();
                             style::menu_row(format!("workflow-transition-{which}-{index}-{id}"), s.id == current, &theme)
-                                .child(status_icon(s.category, &theme))
+                                .child(style::status_icon(s.category, &theme))
                                 .child(s.name.clone())
                                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                     let change = match make {

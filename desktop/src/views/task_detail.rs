@@ -951,7 +951,7 @@ fn picker_rows(
                 )),
             };
             let glyph = match &row {
-                PropertyRow::Status(c) => Some(style::status_icon_large(c.category, &theme)),
+                PropertyRow::Status(c) => Some(style::status_icon(c.category, &theme)),
                 _ => None,
             };
             let check = row
