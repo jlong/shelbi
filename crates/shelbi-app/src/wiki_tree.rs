@@ -329,6 +329,7 @@ pub(crate) mod tests {
             name: path.rsplit('/').next().unwrap().into(),
             title: title.into(),
             kind: NodeKind::Document,
+            icon: None,
             children: Vec::new(),
         }
     }
@@ -340,6 +341,7 @@ pub(crate) mod tests {
             title: name.clone(),
             name,
             kind: NodeKind::Folder,
+            icon: None,
             children,
         }
     }

@@ -15,8 +15,9 @@ pub const NEW_DOCUMENT: &str = "Untitled";
 /// The name a new folder starts with.
 pub const NEW_FOLDER: &str = "New Folder";
 
-/// The folder `path` is in (`""` for the root's children).
-pub fn parent_of(path: &str) -> &str {
+/// The folder `path` is in, `""` for the top level (where
+/// [`crate::wiki_tree::parent_of`] answers `None`).
+pub fn folder_of(path: &str) -> &str {
     path.trim_matches('/').rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
@@ -26,14 +27,9 @@ pub fn name_of(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
 
-/// `name` inside `folder`.
-pub fn join(folder: &str, name: &str) -> String {
-    let folder = folder.trim_matches('/');
-    if folder.is_empty() {
-        name.to_string()
-    } else {
-        format!("{folder}/{name}")
-    }
+/// `name` inside `folder` (`""` the root).
+fn join(folder: &str, name: &str) -> String {
+    crate::wiki_tree::join(folder.trim_matches('/'), name)
 }
 
 /// The nodes directly in `folder` (the root's when `""`), or `None` when no
@@ -60,17 +56,6 @@ pub fn find<'a>(nodes: &'a [WikiNode], path: &str) -> Option<&'a WikiNode> {
     None
 }
 
-/// The folder a new document or folder goes in when `selected` is the
-/// selected row: the folder itself, a document's folder, the root with
-/// nothing selected.
-pub fn new_parent(nodes: &[WikiNode], selected: Option<&str>) -> String {
-    match selected.and_then(|p| find(nodes, p)) {
-        Some(node) if node.kind == NodeKind::Folder => node.path.clone(),
-        Some(node) => parent_of(&node.path).to_string(),
-        None => String::new(),
-    }
-}
-
 /// A free path for a new document (`Untitled.md`, `Untitled 2.md`, …) or
 /// folder (`New Folder`, `New Folder 2`, …) in `folder`, given what `nodes`
 /// has there. Names compare case-insensitively, as macOS's file system does.
@@ -86,7 +71,7 @@ pub fn new_path(nodes: &[WikiNode], folder: &str, kind: NodeKind) -> String {
 /// A free path for a copy of `path` beside it: `plan copy.md`, then
 /// `plan copy 2.md`, … (a folder's `Plans copy`, …), as Finder names one.
 pub fn duplicate_path(nodes: &[WikiNode], path: &str) -> String {
-    let folder = parent_of(path);
+    let folder = folder_of(path);
     let taken = taken_names(nodes, folder);
     let (stem, ext) = split_ext(name_of(path));
     join(folder, &free_name(&taken, &format!("{stem} copy"), ext))
@@ -144,7 +129,7 @@ pub fn rename_target(node: &WikiNode, typed: &str) -> Result<Option<String>, Str
     if name == node.name {
         return Ok(None);
     }
-    Ok(Some(join(parent_of(&node.path), &name)))
+    Ok(Some(join(folder_of(&node.path), &name)))
 }
 
 /// Where a drop lands relative to the row under the pointer.
@@ -183,7 +168,7 @@ pub fn drop_plan(nodes: &[WikiNode], dragged: &str, target: &str, at: DropAt) ->
     let target_node = find(nodes, target).ok_or("Its destination is no longer in the wiki.")?;
     let folder = match (at, target_node.kind) {
         (DropAt::Into, NodeKind::Folder) => target_node.path.clone(),
-        _ => parent_of(&target_node.path).to_string(),
+        _ => folder_of(&target_node.path).to_string(),
     };
     if dragged_node.kind == NodeKind::Folder
         && (folder == dragged_node.path || folder.starts_with(&format!("{}/", dragged_node.path)))
@@ -192,7 +177,7 @@ pub fn drop_plan(nodes: &[WikiNode], dragged: &str, target: &str, at: DropAt) ->
     }
     let name = name_of(dragged).to_string();
     let mut plan = DropPlan::default();
-    if parent_of(dragged) != folder {
+    if folder_of(dragged) != folder {
         let taken = taken_names(nodes, &folder);
         if taken.contains(&name.to_lowercase()) {
             return Err(format!("“{name}” is already there."));
@@ -273,28 +258,7 @@ pub fn document_count(nodes: &[WikiNode]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn doc(path: &str, title: &str) -> WikiNode {
-        WikiNode {
-            path: path.into(),
-            name: name_of(path).into(),
-            title: title.into(),
-            kind: NodeKind::Document,
-            icon: None,
-            children: Vec::new(),
-        }
-    }
-
-    fn folder(path: &str, children: Vec<WikiNode>) -> WikiNode {
-        WikiNode {
-            path: path.into(),
-            name: name_of(path).into(),
-            title: name_of(path).into(),
-            kind: NodeKind::Folder,
-            icon: None,
-            children,
-        }
-    }
+    use crate::wiki_tree::tests::{doc, folder};
 
     fn wiki() -> Vec<WikiNode> {
         vec![
@@ -314,11 +278,9 @@ mod tests {
 
     #[test]
     fn paths_split_into_folder_and_name() {
-        assert_eq!(parent_of("Plans/Archive/old.md"), "Plans/Archive");
-        assert_eq!(parent_of("README.md"), "");
+        assert_eq!(folder_of("Plans/Archive/old.md"), "Plans/Archive");
+        assert_eq!(folder_of("README.md"), "");
         assert_eq!(name_of("Plans/Archive"), "Archive");
-        assert_eq!(join("", "a.md"), "a.md");
-        assert_eq!(join("Plans", "a.md"), "Plans/a.md");
         assert_eq!(find(&wiki(), "Plans/Archive/old.md").unwrap().title, "Old");
         assert!(find(&wiki(), "Plans/nope.md").is_none());
     }
@@ -326,9 +288,6 @@ mod tests {
     #[test]
     fn a_new_item_goes_in_the_selected_folder_under_a_free_name() {
         let w = wiki();
-        assert_eq!(new_parent(&w, Some("Plans")), "Plans");
-        assert_eq!(new_parent(&w, Some("Plans/awareness-v2.md")), "Plans");
-        assert_eq!(new_parent(&w, None), "");
         assert_eq!(new_path(&w, "Plans", NodeKind::Document), "Plans/Untitled 2.md");
         assert_eq!(new_path(&w, "Research", NodeKind::Document), "Research/Untitled.md");
         assert_eq!(new_path(&w, "", NodeKind::Folder), "New Folder");
