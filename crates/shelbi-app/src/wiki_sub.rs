@@ -21,8 +21,9 @@ use crate::changes::{ChangeSubscription, StreamEnd};
 /// A change to the project's wiki.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WikiWake {
-    /// Documents (and folders' files) changed: their wiki-relative paths.
-    Changed { paths: Vec<String> },
+    /// Documents (and folders' files) changed: their wiki-relative paths,
+    /// and who changed them (`local`, `agent` or `pull`).
+    Changed { paths: Vec<String>, source: String },
     /// The sync's status is now this word (`synced`, `syncing`, `pending`,
     /// `offline`, `conflict`, `error <detail>`).
     Status(String),
@@ -78,7 +79,7 @@ fn wake_for(line: &[u8], project: &str) -> Option<WikiWake> {
         return None;
     }
     match change {
-        ChangeNotification::Wiki { paths, .. } => Some(WikiWake::Changed { paths }),
+        ChangeNotification::Wiki { paths, source, .. } => Some(WikiWake::Changed { paths, source }),
         ChangeNotification::WikiStatus { status, .. } => Some(WikiWake::Status(status)),
         ChangeNotification::WikiOpen { path, .. } => Some(WikiWake::Open(path)),
         ChangeNotification::Board { .. } | ChangeNotification::Workspace { .. } | ChangeNotification::Layout { .. } => {
@@ -94,7 +95,7 @@ mod tests {
     #[test]
     fn only_this_projects_wiki_lines_wake() {
         let changed = br#"{"change":"wiki","project":"demo","paths":["Plans/a.md"],"source":"agent"}"#;
-        assert_eq!(wake_for(changed, "demo"), Some(WikiWake::Changed { paths: vec!["Plans/a.md".into()] }));
+        assert_eq!(wake_for(changed, "demo"), Some(WikiWake::Changed { paths: vec!["Plans/a.md".into()], source: "agent".into() }));
         let status = br#"{"change":"wiki-status","project":"demo","status":"syncing"}"#;
         assert_eq!(wake_for(status, "demo"), Some(WikiWake::Status("syncing".into())));
         let open = br#"{"change":"wiki-open","project":"demo","path":"README.md"}"#;

@@ -85,6 +85,9 @@ pub trait CommandHost {
     /// Show the Changelog scrolled to entry `id` (the palette's Changelog
     /// result).
     fn open_changelog_entry(&mut self, id: &str);
+    /// Show the Wiki with document `path` open (the palette's wiki search
+    /// results, a `wiki:` link in a task body).
+    fn open_wiki_doc(&mut self, path: &str);
 }
 
 /// Run a command. Every [`CommandKind`] variant has its own arm.
@@ -155,6 +158,7 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // a Changelog issue chip opens it), the Changelog at the entry.
         CommandKind::OpenIssue { id } => host.open_issue(id),
         CommandKind::OpenChangelogEntry { id } => host.open_changelog_entry(id),
+        CommandKind::OpenWikiDoc { path } => host.open_wiki_doc(path),
         // The board's issue mutations (dt-issues-board; drag and drop reuses
         // MoveIssue and adds PrioritizeIssue in dt-board-dnd).
         CommandKind::MoveIssue { .. }
@@ -205,6 +209,8 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         // Show what is already read.
         CommandKind::OpenIssue { .. } => false,
         CommandKind::OpenChangelogEntry { .. } => false,
+        // Reads the document; its edits are the Wiki's own saves.
+        CommandKind::OpenWikiDoc { .. } => false,
         // Only this client lets go.
         CommandKind::Detach => false,
         // Another window on a project already open.
@@ -376,6 +382,9 @@ mod tests {
         fn open_changelog_entry(&mut self, id: &str) {
             self.0.push(format!("open-changelog-entry:{id}"));
         }
+        fn open_wiki_doc(&mut self, path: &str) {
+            self.0.push(format!("open-wiki-doc:{path}"));
+        }
     }
 
     fn id_for(kind: CommandKind) -> String {
@@ -462,6 +471,7 @@ mod tests {
             ),
             (CommandKind::OpenIssue { id: s("1931") }, "open-issue:1931"),
             (CommandKind::OpenChangelogEntry { id: s("e1") }, "open-changelog-entry:e1"),
+            (CommandKind::OpenWikiDoc { path: s("Plans/a.md") }, "open-wiki-doc:Plans/a.md"),
             (
                 CommandKind::MoveIssue {
                     id: s("t1"),
@@ -558,6 +568,7 @@ mod tests {
                 "editor:edit:changelog-template",
                 "open-issue:1931",
                 "open-changelog-entry:e1",
+                "open-wiki-doc:Plans/a.md",
             ]
         );
     }

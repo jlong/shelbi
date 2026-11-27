@@ -350,6 +350,13 @@ pub struct WikiCommit {
     pub subject: String,
     /// The wiki-relative files it touched.
     pub paths: Vec<String>,
+    /// Who made its changes, when the hub that committed them said so and
+    /// it was one of the two (`None` for a commit made elsewhere, or by
+    /// both). Every commit is the hub's, in the user's git name, so this is
+    /// what tells an agent's edit from the user's. Absent from an older
+    /// hub's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<Author>,
 }
 
 /// A held file's sides, for [`WikiReply::Conflict`]. `None` is "deleted on

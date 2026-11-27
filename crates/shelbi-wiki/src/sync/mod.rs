@@ -32,6 +32,10 @@ use conflicts::{Conflict, ConflictStore};
 /// The remote every wiki syncs with.
 pub const REMOTE: &str = "origin";
 
+/// The commit trailer naming who made a commit's changes (`person`,
+/// `agent`), one line each.
+pub const BY_TRAILER: &str = "Shelbi-By";
+
 /// Why a sync step failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SyncError {
@@ -280,6 +284,14 @@ impl Engine {
     /// Stage the wiki's changes, except held files, and commit them with a
     /// generated message. `None` when there was nothing to commit.
     pub fn commit_pending(&mut self) -> Result<Option<Committed>, SyncError> {
+        self.commit_pending_by(&[])
+    }
+
+    /// [`Self::commit_pending`], saying who made the changes: a
+    /// [`BY_TRAILER`] line for each of `by` (`person`, `agent`), which
+    /// [`Engine::log`] reads back, so a client can say who last edited a
+    /// document (every commit is the hub's, in the user's name).
+    pub fn commit_pending_by(&mut self, by: &[&str]) -> Result<Option<Committed>, SyncError> {
         let scope = self.layout.scope().to_string();
         if self.layout.folder.is_some() && !self.layout.wiki_root().exists() && self.git.ok(&["ls-files", "--", &scope])?.trim().is_empty() {
             return Ok(None);
@@ -290,11 +302,11 @@ impl Engine {
         }
         let add: Vec<&str> = add.iter().map(String::as_str).collect();
         self.git.ok(&add)?;
-        self.commit_staged(None)
+        self.commit_staged(None, by)
     }
 
     /// Commit what is staged; `message` overrides the generated one.
-    fn commit_staged(&mut self, message: Option<&str>) -> Result<Option<Committed>, SyncError> {
+    fn commit_staged(&mut self, message: Option<&str>, by: &[&str]) -> Result<Option<Committed>, SyncError> {
         let staged = self.git.ok(&["diff", "--cached", "--name-status", "-z", "--no-renames"])?;
         let fields = split_z(&staged);
         let mut entries = Vec::new();
@@ -307,7 +319,14 @@ impl Engine {
             return Ok(None);
         }
         let message = message.map(str::to_string).unwrap_or_else(|| message::commit_message(&entries));
-        self.git.ok(&["commit", "-q", "--no-verify", "-m", &message])?;
+        let mut full = message.clone();
+        if !by.is_empty() {
+            full.push('\n');
+            for who in by {
+                full.push_str(&format!("\n{BY_TRAILER}: {who}"));
+            }
+        }
+        self.git.ok(&["commit", "-q", "--no-verify", "-m", &full])?;
         let paths = entries.iter().filter_map(|(_, p)| self.layout.wiki_path(p)).collect();
         Ok(Some(Committed { message, paths }))
     }
@@ -601,7 +620,7 @@ impl Engine {
         self.write_worktree(wiki_path, content)?;
         let repo_path = self.layout.repo_path(wiki_path);
         self.git.ok(&["add", "-A", "--", &format!(":(literal){repo_path}")])?;
-        let committed = self.commit_staged(Some("Resolve merge conflicts"))?;
+        let committed = self.commit_staged(Some("Resolve merge conflicts"), &[])?;
         self.conflicts.release(wiki_path).map_err(|e| io("releasing a conflict", e))?;
         Ok(committed)
     }

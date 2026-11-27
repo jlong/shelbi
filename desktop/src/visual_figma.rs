@@ -1396,7 +1396,10 @@ impl Run {
     /// ([`crate::views::wiki::fake::FakeHub`]): `wiki` with the tree pushed
     /// into the column and a plan open beside it; `wiki-menu` with a row's
     /// context menu; `wiki-rename` renaming a document in place;
-    /// `wiki-undo` after a delete; `wiki-setup` for a project with no wiki.
+    /// `wiki-undo` after a delete; `wiki-history` with the open document's
+    /// ⋯ ▸ Show History; `wiki-changed` with the changed-elsewhere bar over
+    /// an edited document; `wiki-palette` with the palette finding
+    /// documents; `wiki-setup` for a project with no wiki.
     /// `SHELBI_VISUAL_ONLY=wiki` renders just these.
     fn wiki(&mut self) {
         use crate::views::wiki::fake::{ask_of, FakeHub};
@@ -1407,6 +1410,24 @@ impl Run {
             hub.entries.insert("Plans/wiki.md".into(), (false, "Wiki".into(), "# Wiki\n".into()));
             hub.entries.insert("Research/implicit-state-machines.md".into(), (false, "Implicit state machines".into(), "# Implicit state machines\n".into()));
             hub.entries.get_mut("Plans/opencode-integration.md").unwrap().2 = "# OpenCode integration\n\n## Context\n\nOpenCode is a terminal coding agent. Shelbi runs it like Claude Code and Codex: in its own session, with the shared preamble and the project's skills.\n\n## Goals\n\n- [x] Launch OpenCode from a workspace\n- [ ] Awareness events from its plugin\n- [ ] Usage-limit detection\n\n## Decisions\n\n1. The config layer lives in `.shelbi/opencode/`.\n2. Models come from the user's own OpenCode config.\n".into();
+            let ago = |mins: i64| (chrono::Utc::now() - chrono::Duration::minutes(mins)).to_rfc3339();
+            let commit = |by, author: &str, mins, subject: &str, sha: &str| shelbi_app::wiki::WikiCommit {
+                sha: sha.into(),
+                author: author.into(),
+                date: ago(mins),
+                subject: subject.into(),
+                paths: vec!["Plans/opencode-integration.md".into()],
+                by,
+            };
+            use shelbi_app::wiki::Author;
+            hub.commits.insert(
+                "Plans/opencode-integration.md".into(),
+                vec![
+                    commit(Some(Author::Agent), "John Long", 2, "Update opencode-integration.md", "3f9c2e1a"),
+                    commit(Some(Author::Person), "John Long", 95, "Update opencode-integration.md; Add wiki.md", "a41b7d09"),
+                    commit(None, "Jane Doe", 60 * 26, "Add opencode-integration.md", "0d2e88c4"),
+                ],
+            );
             if !set_up {
                 hub.status = Some(shelbi_app::wiki::WikiStatus::not_set_up());
             }
@@ -1473,6 +1494,68 @@ impl Run {
             .unwrap();
         self.settle(handle);
         self.save(handle, "wiki-undo");
+
+        // The document's ⋯ ▸ Show History.
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/opencode-integration.md", window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.open_doc_menu(gpui::point(px(1180.0), px(80.0)), cx);
+                    v.doc_action(crate::views::wiki::doc::DocAction::ShowHistory, window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-history");
+
+        // Edited here while an agent rewrote it: the changed-elsewhere bar.
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| v.reveal("Plans/opencode-integration.md", window, cx))
+            })
+            .unwrap();
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| v.edit_for_visual("\nA note of mine.", window, cx));
+            })
+            .unwrap();
+        self.settle(handle);
+        h.lock().unwrap().entries.get_mut("Plans/opencode-integration.md").unwrap().2 =
+            "# OpenCode integration\n\n## Context\n\nRewritten by an agent.\n".into();
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                let wake = shelbi_app::wiki_sub::WikiWake::Changed {
+                    paths: vec!["Plans/opencode-integration.md".into()],
+                    source: "agent".into(),
+                };
+                wiki.update(cx, |v, cx| v.woke(vec![wake], window, cx));
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-changed");
+
+        // The palette finds documents by title and text.
+        let (handle, _, _) = open_wiki(self, &h);
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_overlay(None, window, cx))
+            .unwrap();
+        self.settle(handle);
+        self.cx.simulate_keystrokes(handle.into(), "o p e n c o d e");
+        for _ in 0..4 {
+            self.settle(handle);
+        }
+        self.save(handle, "wiki-palette");
 
         let (handle, _, _) = open_wiki(self, &hub(false));
         self.settle(handle);

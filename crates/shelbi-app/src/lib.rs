@@ -127,6 +127,7 @@ pub mod toast;
 pub mod tracker_connect;
 pub mod view;
 pub mod wiki;
+pub mod wiki_doc;
 pub mod wiki_sub;
 pub mod wiki_tree;
 pub mod wiki_tree_edit;

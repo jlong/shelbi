@@ -223,6 +223,9 @@ struct Sched {
     stop: bool,
     /// When the oldest uncommitted change was made.
     dirty_at: Option<Instant>,
+    /// Who made the uncommitted changes (`person`, `agent`), for the next
+    /// commit's [`crate::sync::BY_TRAILER`] lines.
+    by: std::collections::BTreeSet<&'static str>,
     /// When the watcher last fired, while its events wait to be read.
     watched_at: Option<Instant>,
     last_rescan: Instant,
@@ -263,6 +266,7 @@ impl WikiService {
             sched: Mutex::new(Sched {
                 stop: false,
                 dirty_at: None,
+                by: Default::default(),
                 watched_at: None,
                 last_rescan: Instant::now(),
                 sync_requested: setup == Setup::Created,
@@ -686,6 +690,10 @@ impl Shared {
         }
         if source != ChangeSource::Pull {
             let mut s = lock(&self.sched);
+            s.by.insert(match source {
+                ChangeSource::Agent => "agent",
+                _ => "person",
+            });
             if s.dirty_at.is_none() {
                 s.dirty_at = Some(Instant::now());
             }
@@ -696,6 +704,12 @@ impl Shared {
             self.wake.notify_all();
         }
         self.sink.changed(&changed, source);
+    }
+
+    /// Who made the changes waiting to be committed, forgotten as the
+    /// commit takes them.
+    fn take_by(&self) -> Vec<&'static str> {
+        std::mem::take(&mut lock(&self.sched).by).into_iter().collect()
     }
 
     fn set_status(&self, status: SyncStatus) {
@@ -744,7 +758,8 @@ impl Shared {
     fn cycle_steps(&self) -> Result<(), SyncError> {
         let remote = {
             let mut engine = lock(&self.engine);
-            engine.commit_pending()?;
+            let by = self.take_by();
+            engine.commit_pending_by(&by)?;
             engine.remote()
         };
         let mut pushed = Pushed::Nothing;
@@ -844,7 +859,9 @@ fn run(shared: &Shared) {
     // Stopping: commit what's pending so nothing waits on a hub that's gone.
     // The push is the next start's.
     if shared.auto {
-        let _ = lock(&shared.engine).commit_pending();
+        let mut engine = lock(&shared.engine);
+        let by = shared.take_by();
+        let _ = engine.commit_pending_by(&by);
     }
 }
 

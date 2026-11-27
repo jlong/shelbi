@@ -538,7 +538,8 @@ impl DocEditor {
         let src = p.layout.hit(self.model.doc(), rel);
         if crate::keys::link_mod(&e.modifiers) {
             if let Some(url) = self.model.link_at(src) {
-                cx.open_url(&url);
+                // A `wiki:` link opens the document in the Wiki.
+                crate::links::open(&url, window, cx);
                 return;
             }
         }
