@@ -221,9 +221,20 @@ impl WikiTree {
     }
 
     /// Filter the rows. The selection moves to the first row that shows
-    /// when it's filtered out.
+    /// when it's filtered out; clearing the filter keeps it where it was.
     pub fn set_filter(&mut self, filter: impl Into<String>) {
         self.filter = filter.into();
+        // A row the filter showed stays shown when it's cleared: its folders
+        // open, as the filter had them.
+        if self.filter.trim().is_empty() {
+            if let Some(path) = self.selected.clone() {
+                if self.node(&path).is_some() {
+                    for folder in ancestors(&path) {
+                        self.expanded.insert(folder.to_string());
+                    }
+                }
+            }
+        }
         if self.selected_index().is_none() {
             self.select_index(0);
         }
@@ -448,6 +459,12 @@ pub(crate) mod tests {
         assert_eq!(t.selected_path(), Some("Research"));
         t.set_filter("");
         assert_eq!(titles(&t), ["Plans", "Research", "Shelbi docs"]);
+        // A match selected while filtering stays selected, its folders open.
+        t.set_filter("old");
+        t.select_path("Plans/Archive/old.md");
+        t.set_filter("");
+        assert_eq!(t.selected_path(), Some("Plans/Archive/old.md"));
+        assert!(t.is_expanded("Plans") && t.is_expanded("Plans/Archive"));
     }
 
     #[test]
