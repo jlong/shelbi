@@ -10,7 +10,7 @@ description = "Wiki storage for Shelbi: ContextStore's on-disk format (settings,
 
 # Copied from ContextStore's Rust core (32pixelsCo/ContextStore, branch
 # `rewrite/rust-core`), MIT in Shelbi. Synchronous on purpose: no tokio, no
-# git2 (the sync slice drives the git CLI).
+# git2: the sync drives the user's git CLI.
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +29,8 @@ diff-match-patch-rs = "0.5"
 trash = "5"
 # Atomic writes go through a same-directory temp file.
 tempfile = "3"
+# The hub's wiki service watches the worktree for edits made outside it.
+notify = "8"
 
 [dev-dependencies]
 static_assertions = "1.1"

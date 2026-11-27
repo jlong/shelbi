@@ -200,6 +200,12 @@ pub struct Project {
     /// `shelbi config lint` report it. See [`crate::releases`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub releases: Option<crate::releases::ReleasesConfig>,
+    /// Where the project's wiki lives and whether the hub syncs it on its
+    /// own. `None` (every existing project's) means no wiki until one is
+    /// asked for, which then gets the default `branch` mode. See
+    /// [`crate::wiki`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiki: Option<crate::wiki::WikiConfig>,
 
     // --- user-local -------------------------------------------------------
     pub repo: String,
@@ -273,6 +279,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "runners",
     "agents",
     "releases",
+    "wiki",
 ];
 
 /// YAML keys that belong in the *user-local* half of a split project
@@ -4569,6 +4576,7 @@ workspace_settings_template: /etc/shelbi/p.json
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
         };
         assert!(project.validate_workspaces().is_ok());
 
@@ -4669,6 +4677,7 @@ workspaces:
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
         }
     }
 
@@ -4974,6 +4983,7 @@ workspaces:
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
         }
     }
 
@@ -6447,6 +6457,7 @@ git:
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
         }
     }
 

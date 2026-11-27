@@ -381,6 +381,9 @@ fn serve_foreground(lock_wait: Duration) -> Result<()> {
     // The per-project workspace-poller manager: one poller per open project.
     // Phase 3, `rt-daemon-poller`.
     super::poller::spawn_poller_manager(stop.clone());
+    // The per-project wiki manager: each open project's wiki service (its
+    // single writer, watcher and sync clock).
+    super::wiki::spawn_wiki_manager(stop.clone());
     // Exit when no project is open (the on-demand lifecycle: nothing to serve,
     // and the next open restarts us). A short minimum-lifetime debounce keeps a
     // just-started daemon alive long enough for the opener to record its open
@@ -418,6 +421,8 @@ fn serve_foreground(lock_wait: Duration) -> Result<()> {
 
     // Only now: until here the control socket told late clients to retry.
     control_close.store(true, Ordering::SeqCst);
+    // Each wiki service commits what's pending before the daemon goes.
+    shelbi_orchestrator::wiki::stop_all();
     let _ = fs::remove_file(&control_sock);
     let _ = fs::remove_file(&sock);
     // Best-effort: drop the PID file so the next start's cleanup
