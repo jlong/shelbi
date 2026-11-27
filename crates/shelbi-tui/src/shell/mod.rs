@@ -2501,7 +2501,8 @@ impl ShellState {
         let mut woke = Vec::new();
         if let Some(w) = self.workers.as_ref() {
             while let Ok(wake) = w.change_rx.try_recv() {
-                changed = true;
+                // A wiki change refreshes the Wiki, not the board.
+                changed |= !wake.is_wiki();
                 if let shelbi_app::changes::ChangeWake::Workspace(ws) = wake {
                     woke.push(ws);
                 }
@@ -4834,6 +4835,7 @@ impl ShellState {
         match v {
             View::Issues
             | View::Changelog
+            | View::Wiki
             | View::Activity
             | View::Machines
             | View::Jobs
@@ -7163,6 +7165,7 @@ fn view_to_row_target(view: &View) -> RowTarget {
     match view {
         View::Issues
         | View::Changelog
+        | View::Wiki
         | View::Activity
         | View::Machines
         | View::Jobs

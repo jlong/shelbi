@@ -666,6 +666,7 @@ pub fn nav_icon(view: &View) -> Icon {
         View::Session(_) => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
         View::Issues => icons::RECTANGLE_STACK,
         View::Changelog => icons::ROCKET_LAUNCH,
+        View::Wiki => icons::BOOK_OPEN,
         // Palette-only now (no sidebar row): the bolt the Figma Activity
         // frame draws, beside the Changelog's rocket there.
         View::Activity => icons::BOLT,

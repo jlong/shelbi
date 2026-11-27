@@ -456,6 +456,7 @@ fn view_description(view: &View) -> Option<&'static str> {
         }
         View::Issues => Some("Queue up and manage work for Shelbi"),
         View::Changelog => Some("See what has shipped"),
+        View::Wiki => Some("Read and write the project's docs"),
         View::Activity => Some("See what's happened recently"),
         View::Machines => Some("See the machines running your agents"),
         View::Jobs => Some("See the jobs Shelbi is watching"),
@@ -473,6 +474,7 @@ fn view_hidden_until_query(view: &View) -> bool {
         View::Reminders => true,
         View::Issues
         | View::Changelog
+        | View::Wiki
         | View::Activity
         | View::Machines
         | View::Jobs

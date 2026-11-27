@@ -37,6 +37,20 @@ pub enum ChangeWake {
     /// ([`crate::source::remote::subscribe_changes`]); this machine's own
     /// reload reaches the app through its relaunch watch instead.
     Reload { reason: String },
+    /// Documents of the project's wiki changed (wiki-relative `paths`): a
+    /// client showing the Wiki reads its tree and open document again. Not a
+    /// board change.
+    Wiki { paths: Vec<String> },
+    /// The project's wiki sync status is now `status` (`synced`, `syncing`,
+    /// `pending`, `offline`, `conflict`, `error <detail>`).
+    WikiStatus { status: String },
+}
+
+impl ChangeWake {
+    /// A wiki wake: it refreshes the Wiki, not the board.
+    pub fn is_wiki(&self) -> bool {
+        matches!(self, ChangeWake::Wiki { .. } | ChangeWake::WikiStatus { .. })
+    }
 }
 
 /// How long a connect attempt / idle read waits before re-checking the stop flag,
@@ -247,6 +261,8 @@ fn wake_for(line: &[u8], project: &str) -> Option<ChangeWake> {
     match change {
         ChangeNotification::Board { .. } => Some(ChangeWake::Board),
         ChangeNotification::Workspace { workspace, .. } => Some(ChangeWake::Workspace(workspace)),
+        ChangeNotification::Wiki { paths, .. } => Some(ChangeWake::Wiki { paths }),
+        ChangeNotification::WikiStatus { status, .. } => Some(ChangeWake::WikiStatus { status }),
         _ => None,
     }
 }
@@ -257,7 +273,8 @@ fn any_wake_for(line: &[u8]) -> Option<(String, ChangeWake)> {
         .ok()
         .and_then(ChangeNotification::from_line)?;
     let project = change.project().to_string();
-    let wake = wake_for(line, &project)?;
+    // The project dots follow work, not documents.
+    let wake = wake_for(line, &project).filter(|w| !w.is_wiki())?;
     Some((project, wake))
 }
 
@@ -304,6 +321,20 @@ mod tests {
             br#"{"change":"layout","project":"demo","event":{"layout":"orchestrator-restarted"}}"#;
         assert_eq!(any_wake_for(layout), None);
         assert_eq!(any_wake_for(b"not json"), None);
+    }
+
+    #[test]
+    fn wiki_changes_wake_the_wiki_not_the_board() {
+        let docs = br#"{"change":"wiki","project":"demo","paths":["Plans/a.md"],"source":"agent"}"#;
+        let wake = wake_for(docs, "demo").unwrap();
+        assert_eq!(wake, ChangeWake::Wiki { paths: vec!["Plans/a.md".into()] });
+        assert!(wake.is_wiki());
+        let status = br#"{"change":"wiki-status","project":"demo","status":"syncing"}"#;
+        assert_eq!(wake_for(status, "demo"), Some(ChangeWake::WikiStatus { status: "syncing".into() }));
+        assert!(!ChangeWake::Board.is_wiki());
+        // The all-projects stream (the project dots) skips them.
+        assert_eq!(any_wake_for(docs), None);
+        assert_eq!(wake_for(docs, "other"), None);
     }
 
     #[test]
