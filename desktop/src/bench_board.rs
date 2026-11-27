@@ -358,7 +358,7 @@ pub fn run(args: &[String]) -> ! {
     let platform = gpui_platform::current_platform(false);
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
     cx.update(|cx| {
-        crate::visual_check::install_theme(cx);
+        crate::visual_theme::install_theme(cx);
         crate::theme::window::set(opts.look, cx);
         crate::assets::load_fonts(cx);
         crate::elements::terminal::TerminalSettings::init(cx);
