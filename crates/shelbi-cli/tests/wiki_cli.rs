@@ -353,3 +353,36 @@ fn every_wiki_command_works_through_the_hub() {
     assert_eq!(fx.code(&["write", "Plans/nope.md", "--content", "x"]), 2);
     assert_eq!(fx.code(&["read", "../outside.md"]), 3);
 }
+
+#[test]
+fn init_writes_the_block_and_the_hub_sets_the_wiki_up() {
+    let mut fx = Fixture::new("init");
+    // A project with no wiki yet: no block.
+    let yaml = fx.home.join("projects/demo.yaml");
+    let text = std::fs::read_to_string(&yaml).unwrap();
+    std::fs::write(&yaml, text.replace("wiki:\n  source: branch\n  sync: manual\n", "")).unwrap();
+    fx.start_daemon();
+    assert_eq!(fx.json(&["sync", "status"])["set_up"].as_bool(), Some(false));
+    assert!(fx.ok(&["sync"]).contains("`shelbi wiki init` sets one up"));
+
+    // A bad path is refused (3) before anything is written.
+    assert_eq!(fx.code(&["init", "--source", "folder", "--path", "../out"]), 3);
+    assert!(!std::fs::read_to_string(&yaml).unwrap().contains("wiki:"));
+
+    let out = fx.ok(&["init", "--branch", "team-wiki"]);
+    assert!(out.starts_with("The wiki is set up on the orphan branch team-wiki."), "{out}");
+    let text = std::fs::read_to_string(&yaml).unwrap();
+    assert!(text.contains("wiki:\n  source: branch\n  branch: team-wiki\n  sync: auto\n"), "{text}");
+    assert!(fx.wiki_file(".contextstore/settings.yml").contains("name:"), "the starter space is there");
+    let status = fx.json(&["sync", "status"]);
+    assert_eq!((status["set_up"].as_bool(), status["branch"].as_str()), (Some(true), Some("team-wiki")));
+    // The orphan branch reaches origin on the first sync.
+    fx.ok(&["sync", "now"]);
+    let origin = fx.root.join("origin.git");
+    let heads = fx.git(&origin, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+    assert!(heads.lines().any(|h| h == "team-wiki"), "{heads}");
+
+    // Again: already set up, nothing rewritten.
+    let out = fx.ok(&["init"]);
+    assert!(out.starts_with("The wiki was already set up on the orphan branch team-wiki."), "{out}");
+}

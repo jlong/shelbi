@@ -107,6 +107,7 @@ pub mod new_task;
 pub mod font_picker;
 pub mod issues;
 pub mod issues_settings;
+pub mod wiki_settings;
 pub mod jobs;
 pub mod jobs_reminders;
 pub mod list_screen;

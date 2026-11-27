@@ -105,6 +105,7 @@ fn hub_checkout(project: &Project) -> Result<PathBuf, String> {
 
 /// The service spec for `project`'s wiki as `config` describes it.
 pub fn spec_for(project: &Project, config: &WikiConfig) -> Result<ServiceSpec, String> {
+    config.validate().map_err(|e| e.to_string())?;
     let repo = hub_checkout(project)?;
     let worktree = wiki_dir(&project.name)?;
     let layout = match (config.source, config.folder()) {

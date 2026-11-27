@@ -417,6 +417,8 @@ heroicons! {
     ARROWS_RIGHT_LEFT = "arrows-right-left";
     CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
     RECTANGLE_STACK = "rectangle-stack";
+    /// Settings ▸ Wiki (and the Wiki's nav item to come).
+    BOOK_OPEN = "book-open";
     WRENCH_SCREWDRIVER = "wrench-screwdriver";
     VIEW_COLUMNS = "view-columns";
     /// Settings ▸ Properties (the Navigation component's State=Settings,
