@@ -533,6 +533,7 @@ mod tests {
             [
                 "show:tasks",
                 "show:changelog",
+                "show:wiki",
                 "show:activity",
                 "show:machines",
                 "show:jobs",

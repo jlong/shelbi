@@ -1824,11 +1824,12 @@ mod tests {
     #[test]
     fn the_selection_key_walks_the_laid_out_rows() {
         let entries = layout(&model(), &BTreeSet::new());
-        // Selectable: 3 nav, the four workspaces, then R-1, Q-1, Q-2.
+        // Selectable: 4 nav, the four workspaces, then R-1, Q-1, Q-2.
         assert_eq!(selected_key(&entries, 0).as_deref(), Some("sidebar-nav-Orchestrator"));
-        assert_eq!(selected_key(&entries, 3).as_deref(), Some("sidebar-ws-alpha"));
-        assert_eq!(selected_key(&entries, 7).as_deref(), Some("sidebar-review-R-1"));
-        assert_eq!(selected_key(&entries, 9).as_deref(), Some("sidebar-review-Q-2"));
+        assert_eq!(selected_key(&entries, 2).as_deref(), Some("sidebar-nav-Wiki"));
+        assert_eq!(selected_key(&entries, 4).as_deref(), Some("sidebar-ws-alpha"));
+        assert_eq!(selected_key(&entries, 8).as_deref(), Some("sidebar-review-R-1"));
+        assert_eq!(selected_key(&entries, 10).as_deref(), Some("sidebar-review-Q-2"));
         assert_eq!(selected_key(&entries, 99), None);
     }
 
@@ -2261,8 +2262,8 @@ mod render_tests {
 
     #[gpui::test]
     fn the_selection_marks_the_selected_row(cx: &mut TestAppContext) {
-        // Selectable rows: 3 nav, hub, alpha, bravo, devbox, delta, T-9.
-        let (_, mut cx) = open(cx, fixture_model(), 4, None);
+        // Selectable rows: 4 nav, hub, alpha, bravo, devbox, delta, T-9.
+        let (_, mut cx) = open(cx, fixture_model(), 5, None);
         let marker = cx.debug_bounds("sidebar-selection").expect("a selection");
         let row = cx.debug_bounds("sidebar-ws-alpha").unwrap();
         assert!(row.contains(&marker.origin), "the marker sits in alpha's row");
@@ -2399,7 +2400,7 @@ mod render_tests {
         assert_eq!(
             events,
             [
-                SidebarEvent::Activate(4),
+                SidebarEvent::Activate(5),
                 SidebarEvent::Activate(1),
                 SidebarEvent::OpenSettings,
                 SidebarEvent::ToggleSection(Section::Workspaces),
