@@ -8633,6 +8633,7 @@ mod image_menu_tests;
 #[cfg(any(test, feature = "visual-check"))]
 impl ShelbiWindow {
     /// The Wiki, once shown.
+    #[cfg(feature = "visual-check")]
     pub(crate) fn offscreen_wiki(&self) -> Option<Entity<WikiView>> {
         self.wiki.clone()
     }

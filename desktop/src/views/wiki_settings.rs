@@ -107,7 +107,7 @@ impl WikiSettingsPage {
         self.run(window, cx);
     }
 
-    #[cfg(any(test, feature = "visual-check"))]
+    #[cfg(test)]
     pub fn form(&self) -> &WikiForm {
         &self.form
     }
