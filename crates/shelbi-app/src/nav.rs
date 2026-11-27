@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 /// What the main area is showing.
 ///
-/// `Issues`, `Changelog`, `Activity`, `Machines`, `Jobs`, and `Reminders`
+/// `Issues`, `Changelog`, `Wiki`, `Activity`, `Machines`, `Jobs`, and `Reminders`
 /// are native (in-process) views.
 /// [`View::Session`] is a terminal view bound to a session by name — the
 /// orchestrator chat, a workspace agent, or a review editor/diff session.
@@ -28,6 +28,9 @@ pub enum View {
     Issues,
     /// The project's changelog: what has shipped ([`crate::changelog`]).
     Changelog,
+    /// The project's wiki ([`crate::wiki`]): its tree takes the sidebar's
+    /// column ([`crate::wiki_tree`]) and the open document the main area.
+    Wiki,
     Activity,
     Machines,
     /// The project's active awareness jobs ([`crate::jobs`]). Palette-only,
@@ -56,6 +59,7 @@ impl View {
         match name {
             "tasks" => View::Issues,
             "changelog" => View::Changelog,
+            "wiki" => View::Wiki,
             "activity" => View::Activity,
             "machines" => View::Machines,
             "jobs" => View::Jobs,
@@ -71,6 +75,7 @@ impl View {
         match self {
             View::Issues => "tasks".to_string(),
             View::Changelog => "changelog".to_string(),
+            View::Wiki => "wiki".to_string(),
             View::Activity => "activity".to_string(),
             View::Machines => "machines".to_string(),
             View::Jobs => "jobs".to_string(),
@@ -458,6 +463,7 @@ mod tests {
         for v in [
             View::Issues,
             View::Changelog,
+            View::Wiki,
             View::Activity,
             View::Machines,
             View::Jobs,

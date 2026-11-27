@@ -2686,7 +2686,7 @@ impl ShelbiWindow {
             view if is_chat(view) => notify::Showing::Orchestrator,
             View::Session(name) => notify::Showing::Workspace(name.clone()),
             View::Issues => notify::Showing::Board,
-            View::Changelog | View::Activity | View::Machines | View::Jobs | View::Reminders => {
+            View::Changelog | View::Wiki | View::Activity | View::Machines | View::Jobs | View::Reminders => {
                 notify::Showing::Other
             }
         }
@@ -3882,6 +3882,9 @@ impl ShelbiWindow {
                     View::Changelog => {
                         self.ensure_changelog(window, cx);
                     }
+                    // The Wiki's tree and document views come with the
+                    // desktop's Wiki slice (wiki-desktop-tree).
+                    View::Wiki => {}
                     View::Activity => {
                         self.ensure_activity(window, cx);
                     }
@@ -7293,6 +7296,7 @@ impl ShelbiWindow {
                 let content = match view {
                     View::Issues => self.issues.clone().map(|v| v.into_any_element()),
                     View::Changelog => self.changelog.clone().map(|v| v.into_any_element()),
+                    View::Wiki => None,
                     View::Activity => self.activity.clone().map(|v| v.into_any_element()),
                     View::Machines => self.machines.clone().map(|v| v.into_any_element()),
                     View::Jobs | View::Reminders => self.jobs_reminders.clone().map(|v| v.into_any_element()),

@@ -33,6 +33,7 @@ pub(crate) mod session;
 mod settings;
 mod sidebar;
 mod stray_output;
+mod wiki;
 mod workspace;
 pub(crate) mod terminal_view;
 
@@ -686,6 +687,17 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.kanban.poll_load_more() {
             state.dirty = true;
             corpus_landed = true;
+        }
+        if state.poll_wiki() {
+            state.dirty = true;
+        }
+        // A Wiki `e`: hand the terminal to $EDITOR on the document's copy, and
+        // save it through the hub when the editor exits.
+        if let Some(edit) = state.wiki.as_mut().and_then(|w| w.take_edit()) {
+            state.toast.dismiss();
+            let outcome = run_wiki_editor(&mut term, &edit.file);
+            state.reported_main = None;
+            state.wiki_edit_returned(edit, outcome);
         }
         if state.poll_changelog() {
             state.dirty = true;
@@ -1679,6 +1691,9 @@ struct ShellState {
     /// after handling input: it hands the terminal to the editor and waits, then
     /// restores the shell (the TUI's half of the palette's `edit:*` commands).
     pending_editor: Option<PathBuf>,
+    /// The Wiki of the current project (the sidebar's Wiki row), built the
+    /// first time it shows; a project switch drops it.
+    wiki: Option<wiki::WikiPage>,
     /// The line to open [`Self::pending_editor`] at (the diff's `Ctrl-g`).
     pending_editor_line: Option<u32>,
     /// A remote session to open. The run loop takes it like
@@ -1997,6 +2012,7 @@ impl ShellState {
             full_redraw: false,
             job: None,
             pending_editor: None,
+            wiki: None,
             pending_editor_line: None,
             pending_remote: None,
             palette_inputs: Arc::new(DiskPaletteInputs),
@@ -2245,7 +2261,8 @@ impl ShellState {
         let hidden = self.overlay.is_some()
             || self.settings_open()
             || self.acknowledgements_open()
-            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_));
+            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_))
+            || self.wiki_tree_shown();
         (!hidden && contains(self.sidebar_rect, x, y)).then_some((x, y))
     }
 
@@ -2387,10 +2404,15 @@ impl ShellState {
                 self.review = None;
                 self.workspace = None;
                 self.client.set_view(v.clone());
+                let wiki = v == View::Wiki;
                 self.main_view = MainView::Native(v);
                 // Focus moved to the main area up front, in `show` — so the
                 // keyboard drives the board / feed / machines list immediately,
-                // the same as opening a session.
+                // the same as opening a session. The Wiki's keys start in its
+                // tree, which takes the sidebar's column.
+                if wiki {
+                    self.open_wiki();
+                }
             }
             RowTarget::Review(id) => {
                 // Review has no `View` variant (it is a transient interface, not a
@@ -2496,18 +2518,118 @@ impl ShellState {
     /// arrived and the names of the workspaces whose change carried one (so the
     /// shown-workspace idle attach can be retried). No-op before the workers are
     /// started.
-    fn drain_change_wakes(&self) -> (bool, Vec<String>) {
+    fn drain_change_wakes(&mut self) -> (bool, Vec<String>) {
+        use shelbi_app::changes::ChangeWake;
         let mut changed = false;
         let mut woke = Vec::new();
+        let mut wiki = Vec::new();
         if let Some(w) = self.workers.as_ref() {
             while let Ok(wake) = w.change_rx.try_recv() {
-                changed = true;
-                if let shelbi_app::changes::ChangeWake::Workspace(ws) = wake {
-                    woke.push(ws);
+                // A wiki change refreshes the Wiki, not the board.
+                changed |= !wake.is_wiki();
+                match wake {
+                    ChangeWake::Workspace(ws) => woke.push(ws),
+                    wake if wake.is_wiki() => wiki.push(wake),
+                    _ => {}
                 }
             }
         }
+        for wake in wiki {
+            self.wiki_woke(wake);
+        }
         (changed, woke)
+    }
+
+    // --- Wiki (wiki-tui) ----------------------------------------------------
+
+    /// Whether the Wiki's tree stands in the sidebar's column.
+    fn wiki_tree_shown(&self) -> bool {
+        matches!(self.main_view, MainView::Native(View::Wiki))
+            && self.wiki.as_ref().is_some_and(|w| w.tree_open)
+    }
+
+    /// The current project's Wiki, built (over the project's hub) if it
+    /// isn't yet.
+    fn ensure_wiki(&mut self) -> Option<&mut wiki::WikiPage> {
+        let project = self.client.project()?.to_string();
+        if self.wiki.as_ref().is_none_or(|w| w.project() != project) {
+            let (_, ask) = (self.wiki_ports)(&project);
+            self.wiki = Some(wiki::WikiPage::new(project, ask));
+        }
+        self.wiki.as_mut()
+    }
+
+    /// The Wiki row opened: its tree takes the sidebar's column, with the
+    /// keys.
+    fn open_wiki(&mut self) {
+        if let Some(page) = self.ensure_wiki() {
+            page.open();
+        }
+        self.client.focus_sidebar();
+        self.dirty = true;
+    }
+
+    /// Carry out what a Wiki key or click asked for.
+    fn apply_wiki_step(&mut self, step: wiki::WikiStep) {
+        match step {
+            wiki::WikiStep::Stay => {}
+            wiki::WikiStep::Back => {
+                // The nav comes back, on the Wiki row; the document stays.
+                if let Some(page) = self.wiki.as_mut() {
+                    page.tree_open = false;
+                }
+                self.client.focus_sidebar();
+                if let Some(view) = self.sidebar_view() {
+                    let count = view.selectable_count();
+                    let at = (0..count).find(|&i| view.target_at(i) == Some(RowTarget::Native(View::Wiki)));
+                    if let Some(i) = at {
+                        self.client.select(i, count);
+                    }
+                }
+            }
+            wiki::WikiStep::FocusDoc => self.client.focus_main(),
+            wiki::WikiStep::FocusTree => {
+                if let Some(page) = self.wiki.as_mut() {
+                    page.tree_open = true;
+                }
+                self.client.focus_sidebar();
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// A `wiki` or `wiki-status` change from the hub.
+    fn wiki_woke(&mut self, wake: shelbi_app::changes::ChangeWake) {
+        let Some(page) = self.wiki.as_mut() else {
+            return;
+        };
+        match wake {
+            shelbi_app::changes::ChangeWake::Wiki { paths } => page.changed(&paths),
+            shelbi_app::changes::ChangeWake::WikiStatus { .. } => page.status_changed(),
+            _ => {}
+        }
+    }
+
+    /// Fold in the Wiki's finished hub work, and while it shows keep the
+    /// hub pulling often. `true` when something landed.
+    fn poll_wiki(&mut self) -> bool {
+        let shown = matches!(self.main_view, MainView::Native(View::Wiki));
+        let Some(page) = self.wiki.as_mut() else {
+            return false;
+        };
+        if shown {
+            page.tick(Instant::now());
+        }
+        page.poll()
+    }
+
+    /// A Wiki edit the editor is done with.
+    fn wiki_edit_returned(&mut self, edit: wiki::WikiEdit, editor: Result<(), String>) {
+        match self.wiki.as_mut() {
+            Some(page) => page.finish_edit(edit, editor),
+            None => self.status = Some(format!("The wiki closed; your copy of {} is at {}", edit.path, edit.file.display())),
+        }
+        self.dirty = true;
     }
 
     /// The freshest snapshot from the current project's refresher, or `None`. A
@@ -2606,6 +2728,7 @@ impl ShellState {
         self.changelog = changelog::ChangelogPage::new();
         self.changelog_issue_rx = None;
         self.issue_read_from = None;
+        self.wiki = None;
         // An open review / workspace interface belongs to the project we left: it
         // renders over the sidebar column and main area regardless of
         // `main_view`, so drop it (detaching its content view) along with any
@@ -2673,7 +2796,15 @@ impl ShellState {
                 // A restored session view keeps sidebar focus — a switch lands
                 // the user on the sidebar (see `ClientState::switch_project`).
             }
-            RowTarget::Native(v) => self.main_view = MainView::Native(v),
+            RowTarget::Native(v) => {
+                let wiki = v == View::Wiki;
+                self.main_view = MainView::Native(v);
+                if wiki {
+                    if let Some(page) = self.ensure_wiki() {
+                        page.open();
+                    }
+                }
+            }
             RowTarget::Review(id) => self.main_view = MainView::Review(id),
             // `view_to_row_target` never yields a machine-toggle target (it has
             // no `View`), so this arm is only for exhaustiveness.
@@ -4834,6 +4965,7 @@ impl ShellState {
         match v {
             View::Issues
             | View::Changelog
+            | View::Wiki
             | View::Activity
             | View::Machines
             | View::Jobs
@@ -5898,6 +6030,14 @@ impl ShellState {
     }
 
     fn handle_sidebar_key(&mut self, k: KeyEvent) {
+        // The Wiki's tree, standing in the nav's place, takes the keys.
+        if self.wiki_tree_shown() {
+            if let Some(page) = self.wiki.as_mut() {
+                let step = page.handle_tree_key(k);
+                self.apply_wiki_step(step);
+            }
+            return;
+        }
         // The sidebar keymap's open-Settings key (`,` by default).
         let open_settings = crate::keymap::chord_from_event(k)
             .and_then(|c| self.keymaps.sidebar.dispatch(c))
@@ -5984,6 +6124,14 @@ impl ShellState {
             MainView::Native(View::Changelog) => {
                 let step = self.changelog.handle_key(k);
                 self.apply_changelog_step(step);
+                self.dirty = true;
+                return;
+            }
+            MainView::Native(View::Wiki) => {
+                if let Some(page) = self.ensure_wiki() {
+                    let step = page.handle_doc_key(k);
+                    self.apply_wiki_step(step);
+                }
                 self.dirty = true;
                 return;
             }
@@ -6325,6 +6473,25 @@ impl ShellState {
             }
             return;
         }
+        if self.wiki_tree_shown() && contains(self.sidebar_rect, m.column, m.row) {
+            if let Some(page) = self.wiki.as_mut() {
+                let step = match m.kind {
+                    MouseEventKind::Down(MouseButton::Left) => page.click_tree(m.column, m.row),
+                    MouseEventKind::ScrollUp => {
+                        page.tree.move_up();
+                        wiki::WikiStep::Stay
+                    }
+                    MouseEventKind::ScrollDown => {
+                        page.tree.move_down();
+                        wiki::WikiStep::Stay
+                    }
+                    _ => return,
+                };
+                self.client.focus_sidebar();
+                self.apply_wiki_step(step);
+            }
+            return;
+        }
         if contains(self.sidebar_rect, m.column, m.row) {
             self.handle_sidebar_mouse(m);
             return;
@@ -6528,6 +6695,17 @@ impl ShellState {
             }
             MainView::Native(View::Activity) => {
                 crate::handlers::activity::handle_activity_mouse(&mut self.activity, m);
+                self.dirty = true;
+                return;
+            }
+            MainView::Native(View::Wiki) => {
+                if let Some(page) = self.wiki.as_mut() {
+                    match m.kind {
+                        MouseEventKind::ScrollUp => page.scroll_by(-3),
+                        MouseEventKind::ScrollDown => page.scroll_by(3),
+                        _ => {}
+                    }
+                }
                 self.dirty = true;
                 return;
             }
@@ -6804,6 +6982,9 @@ where
     let is_workspace = matches!(main_view, MainView::Workspace(_));
     // Either sidebar-column interface suppresses the nav sidebar and the shell's
     // bottom status band (each carries its own column + status line).
+    // The Wiki's tree stands in the nav's place the same way; the status
+    // band stays (the document doesn't carry one).
+    let is_wiki_tree = state.wiki_tree_shown();
     let is_panel = is_review || is_workspace;
     // Settings stands over all of it: its sidebar in the column, its page in
     // the main area. What's under it isn't drawn (its sessions keep running).
@@ -6826,6 +7007,7 @@ where
     let jobs = &mut state.jobs;
     let reminders = &mut state.reminders;
     let changelog = &mut state.changelog;
+    let wiki = &mut state.wiki;
     let onboarding = &mut state.onboarding;
     let sessions = &state.sessions;
 
@@ -6873,7 +7055,7 @@ where
             // interface is open: then that panel takes the sidebar's column
             // (rendered at the frame level below), so there are only two columns,
             // panel and content (`rt-review-screen-hangs-on-connecting`).
-            if !is_panel && !is_settings && !is_ack {
+            if !is_panel && !is_wiki_tree && !is_settings && !is_ack {
                 if let Some(view) = &sidebar_view {
                     view.render(buf, content_rect, selection, !focus_main, &sidebar_chrome);
                 }
@@ -6925,6 +7107,11 @@ where
                         cursor = cur;
                     }
                 }
+                MainView::Native(View::Wiki) => {
+                    if let Some(page) = wiki.as_mut() {
+                        page.render_doc(buf, main_rect);
+                    }
+                }
                 MainView::Native(_) => {} // drawn above
                 MainView::Review(id) => {
                     // The interface itself renders at the frame level below; this
@@ -6965,6 +7152,13 @@ where
             let cur = r.render(frame, content_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
+            }
+        }
+
+        // The Wiki's tree, into the sidebar's column.
+        if is_wiki_tree && !is_settings && !is_ack {
+            if let Some(page) = wiki.as_mut() {
+                page.render_tree(frame, content_rect, !focus_main);
             }
         }
 
@@ -7163,6 +7357,7 @@ fn view_to_row_target(view: &View) -> RowTarget {
     match view {
         View::Issues
         | View::Changelog
+        | View::Wiki
         | View::Activity
         | View::Machines
         | View::Jobs
@@ -7521,6 +7716,25 @@ fn enter_terminal_modes() -> io::Result<()> {
 /// this thread, so nothing competes with the editor for keys. An app
 /// `editor:` opens the file in the app instead (`open -a`), leaving the
 /// screen as it is.
+/// Run `$EDITOR` (else `$VISUAL`, else vi: `shelbi wiki edit`'s rule) on a
+/// Wiki document's copy and wait for it, the terminal handed over meanwhile.
+fn run_wiki_editor(term: &mut Terminal<CrosstermBackend<io::Stdout>>, file: &std::path::Path) -> Result<(), String> {
+    let argv = shelbi_app::wiki::editor_argv(
+        file,
+        std::env::var("EDITOR").ok().as_deref(),
+        std::env::var("VISUAL").ok().as_deref(),
+    );
+    restore_terminal();
+    let outcome = std::process::Command::new(&argv[0]).args(&argv[1..]).status();
+    let _ = enter_terminal_modes();
+    let _ = term.clear();
+    match outcome {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{} exited with {status}", argv[0])),
+        Err(e) => Err(format!("couldn't start the editor `{}`: {e}", argv[0])),
+    }
+}
+
 fn run_editor(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     path: &std::path::Path,
@@ -7587,6 +7801,8 @@ mod tests {
     mod new_task;
     // Shelbi's own diff in a review and a workspace (`tests/diff_view.rs`).
     mod diff_view;
+    // The Wiki: its nav row, tree, document and editor (`tests/wiki.rs`).
+    mod wiki;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {

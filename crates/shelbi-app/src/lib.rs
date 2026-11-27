@@ -127,6 +127,7 @@ pub mod toast;
 pub mod tracker_connect;
 pub mod view;
 pub mod wiki;
+pub mod wiki_tree;
 pub mod wire;
 pub mod workspace_panel;
 pub mod zen;

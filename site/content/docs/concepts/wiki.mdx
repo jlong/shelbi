@@ -105,10 +105,17 @@ main area.
 
 <Tui>
 
-Open it with **Wiki** in the sidebar (📖). The arrow keys move through the
-tree and open and close folders, `Enter` opens a document, `/` filters, and
-`Esc` goes back to the sidebar. A document shows as rendered Markdown; `e`
-opens it in `$EDITOR` and saves it through the hub when you quit the editor.
+Open it with **Wiki** in the sidebar (📖). The arrow keys (or `j`, `k`, `h`,
+`l`) move through the tree and open and close folders, `Enter` opens a
+document, `/` filters, and `Esc` goes back to the sidebar. `n` makes a document
+and `N` a folder in the selected folder, `r` renames, `m` moves to another
+folder, and `d` deletes after you confirm with `y`.
+
+A document shows as rendered Markdown in the main area, where the arrow keys,
+`Page Up` and `Page Down` scroll it. `e` opens it in `$EDITOR` (else `$VISUAL`,
+else `vi`) and saves it through the hub when you quit the editor. If it changed
+elsewhere while you edited, nothing is saved and the status line says where
+your copy is.
 
 </Tui>
 <Desktop>
