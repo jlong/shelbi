@@ -294,6 +294,24 @@ impl WikiService {
         lock(&self.shared.engine).conflicts().iter().find(|c| c.path == path).cloned()
     }
 
+    /// The uncommitted change under wiki-relative `path` (the whole wiki
+    /// when `None`), as a unified diff.
+    pub fn diff(&self, path: Option<&str>) -> Result<String, OpError> {
+        if let Some(p) = path {
+            self.resolve_path(p)?;
+        }
+        Ok(lock(&self.shared.engine).diff(path)?)
+    }
+
+    /// The commits that touched `path` (the whole wiki when `None`), newest
+    /// first, at most `limit`.
+    pub fn log(&self, path: Option<&str>, limit: usize) -> Result<Vec<crate::sync::history::CommitInfo>, OpError> {
+        if let Some(p) = path {
+            self.resolve_path(p)?;
+        }
+        Ok(lock(&self.shared.engine).log(path, limit)?)
+    }
+
     /// A client shows the Wiki: pull on the faster clock for a while.
     pub fn touch_active(&self) {
         let mut s = lock(&self.shared.sched);

@@ -70,6 +70,10 @@ pub enum ChangeNotification {
     /// `project`'s wiki sync status is now `status` (`synced`, `syncing`,
     /// `pending`, `offline`, `conflict`, `error <detail>`).
     WikiStatus { project: String, status: String },
+    /// Someone asked to see `project`'s wiki at `path` (its root when
+    /// `None`), wiki-relative: `shelbi wiki open`. A client showing the
+    /// project opens its Wiki there.
+    WikiOpen { project: String, path: Option<String> },
 }
 
 impl ChangeNotification {
@@ -83,6 +87,7 @@ impl ChangeNotification {
             ChangeNotification::Layout { project, .. } => project,
             ChangeNotification::Wiki { project, .. } => project,
             ChangeNotification::WikiStatus { project, .. } => project,
+            ChangeNotification::WikiOpen { project, .. } => project,
         }
     }
 

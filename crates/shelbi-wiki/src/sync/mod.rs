@@ -19,6 +19,7 @@
 //! when. A file a pull can't merge is held (see [`conflicts`]).
 
 pub mod conflicts;
+pub mod history;
 pub mod message;
 pub mod pr;
 

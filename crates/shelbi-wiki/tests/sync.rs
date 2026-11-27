@@ -463,3 +463,36 @@ fn writes_refuse_paths_outside_the_wiki() {
     assert!(svc.write(".git/config", "x", ChangeSource::Local).is_err());
     assert!(!fx.root.join("home/projects/demo/escape.md").exists());
 }
+
+/// `diff` and `log` read wiki-relative in folder mode (the repo folder is
+/// stripped), include new files, and narrow to one path.
+#[test]
+fn diff_and_log_answer_wiki_relative_paths_in_folder_mode() {
+    let fx = Fixture::new();
+    let layout = Layout::folder(fx.hub(), fx.worktree(), "shelbi/wiki-docs", "docs", "main");
+    let mut spec = fx.spec(layout, false);
+    spec.pull_requests = Some(Arc::new(FakePrs::default()));
+    let (svc, _) = WikiService::start(spec, Arc::new(Recorder::default())).unwrap();
+    assert_eq!(svc.diff(None).unwrap(), "");
+
+    svc.write("intro.md", "# Intro\n\nChanged.\n", ChangeSource::Local).unwrap();
+    svc.write("Guides/new.md", "# New\n", ChangeSource::Local).unwrap();
+    std::fs::write(fx.worktree().join("stray.txt"), "outside the wiki\n").unwrap();
+    let diff = svc.diff(None).unwrap();
+    assert!(diff.contains("a/intro.md") && diff.contains("+Changed."), "{diff}");
+    assert!(diff.contains("b/Guides/new.md") && diff.contains("+# New"), "{diff}");
+    assert!(!diff.contains("docs/") && !diff.contains("stray"), "{diff}");
+    let one = svc.diff(Some("Guides/new.md")).unwrap();
+    assert!(one.contains("+# New") && !one.contains("intro"), "{one}");
+
+    let _ = svc.sync_now(SYNC);
+    assert_eq!(svc.diff(None).unwrap(), "");
+    let log = svc.log(None, 10).unwrap();
+    assert!(log.len() >= 2, "{log:?}");
+    assert!(log[0].paths.contains(&"Guides/new.md".to_string()), "{log:?}");
+    assert!(log.iter().all(|c| c.paths.iter().all(|p| !p.starts_with("docs/"))), "{log:?}");
+    let intro = svc.log(Some("intro.md"), 1).unwrap();
+    assert_eq!(intro.len(), 1);
+    assert_eq!(intro[0].paths, vec!["intro.md".to_string()]);
+    assert!(svc.log(Some("../main.txt"), 5).is_err());
+}

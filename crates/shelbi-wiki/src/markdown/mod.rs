@@ -8,6 +8,9 @@
 //!   * [`sections`] — heading addressing, frontmatter handling, and
 //!     section read/write/append/prepend/remove.
 //!   * [`tasks`] — GFM checkbox listing and toggling.
+//!   * [`compose`] — whole-document writes with `cstore`'s rules
+//!     (keep frontmatter and H1), new-document bodies, `ls --stats`
+//!     counts.
 //!   * [`links`] — both `[text](href)` and wikilink (`[[name]]`)
 //!     extraction.
 //!
@@ -19,6 +22,7 @@
 
 use comrak::Options;
 
+pub mod compose;
 pub mod links;
 pub mod sections;
 pub mod tasks;
