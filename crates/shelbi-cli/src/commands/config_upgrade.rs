@@ -445,6 +445,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_tracker_ownership_dispatch(entry, &text, out);
         sniff_claim_on_start_dispatch(entry, &text, out);
         sniff_orchestrator_changelog(entry, &text, out);
+        sniff_orchestrator_wiki(entry, &text, out);
         sniff_orchestrator_changelog_attachments(entry, &text, out);
         sniff_orchestrator_changelog_releases(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
@@ -460,6 +461,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
     } else if id.ends_with(SHARED_PREAMBLE_SURFACE_SUFFIX) {
         sniff_shared_preamble(entry, &text, out);
         sniff_shared_preamble_jobs(entry, &text, out);
+        sniff_shared_preamble_wiki(entry, &text, out);
     } else if id.ends_with(".changelog-template") {
         sniff_changelog_template(entry, &text, out);
     } else if id.ends_with(".zenmode") {
@@ -3265,6 +3267,134 @@ fn sniff_shared_preamble_jobs(entry: &InventoryEntry, text: &str, out: &mut Vec<
         "Append the shipped `## Jobs` section: run long commands with `shelbi job run --label \
          <l> --estimate <d> -- <cmd>`, the result arrives as a prompt, read output with `shelbi \
          job log <id>`, and run the command directly where `shelbi` isn't on the PATH.",
+        Location {
+            line: text.lines().count().max(1),
+            column: 1,
+        },
+    ));
+}
+
+/// Heading of the wiki section in the shared preamble and in the orchestrator
+/// instructions (read and write the project's wiki with `shelbi wiki`; plans go
+/// there, never in the repo). The sniffers key on it and the healers append the
+/// shipped section under it, so the two can never disagree.
+pub(crate) const WIKI_SECTION_HEADING: &str = "## Wiki";
+
+/// The command every wiki section names. A copy that mentions it anywhere
+/// already teaches the wiki in some form (moved, reworded), so it's left alone
+/// even without the heading.
+const WIKI_COMMAND_MARKER: &str = "shelbi wiki";
+
+/// The stable code for "the project's shared preamble predates the Wiki
+/// section". An auto-heal: the shipped section is appended, never interleaved.
+pub(crate) const SHARED_PREAMBLE_WIKI_MISSING: &str = "SHARED_PREAMBLE_WIKI_MISSING";
+
+/// The stable code for "the orchestrator instructions predate the Wiki rule"
+/// (plans go in the wiki via `shelbi wiki new Plans/<name>.md`). An auto-heal,
+/// appended like the Changelog rule.
+pub(crate) const ORCH_WIKI_RULE_MISSING: &str = "ORCH_WIKI_RULE_MISSING";
+
+/// Whether a preamble or orchestrator copy already teaches the wiki: the
+/// heading line, or the command anywhere in the file. A user who rewrote or
+/// emptied the section keeps the heading, so their edit is never touched.
+fn has_wiki_section(text: &str) -> bool {
+    text.lines().any(|l| l.trim_end() == WIKI_SECTION_HEADING) || text.contains(WIKI_COMMAND_MARKER)
+}
+
+/// `template`'s `## Wiki` section (heading and body).
+fn shipped_wiki_section(template: &str, what: &str) -> String {
+    let body = markdown_section(template, WIKI_SECTION_HEADING)
+        .unwrap_or_else(|| panic!("the shipped {what} carries a `## Wiki` section"));
+    format!("{WIKI_SECTION_HEADING}\n{}", body.trim_end())
+}
+
+/// The shipped shared preamble's `## Wiki` section.
+pub(crate) fn shipped_preamble_wiki_section() -> String {
+    shipped_wiki_section(shelbi_state::DEFAULT_SHARED_PREAMBLE, "shared preamble")
+}
+
+/// The shipped orchestrator instructions' `## Wiki` section.
+pub(crate) fn shipped_orchestrator_wiki_section() -> String {
+    shipped_wiki_section(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, "orchestrator template")
+}
+
+/// Append `section` after a blank line, unless `text` is empty or already
+/// teaches the wiki. Purely additive: the original text is a byte prefix of
+/// the result.
+fn append_wiki_section(text: &str, section: &str) -> String {
+    if text.trim().is_empty() || has_wiki_section(text) {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(section);
+    out.push('\n');
+    out
+}
+
+/// Append the shipped Wiki section to a shared preamble that lacks it (the
+/// healer's write-back; it shares [`has_wiki_section`] with the sniffer).
+pub(crate) fn append_preamble_wiki_section(text: &str) -> String {
+    append_wiki_section(text, &shipped_preamble_wiki_section())
+}
+
+/// Append the shipped Wiki rule to orchestrator instructions that lack it.
+pub(crate) fn append_orchestrator_wiki_section(text: &str) -> String {
+    append_wiki_section(text, &shipped_orchestrator_wiki_section())
+}
+
+/// Sniff an existing `agents/_shared/preamble.md` for the Wiki section: read
+/// the project's plans and context with `shelbi wiki`, and write plans there,
+/// never in the repo.
+///
+/// The section ships in the default preamble, which only reaches NEW projects.
+/// An **absence** sniff routed to [`Classification::AutoHeal`], like the Jobs
+/// section: the fix appends a self-contained section at the end and rewrites
+/// nothing the project wrote. A preamble with the heading or `shelbi wiki`
+/// anywhere never fires. Idempotent: after the heal the file carries the
+/// heading.
+fn sniff_shared_preamble_wiki(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if text.trim().is_empty() || has_wiki_section(text) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        SHARED_PREAMBLE_WIKI_MISSING,
+        "the shared agent preamble has no `## Wiki` section, so agents don't read the \
+         project's plans before starting and write new plans into the repo",
+        "Append the shipped `## Wiki` section: read the plan a task names (or `shelbi wiki \
+         search`), write plans and design docs with `shelbi wiki new Plans/<name>.md` rather \
+         than as repo files, and use the `shelbi-wiki` skill for the commands.",
+        Location {
+            line: text.lines().count().max(1),
+            column: 1,
+        },
+    ));
+}
+
+/// Sniff an orchestrator `instructions.md` for the Wiki rule: plans go in the
+/// wiki via `shelbi wiki new Plans/<name>.md`. An absence sniff routed to
+/// [`Classification::AutoHeal`], like the Changelog rule (append-only, never
+/// fires on a copy that has the heading or names `shelbi wiki` anywhere).
+fn sniff_orchestrator_wiki(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if text.trim().is_empty() || has_wiki_section(text) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        ORCH_WIKI_RULE_MISSING,
+        "orchestrator instructions have no `## Wiki` rule, so plans end up in repo files or \
+         other tools instead of the project's wiki",
+        "Append the shipped `## Wiki` section: write plans with `shelbi wiki new \
+         Plans/<name>.md`, search the wiki before planning, name the plan in the issues made \
+         from it, and check its tasks off as they land.",
         Location {
             line: text.lines().count().max(1),
             column: 1,
@@ -7300,11 +7430,12 @@ Finalize by moving the card: `shelbi task move <task> --to done`.
 
         // The on-start pass never rewrites the project's own prose, and never
         // writes the hub-safety rules in itself. It only appends the shipped
-        // `## Jobs` section (SHARED_PREAMBLE_JOBS_MISSING, additive).
+        // `## Wiki` and `## Jobs` sections (SHARED_PREAMBLE_WIKI_MISSING,
+        // SHARED_PREAMBLE_JOBS_MISSING, both additive), Wiki first.
         run_for_project("demo");
         let after = std::fs::read_to_string(dir.join("preamble.md")).unwrap();
         assert!(after.starts_with(custom), "{after}");
-        assert_eq!(after, append_preamble_jobs_section(custom));
+        assert_eq!(after, append_preamble_jobs_section(&append_preamble_wiki_section(custom)));
         assert!(!after.to_ascii_lowercase().contains("hub safety"), "{after}");
     }
 

@@ -35,6 +35,9 @@ archives:
       - plugins/shelbi-awareness/hooks/hooks.json
       - plugins/shelbi-awareness/monitors/monitors.json
       - plugins/shelbi-awareness/README.md
+      - plugins/shelbi-wiki/.claude-plugin/plugin.json
+      - plugins/shelbi-wiki/.codex-plugin/plugin.json
+      - plugins/shelbi-wiki/skills/shelbi-wiki/SKILL.md
 
 nfpms:
   - id: shelbi-deb
@@ -74,6 +77,12 @@ nfpms:
         dst: /usr/share/shelbi/plugins/shelbi-awareness/monitors/monitors.json
       - src: plugins/shelbi-awareness/README.md
         dst: /usr/share/shelbi/plugins/shelbi-awareness/README.md
+      - src: plugins/shelbi-wiki/.claude-plugin/plugin.json
+        dst: /usr/share/shelbi/plugins/shelbi-wiki/.claude-plugin/plugin.json
+      - src: plugins/shelbi-wiki/.codex-plugin/plugin.json
+        dst: /usr/share/shelbi/plugins/shelbi-wiki/.codex-plugin/plugin.json
+      - src: plugins/shelbi-wiki/skills/shelbi-wiki/SKILL.md
+        dst: /usr/share/shelbi/plugins/shelbi-wiki/skills/shelbi-wiki/SKILL.md
     overrides:
       deb:
         file_name_template: "{{ .ProjectName }}_{{ .Version }}_amd64"
