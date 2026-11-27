@@ -1512,7 +1512,7 @@ impl WikiView {
             .size(px(16.0))
             .when(row.is_folder() && row.has_children, |d| {
                 d.child(
-                    heroicon(if row.expanded { icons::CHEVRON_DOWN_MENU } else { icons::CHEVRON_RIGHT_MENU })
+                    heroicon(if row.expanded { icons::DISCLOSURE_OPEN_MENU } else { icons::CHEVRON_RIGHT_MENU })
                         .text_color(theme.icon),
                 )
             });

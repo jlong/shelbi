@@ -34,6 +34,6 @@ The Wiki sidebar's tree draws its rows' marks on the same grid:
   folder's disclosure (the Heroicons chevrons on the 16pt grid with a
   1.25pt stroke).
 - `folder.svg`, `folder-open.svg` and `document-text.svg`: a folder (closed
-  and open) and a document, the Heroicons 24/outline drawings with their
-  stroke widened to 1.875 so it is 1.25pt at 16pt (the same as scaling the
-  path by 2/3).
+  and open) and a document, the Heroicons 24/outline paths scaled by 2/3
+  onto the 16pt grid (a `scale` group) with a 1.875 stroke, so it is 1.25pt
+  at 16pt.

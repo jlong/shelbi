@@ -492,8 +492,9 @@ heroicons! {
         /// A menu row that opens a submenu (a tab's Move to Window), and a
         /// closed folder's disclosure in the Wiki tree.
         CHEVRON_RIGHT_MENU = "chevron-right";
-        /// An open folder's disclosure in the Wiki tree.
-        CHEVRON_DOWN_MENU = "chevron-down";
+        /// An open folder's disclosure in the Wiki tree (not a dropdown's
+        /// chevron, which is `style::DROPDOWN_CHEVRON`).
+        DISCLOSURE_OPEN_MENU = "chevron-down";
         /// The Wiki tree's folders (closed and open) and documents.
         FOLDER_MENU = "folder";
         FOLDER_OPEN_MENU = "folder-open";
