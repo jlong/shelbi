@@ -52,10 +52,24 @@ pub enum WikiRequest {
         section: Option<String>,
         by: Author,
     },
+    /// Replace a document's text with `cstore write`'s rules: its
+    /// frontmatter and H1 stay unless `content` brings its own, and `title`
+    /// sets the H1. The document must exist. (A client's save of the whole
+    /// text sends [`WikiRequest::Write`].)
+    Overwrite {
+        path: String,
+        content: String,
+        title: Option<String>,
+        by: Author,
+    },
     /// A new document (a path ending in `.md`) or folder (any other path).
+    /// A document gets `# <title>` (else a title from its file name) unless
+    /// `content` starts with an H1 of its own; a folder's `content` is its
+    /// description.
     New {
         path: String,
         content: Option<String>,
+        title: Option<String>,
         by: Author,
     },
     /// Move or rename a document or folder.
@@ -68,6 +82,35 @@ pub enum WikiRequest {
         section: Option<String>,
         by: Author,
     },
+    /// One folder's entries (subfolders, then documents, with their
+    /// counts), or a document's headings. Answers [`WikiReply::Entries`].
+    List { path: Option<String> },
+    /// The GFM tasks (`- [ ]`, `- [x]`) of a document, or of every document
+    /// directly in a folder; only one section's with `section`, only the
+    /// open ones with `pending`. Answers [`WikiReply::Tasks`].
+    Tasks {
+        path: String,
+        section: Option<String>,
+        pending: bool,
+    },
+    /// Check (or uncheck) the one task of a document whose text contains
+    /// `text` (case-insensitive), looking only in `section` when given.
+    SetTask {
+        path: String,
+        text: String,
+        section: Option<String>,
+        checked: bool,
+        by: Author,
+    },
+    /// The uncommitted change under `path` (the whole wiki when `None`), as
+    /// a unified diff. Answers [`WikiReply::Text`].
+    Diff { path: Option<String> },
+    /// The commits that touched `path` (the whole wiki when `None`), newest
+    /// first, at most `limit`. Answers [`WikiReply::Log`].
+    Log { path: Option<String>, limit: usize },
+    /// Ask the clients to show the Wiki at `path` (its root when `None`):
+    /// the hub announces it on the change bus.
+    Open { path: Option<String> },
     /// Grep the wiki's documents. Answers [`WikiReply::Matches`].
     Search {
         query: String,
@@ -124,6 +167,11 @@ pub enum WikiReply {
     Tree(Vec<WikiNode>),
     Doc { path: String, content: String },
     Matches(Vec<WikiMatch>),
+    Entries(Vec<WikiEntry>),
+    Tasks(Vec<WikiTask>),
+    Log(Vec<WikiCommit>),
+    /// Plain text (a diff).
+    Text(String),
     Conflict(WikiConflict),
     /// A write (or move, copy, remove) was made.
     Done,
@@ -227,6 +275,59 @@ pub struct WikiMatch {
     /// Byte range of the match within `text`.
     pub start: usize,
     pub end: usize,
+}
+
+/// One row of [`WikiReply::Entries`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WikiEntry {
+    pub kind: EntryKind,
+    /// A folder's or document's name on disk; a section's heading line as
+    /// written (`## Goals`).
+    pub name: String,
+    /// Wiki-relative; a section's is its document's.
+    pub path: String,
+    /// A document's first H1 (else its file name); a folder's display name;
+    /// a section's heading text.
+    pub title: String,
+    /// A section's heading level (1..=6); 0 otherwise.
+    pub level: u8,
+    /// A document's or section's lines and words; 0 for a folder.
+    pub lines: usize,
+    pub words: usize,
+    /// A document's size; 0 otherwise.
+    pub bytes: u64,
+    /// A folder's documents (directly in it); 0 otherwise.
+    pub documents: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryKind {
+    Folder,
+    Document,
+    Section,
+}
+
+/// One task of [`WikiReply::Tasks`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WikiTask {
+    /// The document it's in.
+    pub path: String,
+    /// 1-based, in the document (also when asked for one section).
+    pub line: usize,
+    pub checked: bool,
+    pub text: String,
+}
+
+/// One commit of [`WikiReply::Log`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WikiCommit {
+    pub sha: String,
+    pub author: String,
+    /// RFC3339.
+    pub date: String,
+    pub subject: String,
+    /// The wiki-relative files it touched.
+    pub paths: Vec<String>,
 }
 
 /// A held file's sides, for [`WikiReply::Conflict`]. `None` is "deleted on

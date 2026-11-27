@@ -2145,6 +2145,7 @@ dependencies = [
  "shelbi-state",
  "shelbi-term",
  "shelbi-tui",
+ "shelbi-wiki",
  "signal-hook",
  "syn 2.0.118",
  "tempfile",

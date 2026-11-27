@@ -41,6 +41,7 @@ pub mod session_cli;
 pub mod status;
 mod temp_dir;
 pub mod tracker;
+pub mod wiki;
 pub mod wizard;
 pub mod workflow;
 pub mod workspace;

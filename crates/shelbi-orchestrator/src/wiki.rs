@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use shelbi_app::wiki::{
-    Author, FailureKind, NodeKind, SyncOp, SyncState, WikiConflict, WikiMatch, WikiNode, WikiReply, WikiRequest,
-    WikiStatus,
+    Author, EntryKind, FailureKind, NodeKind, SyncOp, SyncState, WikiCommit, WikiConflict, WikiEntry, WikiMatch,
+    WikiNode, WikiReply, WikiRequest, WikiStatus, WikiTask,
 };
 use shelbi_core::{Project, WikiConfig, WikiSource, WikiSyncMode};
 use shelbi_wiki::service::{ChangeSource, EventSink, OpError, ServiceSpec, StatusReport, SyncStatus, Timing, WikiService};
@@ -237,12 +237,18 @@ pub fn answer(project: &str, req: WikiRequest) -> WikiReply {
         .and_then(|p| p.wiki)
         .map(|w| w.source)
         .unwrap_or_default();
-    answer_with(&svc, source_kind, req)
+    answer_for(&svc, source_kind, Some(project), req)
 }
 
 /// Run `req` against a running service.
 pub fn answer_with(svc: &WikiService, source_kind: WikiSource, req: WikiRequest) -> WikiReply {
-    use shelbi_wiki::markdown::sections;
+    answer_for(svc, source_kind, None, req)
+}
+
+/// [`answer_with`] for `project`, which names the wiki an
+/// [`WikiRequest::Open`] is announced for.
+fn answer_for(svc: &WikiService, source_kind: WikiSource, project: Option<&str>, req: WikiRequest) -> WikiReply {
+    use shelbi_wiki::markdown::{compose, sections};
     let status = |svc: &WikiService| WikiReply::Status(status_reply(&svc.status(), source_kind));
     let result: Result<WikiReply, OpError> = match req {
         WikiRequest::Init | WikiRequest::Status => Ok(status(svc)),
@@ -261,9 +267,17 @@ pub fn answer_with(svc: &WikiService, source_kind: WikiSource, req: WikiRequest)
             by,
         } => match section {
             None => svc.write(&path, &content, source(by)),
-            Some(h) => svc.update(&path, source(by), |c| sections::write_section(c, &h, &content).map_err(section_error)),
+            Some(h) => svc.update(&path, source(by), |c| compose::write_section(c, &h, &content).map_err(section_error)),
         }
         .map(|()| WikiReply::Done),
+        WikiRequest::Overwrite {
+            path,
+            content,
+            title,
+            by,
+        } => svc
+            .update(&path, source(by), |c| Ok(compose::render_write_output(c, &content, title.as_deref())))
+            .map(|()| WikiReply::Done),
         WikiRequest::Append {
             path,
             content,
@@ -271,8 +285,8 @@ pub fn answer_with(svc: &WikiService, source_kind: WikiSource, req: WikiRequest)
             by,
         } => svc
             .update(&path, source(by), |c| match &section {
-                None => Ok(append_to_document(c, &content)),
-                Some(h) => sections::append_to_section(c, h, &content).map_err(section_error),
+                None => Ok(compose::append_to_document(c, &content)),
+                Some(h) => compose::append_to_section(c, h, &content).map_err(section_error),
             })
             .map(|()| WikiReply::Done),
         WikiRequest::Prepend {
@@ -282,25 +296,62 @@ pub fn answer_with(svc: &WikiService, source_kind: WikiSource, req: WikiRequest)
             by,
         } => svc
             .update(&path, source(by), |c| match &section {
-                None => Ok(sections::prepend_to_document(c, &content)),
-                Some(h) => sections::prepend_to_section(c, h, &content).map_err(section_error),
+                None => Ok(compose::prepend_to_document(c, &content)),
+                Some(h) => compose::prepend_to_section(c, h, &content).map_err(section_error),
             })
             .map(|()| WikiReply::Done),
-        WikiRequest::New { path, content, by } => if path.ends_with(".md") {
-            let content = content.unwrap_or_else(|| default_document(&path));
+        WikiRequest::New {
+            path,
+            content,
+            title,
+            by,
+        } => if path.ends_with(".md") {
+            let content = new_document(&path, content.as_deref(), title.as_deref());
             svc.create_document(&path, &content, source(by))
         } else {
-            svc.create_folder(&path, source(by))
+            svc.create_folder(&path, source(by)).and_then(|()| match content.filter(|c| !c.trim().is_empty()) {
+                Some(description) => describe_folder(svc, &path, description.trim(), source(by)),
+                None => Ok(()),
+            })
         }
         .map(|()| WikiReply::Done),
         WikiRequest::Move { from, to, by } => svc.rename(&from, &to, source(by)).map(|()| WikiReply::Done),
         WikiRequest::Copy { from, to, by } => svc.copy(&from, &to, source(by)).map(|()| WikiReply::Done),
         WikiRequest::Remove { path, section, by } => match section {
             None => svc.remove(&path, source(by)),
-            Some(h) => svc.update(&path, source(by), |c| sections::remove_section(c, &h).map_err(section_error)),
+            Some(h) => svc.update(&path, source(by), |c| compose::remove_section(c, &h).map_err(section_error)),
         }
         .map(|()| WikiReply::Done),
         WikiRequest::Search { query, folder, regex } => search(svc.root(), &query, folder, regex).map(WikiReply::Matches),
+        WikiRequest::List { path } => list(svc.root(), path.as_deref().unwrap_or("")).map(WikiReply::Entries),
+        WikiRequest::Tasks { path, section, pending } => {
+            tasks(svc, &path, section.as_deref(), pending).map(WikiReply::Tasks)
+        }
+        WikiRequest::SetTask {
+            path,
+            text,
+            section,
+            checked,
+            by,
+        } => svc
+            .update(&path, source(by), |c| set_task(c, &text, section.as_deref(), checked))
+            .map(|()| WikiReply::Done),
+        WikiRequest::Diff { path } => svc.diff(path.as_deref()).map(WikiReply::Text),
+        WikiRequest::Log { path, limit } => svc.log(path.as_deref(), limit).map(|commits| {
+            WikiReply::Log(
+                commits
+                    .into_iter()
+                    .map(|c| WikiCommit {
+                        sha: c.sha,
+                        author: c.author,
+                        date: c.date,
+                        subject: c.subject,
+                        paths: c.paths,
+                    })
+                    .collect(),
+            )
+        }),
+        WikiRequest::Open { path } => open(svc, project, path),
         WikiRequest::Sync(op) => {
             match op {
                 SyncOp::Now => {
@@ -351,26 +402,210 @@ fn section_error(e: shelbi_wiki::markdown::MarkdownError) -> OpError {
     use shelbi_wiki::markdown::MarkdownError;
     match e {
         MarkdownError::SectionNotFound(h) => OpError::NotFound(format!("section `{h}`")),
+        MarkdownError::TaskNotFound(t) => OpError::NotFound(format!("a task matching `{t}`")),
         other => OpError::Invalid(other.to_string()),
     }
 }
 
-fn append_to_document(content: &str, addition: &str) -> String {
-    let mut out = content.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(addition);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+/// A new document's text: `content` under `# <title>` (the title from the
+/// file name when none is given), unless `content` has an H1 of its own.
+fn new_document(path: &str, content: Option<&str>, title: Option<&str>) -> String {
+    let title = title.map(str::to_string).unwrap_or_else(|| {
+        let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        shelbi_wiki::fs::paths::humanize_folder_name(&stem)
+    });
+    shelbi_wiki::markdown::compose::render_new_document(&title, content.unwrap_or(""))
 }
 
-/// A new document with no content gets a title from its file name.
-fn default_document(path: &str) -> String {
-    let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    format!("# {}\n", shelbi_wiki::fs::paths::humanize_folder_name(&stem))
+/// Give a folder a description: its `.contextstore/settings.yml`, as
+/// ContextStore writes it.
+fn describe_folder(svc: &WikiService, path: &str, description: &str, by: ChangeSource) -> Result<(), OpError> {
+    use shelbi_wiki::fs::settings::{ProjectSettings, ProjectSettingsFile};
+    let name = path.trim_matches('/').rsplit('/').next().unwrap_or(path).to_string();
+    let file = ProjectSettingsFile::current(ProjectSettings {
+        name,
+        icon: None,
+        description: Some(description.to_string()),
+    });
+    let yaml = yaml_serde::to_string(&file).map_err(|e| OpError::Failed(e.to_string()))?;
+    svc.write(&format!("{}/.contextstore/settings.yml", path.trim_matches('/')), &yaml, by)
+}
+
+/// Check or uncheck the one task matching `needle` (in `section` when
+/// given), as `cstore check` does: the match is made within the section,
+/// the toggle on the whole document by the matched task's full text.
+fn set_task(content: &str, needle: &str, section: Option<&str>, checked: bool) -> Result<String, OpError> {
+    use shelbi_wiki::markdown::{sections, tasks, MarkdownError};
+    let needle = match section {
+        None => needle.to_string(),
+        Some(h) => {
+            let scoped = sections::read_section(content, h).map_err(section_error)?;
+            let lowered = needle.to_lowercase();
+            let found: Vec<tasks::Task> =
+                tasks::list(&scoped).into_iter().filter(|t| t.text.to_lowercase().contains(&lowered)).collect();
+            match found.len() {
+                0 => return Err(section_error(MarkdownError::TaskNotFound(needle.to_string()))),
+                1 => found[0].text.clone(),
+                count => {
+                    return Err(section_error(MarkdownError::AmbiguousTask {
+                        needle: needle.to_string(),
+                        count,
+                    }))
+                }
+            }
+        }
+    };
+    let out = if checked {
+        tasks::check(content, &needle)
+    } else {
+        tasks::uncheck(content, &needle)
+    };
+    out.map(|mut o| {
+        if content.ends_with('\n') && !o.ends_with('\n') {
+            o.push('\n');
+        }
+        o
+    })
+    .map_err(section_error)
+}
+
+/// The tasks of the document at `path`, or of every document directly in
+/// the folder at `path`, with document line numbers.
+fn tasks(svc: &WikiService, path: &str, section: Option<&str>, pending: bool) -> Result<Vec<WikiTask>, OpError> {
+    use shelbi_wiki::markdown::sections;
+    let abs = svc.resolve_path(path)?;
+    let root = svc.root();
+    let docs: Vec<String> = if abs.is_dir() {
+        let folder_name = abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        shelbi_wiki::model::list_documents(&abs, root, &folder_name)
+            .map_err(|e| OpError::Failed(e.to_string()))?
+            .into_iter()
+            .map(|d| relative(root, &d.path))
+            .collect()
+    } else {
+        vec![path.trim_matches('/').to_string()]
+    };
+    let folder_mode = abs.is_dir();
+    let mut out = Vec::new();
+    for doc in docs {
+        let content = svc.read(&doc)?;
+        let (text, offset) = match section {
+            None => (content.clone(), 0),
+            Some(h) => match sections::find_section(&content, h) {
+                Ok(found) => (sections::read_section(&content, h).map_err(section_error)?, found.start_line - 1),
+                // Across a folder, a document without the section has none
+                // of its tasks.
+                Err(_) if folder_mode => continue,
+                Err(e) => return Err(section_error(e)),
+            },
+        };
+        for task in shelbi_wiki::markdown::tasks::list(&text) {
+            if pending && task.checked {
+                continue;
+            }
+            out.push(WikiTask {
+                path: doc.clone(),
+                line: task.line + offset,
+                checked: task.checked,
+                text: task.text,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Announce that someone wants to see the wiki at `path`.
+fn open(svc: &WikiService, project: Option<&str>, path: Option<String>) -> Result<WikiReply, OpError> {
+    let path = path.map(|p| p.trim_matches('/').to_string()).filter(|p| !p.is_empty());
+    if let Some(p) = &path {
+        if !svc.resolve_path(p)?.exists() {
+            return Err(OpError::NotFound(p.clone()));
+        }
+    }
+    if let Some(project) = project {
+        shelbi_state::publish_change(shelbi_state::ChangeNotification::WikiOpen {
+            project: project.to_string(),
+            path,
+        });
+    }
+    Ok(WikiReply::Done)
+}
+
+fn relative(root: &Path, abs: &Path) -> String {
+    abs.strip_prefix(root).unwrap_or(abs).to_string_lossy().replace('\\', "/")
+}
+
+/// One folder's entries (its subfolders, then its documents, each with its
+/// counts), or a document's headings when `under` is a document.
+pub fn list(root: &Path, under: &str) -> Result<Vec<WikiEntry>, OpError> {
+    use shelbi_wiki::markdown::compose;
+    let under = under.trim_matches('/');
+    let fail = |e: shelbi_wiki::fs::FsError| OpError::Failed(e.to_string());
+    let abs = if under.is_empty() {
+        root.to_path_buf()
+    } else {
+        shelbi_wiki::fs::paths::resolve_in_space(root, under).map_err(|e| OpError::Invalid(e.to_string()))?
+    };
+    if abs.is_file() {
+        let content = std::fs::read_to_string(&abs).map_err(|e| OpError::Failed(e.to_string()))?;
+        return Ok(compose::section_counts(&content)
+            .into_iter()
+            .map(|s| WikiEntry {
+                kind: EntryKind::Section,
+                name: s.heading,
+                path: under.to_string(),
+                title: s.text,
+                level: s.level,
+                lines: s.lines,
+                words: s.words,
+                bytes: 0,
+                documents: 0,
+            })
+            .collect());
+    }
+    if !abs.is_dir() {
+        return Err(OpError::NotFound(under.to_string()));
+    }
+    let folder_name = if under.is_empty() {
+        shelbi_wiki::fs::settings::load_space_settings(root)
+            .map(|s| s.name)
+            .unwrap_or_default()
+    } else {
+        abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for folder in shelbi_wiki::fs::tree::build_children(root, Some(root), under).map_err(fail)? {
+        let documents = shelbi_wiki::model::list_documents(&folder.path, root, &folder.name)
+            .map(|d| d.len())
+            .unwrap_or(0);
+        out.push(WikiEntry {
+            kind: EntryKind::Folder,
+            title: folder.name.clone(),
+            name: folder.name,
+            path: folder.relative_path,
+            level: 0,
+            lines: 0,
+            words: 0,
+            bytes: 0,
+            documents,
+        });
+    }
+    for doc in shelbi_wiki::model::list_documents(&abs, root, &folder_name).map_err(fail)? {
+        let content = std::fs::read_to_string(&doc.path).unwrap_or_default();
+        let counts = compose::counts(&content);
+        out.push(WikiEntry {
+            kind: EntryKind::Document,
+            name: doc.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            path: relative(root, &doc.path),
+            title: doc.title,
+            level: 0,
+            lines: counts.lines,
+            words: counts.words,
+            bytes: counts.bytes,
+            documents: 0,
+        });
+    }
+    Ok(out)
 }
 
 /// The wire form of a service's status.
@@ -695,7 +930,41 @@ mod tests {
     }
 
     #[test]
+    fn a_task_is_toggled_by_its_text_within_a_section() {
+        let doc = "# T\n\n## A\n\n- [ ] Ship\n\n## B\n\n- [ ] Ship docs\n";
+        assert_eq!(
+            set_task(doc, "ship", Some("## B"), true).unwrap(),
+            "# T\n\n## A\n\n- [ ] Ship\n\n## B\n\n- [x] Ship docs\n"
+        );
+        assert!(matches!(set_task(doc, "ship", None, true), Err(OpError::Invalid(_))), "two match");
+        assert!(matches!(set_task(doc, "nope", None, true), Err(OpError::NotFound(_))));
+        assert!(matches!(set_task(doc, "x", Some("## C"), true), Err(OpError::NotFound(_))));
+    }
+
+    #[test]
+    fn list_answers_folders_documents_and_headings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Plans/Old")).unwrap();
+        std::fs::write(root.join("Plans/Old/x.md"), "# X\n").unwrap();
+        std::fs::write(root.join("Plans/b.md"), "# Bee\n\n## One\n\ntwo words\n").unwrap();
+        std::fs::write(root.join("Plans/a.md"), "# Ay\n").unwrap();
+        let entries = list(root, "Plans/").unwrap();
+        let shape: Vec<(EntryKind, &str)> = entries.iter().map(|e| (e.kind, e.path.as_str())).collect();
+        assert_eq!(
+            shape,
+            vec![(EntryKind::Folder, "Plans/Old"), (EntryKind::Document, "Plans/a.md"), (EntryKind::Document, "Plans/b.md")]
+        );
+        assert_eq!(entries[0].documents, 1);
+        assert_eq!((entries[2].title.as_str(), entries[2].words), ("Bee", 6));
+        let headings = list(root, "Plans/b.md").unwrap();
+        assert_eq!(headings.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["# Bee", "## One"]);
+        assert!(matches!(list(root, "Nope"), Err(OpError::NotFound(_))));
+    }
+
+    #[test]
     fn a_new_document_is_titled_from_its_file_name() {
-        assert_eq!(default_document("Plans/wiki-sync.md"), "# Wiki Sync\n");
+        assert_eq!(new_document("Plans/wiki-sync.md", None, None), "# Wiki Sync\n");
+        assert_eq!(new_document("Plans/a.md", Some("Body."), Some("API")), "# API\n\nBody.\n");
     }
 }
