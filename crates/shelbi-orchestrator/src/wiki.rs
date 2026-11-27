@@ -972,6 +972,28 @@ mod tests {
     }
 
     #[test]
+    fn the_tree_carries_a_folders_emoji_icon() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Research/.contextstore")).unwrap();
+        std::fs::create_dir_all(root.join("Plans")).unwrap();
+        std::fs::write(
+            root.join("Research/.contextstore/settings.yml"),
+            "version: 1\nproject:\n  name: Research\n  icon: \"🔬\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Research/a.md"), "# A\n").unwrap();
+        let nodes = tree(root, "").unwrap();
+        let icon = |path: &str| nodes.iter().find(|n| n.path == path).and_then(|n| n.icon.clone());
+        assert_eq!(icon("Research").as_deref(), Some("🔬"));
+        assert_eq!(icon("Plans"), None);
+        // An answer without icons (an older hub's) still reads.
+        let old = r#"{"path":"Plans","name":"Plans","title":"Plans","kind":"Folder","children":[]}"#;
+        let node: WikiNode = serde_json::from_str(old).unwrap();
+        assert_eq!(node.icon, None);
+    }
+
+    #[test]
     fn a_new_document_is_titled_from_its_file_name() {
         assert_eq!(new_document("Plans/wiki-sync.md", None, None), "# Wiki Sync\n");
         assert_eq!(new_document("Plans/a.md", Some("Body."), Some("API")), "# API\n\nBody.\n");

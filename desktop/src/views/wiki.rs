@@ -300,11 +300,6 @@ impl WikiView {
         &self.tree
     }
 
-    #[cfg(any(test, feature = "visual-check"))]
-    pub fn status(&self) -> Option<&Result<WikiStatus, String>> {
-        self.status.as_ref()
-    }
-
     /// The document shown in the main area.
     pub fn open_path(&self) -> Option<&str> {
         self.open.as_deref()
@@ -315,40 +310,31 @@ impl WikiView {
         self.tree.expanded().map(str::to_string).collect()
     }
 
-    #[cfg(any(test, feature = "visual-check"))]
+    #[cfg(test)]
     pub fn menu(&self) -> Option<&Menu> {
         self.menu.as_ref()
     }
 
-    #[cfg(any(test, feature = "visual-check"))]
-    pub fn undo(&self) -> Option<&Undo> {
-        self.undo.as_ref()
-    }
-
-    #[cfg(any(test, feature = "visual-check"))]
+    #[cfg(test)]
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }
 
     /// The path a rename in place is open on.
-    #[cfg(any(test, feature = "visual-check"))]
+    #[cfg(test)]
     pub fn renaming(&self) -> Option<&str> {
         self.rename.as_ref().map(|r| r.path.as_str())
+    }
+
+    /// Ask `ask` from now on (a test's hub that changes its answers).
+    #[cfg(test)]
+    pub fn set_ask_for_test(&mut self, ask: Ask) {
+        self.ask = ask;
     }
 
     #[cfg(test)]
     pub fn rename_input(&self) -> Option<Entity<InputState>> {
         self.rename.as_ref().map(|r| r.input.clone())
-    }
-
-    #[cfg(test)]
-    pub fn filter_input(&self) -> Entity<InputState> {
-        self.filter.clone()
-    }
-
-    #[cfg(test)]
-    pub fn drop_target(&self) -> Option<&(String, DropAt)> {
-        self.drop_target.as_ref()
     }
 
     /// The Wiki is shown: read the status and the tree, follow the hub's
@@ -368,7 +354,7 @@ impl WikiView {
         self.live = None;
     }
 
-    #[cfg(any(test, feature = "visual-check"))]
+    #[cfg(test)]
     pub fn is_shown(&self) -> bool {
         self.shown
     }
@@ -471,8 +457,9 @@ impl WikiView {
                 this.read_tree(window, cx);
                 this.last_active = None;
             }
-            if !set_up && this.setup.config().is_none() {
+            if !set_up && this.setup.config().is_none() && !this.setup.work_due() {
                 this.setup.visit();
+                this.run_setup(window, cx);
             }
         });
     }
@@ -678,11 +665,7 @@ impl WikiView {
         });
         let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { .. } => this.commit_rename(window, cx),
-            InputEvent::Blur => {
-                if this.rename.is_some() {
-                    this.commit_rename(window, cx)
-                }
-            }
+            InputEvent::Blur if this.rename.is_some() => this.commit_rename(window, cx),
             _ => {}
         });
         input.update(cx, |s, cx| s.focus(window, cx));
@@ -1343,7 +1326,7 @@ impl WikiView {
                 .border_color(theme.divider)
                 .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).child(title))
                 .child(div().type_style(Type::Small).text_color(theme.muted).child(detail))
-                .child(div().pt(px(4.0)).child(button))
+                .child(div().flex().flex_row().pt(px(4.0)).child(button))
         };
         let status = if self.setup.setting_up() {
             Some(("Setting up…".to_string(), theme.icon_yellow))
@@ -1555,6 +1538,7 @@ impl WikiView {
                 .top_0()
                 .bottom_0()
                 .left(px(PAD_X + 6.0 + 7.5 + level as f32 * INDENT))
+                .debug_selector(move || format!("wiki-guide-{level}"))
                 .w(px(1.0))
                 .bg(theme.divider)
         });
@@ -1632,7 +1616,7 @@ impl WikiView {
             .when_some(fill, |d, f| d.bg(f))
             .when(fill.is_none(), |d| d.hover(|s| s.bg(theme.nested(theme.background_hover))))
             .when(drop_edge == Some(DropAt::Into), |d| d.bg(theme.accent.opacity(0.18)))
-            .children(guides.map(|g| g.ml(px(-(PAD_X + 6.0 + row.depth as f32 * INDENT)))))
+            .children(guides)
             .when(selected, |d| d.child(div().debug_selector(|| "wiki-selection".into()).absolute().size_0()))
             .when(open, |d| d.child(div().debug_selector(|| "wiki-open-row".into()).absolute().size_0()))
             .child(chevron)
@@ -1962,26 +1946,29 @@ impl Render for WikiView {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// A fake hub for the tests and the visual check: a wiki in memory.
+#[cfg(any(test, feature = "visual-check"))]
+pub(crate) mod fake {
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
-    use shelbi_app::wiki::{SyncState, WikiNode};
-
-    use super::*;
+    use shelbi_app::settings::wiki::Ask;
+    use shelbi_app::wiki::{NodeKind, SyncState, WikiNode, WikiReply, WikiRequest, WikiStatus};
+    use shelbi_app::wiki_tree_edit as edit;
 
     /// A hub over a flat list of entries (`Plans/a.md`, `Plans`), answering
     /// what the Wiki asks and recording it.
+    /// An entry: folder?, title, text.
+    type Entry = (bool, String, String);
+
     #[derive(Default)]
     pub(crate) struct FakeHub {
         pub status: Option<WikiStatus>,
         /// path → (folder?, title, text).
-        pub entries: BTreeMap<String, (bool, String, String)>,
+        pub entries: BTreeMap<String, Entry>,
         pub icons: BTreeMap<String, String>,
         pub asked: Vec<WikiRequest>,
-        trashed: Vec<(String, Vec<(String, (bool, String, String))>)>,
+        trashed: Vec<Vec<(String, Entry)>>,
     }
 
     impl FakeHub {
@@ -2042,6 +2029,11 @@ pub(crate) mod tests {
                 .collect()
         }
 
+        #[cfg(test)]
+        pub(crate) fn answer_for_test(&mut self, req: WikiRequest) -> WikiReply {
+            self.answer(req)
+        }
+
         fn answer(&mut self, req: WikiRequest) -> WikiReply {
             self.asked.push(req.clone());
             let Some(status) = self.status.clone() else {
@@ -2072,16 +2064,20 @@ pub(crate) mod tests {
                     WikiReply::Done
                 }
                 WikiRequest::Trash { path, .. } => {
-                    let gone: Vec<_> = self.under(&path).into_iter().map(|p| {
-                        let e = self.entries.remove(&p).unwrap();
-                        (p, e)
-                    }).collect();
-                    self.trashed.push((path, gone));
+                    let gone: Vec<_> = self
+                        .under(&path)
+                        .into_iter()
+                        .map(|p| {
+                            let e = self.entries.remove(&p).unwrap();
+                            (p, e)
+                        })
+                        .collect();
+                    self.trashed.push(gone);
                     WikiReply::Trashed { token: format!("t{}", self.trashed.len()) }
                 }
                 WikiRequest::Untrash { token, .. } => {
                     let ix: usize = token[1..].parse().unwrap();
-                    for (p, e) in self.trashed[ix - 1].1.clone() {
+                    for (p, e) in self.trashed[ix - 1].clone() {
                         self.entries.insert(p, e);
                     }
                     WikiReply::Done
@@ -2095,6 +2091,16 @@ pub(crate) mod tests {
         let hub = hub.clone();
         Arc::new(move |req| hub.lock().unwrap().answer(req))
     }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::Mutex;
+
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+
+    pub(crate) use super::fake::{ask_of, FakeHub};
+    use super::*;
 
     struct T {
         cx: VisualTestContext,
@@ -2432,6 +2438,9 @@ pub(crate) mod tests {
         assert!(t.drawn("wiki-setup-folder"));
         assert!(t.drawn("wiki-tree-empty"));
         assert!(!t.drawn("wiki-new-document"), "nothing to add to yet");
+        // The project's config reads (a test home has none: an unreadable
+        // config leaves the buttons off rather than guessing).
+        assert!(t.read(|v| v.setup.loaded() || v.setup.unreadable().is_some()));
     }
 
     #[test]

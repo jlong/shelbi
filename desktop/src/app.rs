@@ -4778,9 +4778,10 @@ impl ShelbiWindow {
         if let Some(tap) = &self.tap {
             tap.borrow_mut().push(HostCall::ShowView(view.clone()));
             self.set_route(Route::View);
-            if workspace_name(self.client.view()).is_some() {
-                // Leaving a workspace: the main area (and so the column)
-                // moves off it, though the view itself is only recorded.
+            if workspace_name(self.client.view()).is_some() || matches!(self.client.view(), View::Wiki) {
+                // Leaving a workspace (or the Wiki): the main area (and so
+                // the column) moves off it, though the view itself is only
+                // recorded.
                 self.client.set_view(view.clone());
             }
             self.sync_chat(window, cx);
@@ -8565,6 +8566,10 @@ mod sidebar_tests;
 mod settings_tests;
 
 #[cfg(test)]
+#[path = "app_wiki_tests.rs"]
+mod wiki_tests;
+
+#[cfg(test)]
 #[path = "app_feedback_tests.rs"]
 mod feedback_tests;
 
@@ -8627,13 +8632,13 @@ mod image_menu_tests;
 /// The Jobs and Reminders screen's pieces, for tests and the visual check.
 #[cfg(any(test, feature = "visual-check"))]
 impl ShelbiWindow {
-    /// The Jobs and Reminders screen, once shown.
-    #[cfg(test)]
     /// The Wiki, once shown.
     pub(crate) fn offscreen_wiki(&self) -> Option<Entity<WikiView>> {
         self.wiki.clone()
     }
 
+    /// The Jobs and Reminders screen, once shown.
+    #[cfg(test)]
     pub(crate) fn offscreen_jobs_reminders(&self) -> Option<Entity<JobsRemindersView>> {
         self.jobs_reminders.clone()
     }

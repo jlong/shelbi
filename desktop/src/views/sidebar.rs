@@ -1978,6 +1978,7 @@ mod tests {
         assert_eq!(nav_icon(&View::Session("orch".into())), icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS);
         assert_eq!(nav_icon(&View::Issues), icons::RECTANGLE_STACK);
         assert_eq!(nav_icon(&View::Changelog), icons::ROCKET_LAUNCH);
+        assert_eq!(nav_icon(&View::Wiki), icons::BOOK_OPEN);
         assert_eq!(nav_icon(&View::Activity), icons::BOLT);
         assert_eq!(nav_icon(&View::Jobs), icons::QUEUE_LIST);
         assert_eq!(nav_icon(&View::Reminders), icons::CLOCK);

@@ -1392,6 +1392,94 @@ impl Run {
         self.save(handle, "jobs-empty");
     }
 
+    /// The Wiki (no Figma frame; checked by eye), over a fake hub
+    /// ([`crate::views::wiki::fake::FakeHub`]): `wiki` with the tree pushed
+    /// into the column and a plan open beside it; `wiki-menu` with a row's
+    /// context menu; `wiki-rename` renaming a document in place;
+    /// `wiki-undo` after a delete; `wiki-setup` for a project with no wiki.
+    /// `SHELBI_VISUAL_ONLY=wiki` renders just these.
+    fn wiki(&mut self) {
+        use crate::views::wiki::fake::{ask_of, FakeHub};
+        use crate::views::wiki::{MenuAction, WikiPorts};
+        use std::sync::{Arc, Mutex};
+        let hub = |set_up: bool| {
+            let mut hub = FakeHub::sample();
+            hub.entries.insert("Plans/wiki.md".into(), (false, "Wiki".into(), "# Wiki\n".into()));
+            hub.entries.insert("Research/implicit-state-machines.md".into(), (false, "Implicit state machines".into(), "# Implicit state machines\n".into()));
+            hub.entries.get_mut("Plans/opencode-integration.md").unwrap().2 = "# OpenCode integration\n\n## Context\n\nOpenCode is a terminal coding agent. Shelbi runs it like Claude Code and Codex: in its own session, with the shared preamble and the project's skills.\n\n## Goals\n\n- [x] Launch OpenCode from a workspace\n- [ ] Awareness events from its plugin\n- [ ] Usage-limit detection\n\n## Decisions\n\n1. The config layer lives in `.shelbi/opencode/`.\n2. Models come from the user's own OpenCode config.\n".into();
+            if !set_up {
+                hub.status = Some(shelbi_app::wiki::WikiStatus::not_set_up());
+            }
+            Arc::new(Mutex::new(hub))
+        };
+        let ports = |hub: &Arc<Mutex<FakeHub>>| WikiPorts {
+            ask: ask_of(hub),
+            store: shelbi_app::settings::store::Disk::store(PROJECT),
+        };
+        let open_wiki = |this: &mut Self, hub: &Arc<Mutex<FakeHub>>| {
+            let ports = ports(hub);
+            this.cx.update(|cx| cx.set_global(ports));
+            let handle = this.open();
+            this.click(handle, View::Wiki);
+            let wiki = handle.update(&mut this.cx, |w, _, _| w.offscreen_wiki()).unwrap().expect("the Wiki");
+            let loaded = this.wait(handle, Duration::from_secs(10), |cx| wiki.read_with(cx, |v, _| v.tree().is_loaded()));
+            (handle, wiki, loaded)
+        };
+
+        let h = hub(true);
+        let (handle, wiki, loaded) = open_wiki(self, &h);
+        self.expect("wiki: the tree loads", loaded);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/Archive/old.md", window, cx);
+                    v.reveal("Plans/opencode-integration.md", window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki");
+
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/opencode-integration.md", window, cx);
+                    v.open_menu(Some("Plans/awareness-v2.md".into()), gpui::point(px(150.0), px(170.0)), window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-menu");
+
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/awareness-v2.md", window, cx);
+                    v.open_menu(Some("Plans/awareness-v2.md".into()), gpui::point(px(150.0), px(170.0)), window, cx);
+                    v.menu_action(MenuAction::Rename, window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-rename");
+
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| v.delete("Plans/wiki.md", window, cx));
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-undo");
+
+        let (handle, _, _) = open_wiki(self, &hub(false));
+        self.settle(handle);
+        self.save(handle, "wiki-setup");
+        self.cx.update(|cx| cx.remove_global::<WikiPorts>());
+    }
+
     /// The Reminders screen (no Figma frame; checked by eye), pinned at 3 PM:
     /// `reminders` with five pending reminders (Next up in 12m, two more
     /// today, one of them repeating, one tomorrow, one later in the week)
@@ -3692,6 +3780,11 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "reminders") {
             self.reminders();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "wiki") {
+            self.wiki();
             return;
         }
 
