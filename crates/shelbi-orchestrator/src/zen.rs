@@ -12884,6 +12884,77 @@ mod probe_tests {
     }
 
     #[test]
+    fn probe_behind_but_clean_branch_reports_no_rebase_conflict() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        // Regression (zen-probe-false-rebase-conflict): main moved by one
+        // commit touching none of the branch's files. The branch is one
+        // behind and one ahead, and rebases cleanly, so neither conflict
+        // probe may fire.
+        let (base, origin, wt) = setup_origin_and_worktree();
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        detach_for_handoff(&wt, "shelbi/task1");
+        advance_origin_main(base.path(), &origin, "unrelated merge", |r| {
+            std::fs::write(r.join("other.txt"), "other\n").unwrap();
+        });
+
+        let project = probe_project(base.path(), &["true"]);
+        let task = probe_task("shelbi/task1");
+        for policy in [RebasePolicy::AsIs, RebasePolicy::RebaseOntoDefault] {
+            if policy == RebasePolicy::AsIs {
+                // AsIs never fetches; give the local base the moved tip.
+                run_git(&wt, &["fetch", "-q", "origin", "main:main"]);
+            }
+            let report = probe_in_workflow(&project, None, &task, "shelbi/task1", policy)
+                .unwrap_or_else(|e| panic!("{policy:?} probe failed: {e}"));
+            assert!(
+                !report.rebase_conflict.conflicts && report.rebase_conflict.files.is_empty(),
+                "{policy:?}: clean rebase expected, got {:?}",
+                report.rebase_conflict
+            );
+            assert!(!report.merge_conflict.conflicts, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn probe_surfaces_non_conflict_rebase_failure_as_an_error() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        // Regression (zen-probe-false-rebase-conflict): the rebase fails
+        // because commit signing can't run, not because of a conflict. The
+        // probe must name that reason, not report `conflicts: true` with no
+        // files.
+        let (base, origin, wt) = setup_origin_and_worktree();
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        detach_for_handoff(&wt, "shelbi/task1");
+        advance_origin_main(base.path(), &origin, "unrelated merge", |r| {
+            std::fs::write(r.join("other.txt"), "other\n").unwrap();
+        });
+        run_git(&wt, &["config", "commit.gpgsign", "true"]);
+        run_git(&wt, &["config", "gpg.format", "openpgp"]);
+        run_git(&wt, &["config", "gpg.program", "false"]);
+
+        let project = probe_project(base.path(), &["true"]);
+        let task = probe_task("shelbi/task1");
+        let err = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .expect_err("a signing failure must not produce a report");
+        let msg = err.to_string();
+        assert!(msg.contains("rebase_failed:"), "unexpected error: {msg}");
+    }
+
+    #[test]
     fn probe_reports_rebase_conflict_and_skips_checks() {
         let _lock = crate::test_lock::acquire();
         let _home = ProbeHomeGuard::install();
