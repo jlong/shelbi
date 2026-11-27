@@ -42,8 +42,10 @@ Three other things shape the agent:
 
 - **`agents/_shared/preamble.md`** is prepended to *every* agent in the
   project, so the rendered prompt the runner sees is the preamble followed
-  by this agent's `instructions.md`. The shipped preamble holds only hub
-  safety rules. Put your repo layout, house style, and test command there.
+  by this agent's `instructions.md`. The shipped preamble holds hub safety
+  rules and short sections on [jobs](/docs/cli/job) and the
+  [wiki](/docs/concepts/wiki). Put your repo layout, house style, and test
+  command there.
 - **`agent.yaml`** (optional; `shelbi agent new` doesn't create one) sets
   the agent's description, preferred runner, per-runner model and
   reasoning effort, and permission mode. You can also edit these in

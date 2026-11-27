@@ -128,7 +128,7 @@ cleanup_staged_asset() {
   fi
 }
 trap cleanup_staged_asset EXIT
-for plugin in update-shelbi-configuration shelbi-awareness; do
+for plugin in update-shelbi-configuration shelbi-awareness shelbi-wiki; do
   ASSET_ROOT="$PLUGIN_PARENT/$plugin"
   echo "==> installing system plugin to $ASSET_ROOT"
   STAGED_ASSET_ROOT="$(mktemp -d "$PLUGIN_PARENT/.$plugin.XXXXXX")"

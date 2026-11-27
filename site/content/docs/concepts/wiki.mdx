@@ -1,0 +1,143 @@
+---
+title: Wiki
+order: 20.2
+summary: Each project's wiki is a folder of Markdown documents for its plans, designs and decisions. The hub keeps it in sync, every agent knows how to read and write it, and both apps show it.
+---
+
+A project's **Wiki** holds the writing that belongs beside the code but not in
+it: plans, designs, specs, research, decisions and notes on how the project
+works. It is a folder of Markdown documents, shared by you and every agent on
+the project. You browse and edit it in the TUI and the desktop app; agents read
+and write it with [`shelbi wiki`](/docs/cli/wiki).
+
+The hub keeps it. Every change, yours or an agent's, is committed a few seconds
+later and pushed, and every client showing the wiki refreshes, so a plan the
+orchestrator writes is on your screen as soon as it's saved.
+
+## Where it lives
+
+A project's wiki has one source, set by the `wiki:` block of its
+[project YAML](/docs/configuration/project):
+
+```yaml
+wiki:
+  source: branch        # branch | folder
+  branch: docs/planning # for source: branch
+  path: docs            # for source: folder, relative to the repo root
+  sync: auto            # auto | manual
+```
+
+- **`branch`** (the default): an orphan branch of the project repo,
+  `docs/planning` unless you name another. It shares no history with your code
+  and never touches your working tree. The hub checks it out once, as a
+  worktree of its own at `~/.shelbi/projects/<project>/wiki/`, outside every
+  workspace. When the branch doesn't exist yet, locally or on `origin`, the hub
+  creates it with a starter `README.md` and settings.
+- **`folder`**: a folder of the main repo, `docs/` unless you name another.
+  The wiki shows that folder as it is on your base branch plus the edits not
+  merged yet. Edits are committed to one rolling branch, `shelbi/wiki-docs`,
+  and ride one pull request into the base branch that Shelbi keeps open and up
+  to date. Merge it to land them; the next edit after that opens a new one.
+
+A project with no `wiki:` block has no wiki until you ask for one: open the
+Wiki in either app and confirm, or run `shelbi wiki init`. It then gets
+`branch` mode on `docs/planning`.
+
+## The format
+
+A wiki is the same folder a ContextStore space is, so either one opens it:
+
+- **Documents** are `.md` files in folders. A document's title is its first
+  `#` heading (its file name when it has none), and its path is its identity:
+  `Plans/auth.md`. Frontmatter is optional.
+- **`.contextstore/settings.yml`** (committed) holds the wiki's name and its
+  folder order. A folder can have its own `.contextstore/settings.yml` with a
+  name, an icon and a description. `.contextstore/settings.local.yml` is
+  per-machine and ignored by git.
+- **`.csignore`** lists files the wiki doesn't show, in `.gitignore` syntax.
+
+Folders sort by the order saved in the settings, then by name. Documents sort
+with the pinned ones first (one named after its folder, then `README.md`, then
+`index.md` or `overview.md`) and the rest by name. Renaming a document's title
+renames its file when the wiki's settings say so, except for `README.md`,
+`AGENTS.md`, `CLAUDE.md` and `index.md`.
+
+## Sync
+
+The hub runs one sync per project, so it works the same whether an app is open
+or not, and the TUI, the desktop app, the CLI and every agent all see one
+state.
+
+- **Writes go through the hub.** The apps, the CLI and agents all send their
+  changes to the hub, which is the wiki's only writer. The hub also watches
+  the wiki's folder, so an edit you make there with your own editor is picked
+  up too.
+- **Commit**: 5 seconds after the last change, with a message naming what
+  changed ("Add auth.md; Update roadmap.md"), signed when your git config signs
+  commits. It uses your own `git`, SSH keys and credentials.
+- **Pull and push**: right after each commit, every 30 seconds while an app has
+  the Wiki open, and every 5 minutes otherwise. A pull fast-forwards when it
+  can and merges when it can't, resolving Markdown edits to different parts of
+  a document on its own.
+- **Conflicts**: a document the merge can't resolve is held. Sync leaves it
+  alone, both apps show a notice, and you pick your version, theirs, or a mix
+  of the two, hunk by hunk. The resolution is committed as "Resolve merge
+  conflicts".
+- **Manual sync**: with `sync: manual` the hub commits, pulls and pushes only
+  when asked (`shelbi wiki sync now`, or **Sync now** in the apps).
+
+The status is one of `synced`, `syncing`, `pending` (changes not yet
+committed or pushed), `offline`, `conflict` or `error`. The apps show it at
+the foot of the Wiki's sidebar; `shelbi wiki sync` prints it. Each change also
+writes a `wiki_changed` line to the [events log](/docs/concepts/events-log).
+
+## In the apps
+
+The Wiki sits in the sidebar after Issues. Opening it swaps the sidebar for the
+wiki's tree of folders and documents, labeled by title, with a filter box at
+the top and the sync status at the foot. Choosing a document shows it in the
+main area.
+
+<Tui>
+
+Open it with **Wiki** in the sidebar (📖). The arrow keys move through the
+tree and open and close folders, `Enter` opens a document, `/` filters, and
+`Esc` goes back to the sidebar. A document shows as rendered Markdown; `e`
+opens it in `$EDITOR` and saves it through the hub when you quit the editor.
+
+</Tui>
+<Desktop>
+
+Open it with **Wiki** in the sidebar. The tree works like an editor's file
+tree: click or press `Enter` to open, rename in place, drag to move or reorder,
+and right-click for New Document, New Folder, Rename, Move and Delete. A
+document opens for editing in place and saves as you type. If it changes
+elsewhere while you have unsaved edits, a bar asks whether to reload it or keep
+yours.
+
+</Desktop>
+
+## Agents and the wiki
+
+Every agent knows the wiki. Shelbi gives each one, orchestrator and workers,
+on Claude Code, Codex and OpenCode alike, the **`shelbi-wiki` skill**: what the
+wiki is, when to read it, when to write it, and the `shelbi wiki` commands. The
+shipped agent preamble adds a short `## Wiki` section that points at it, and
+the orchestrator's instructions add one rule: **plans go in the wiki**, made
+with `shelbi wiki new Plans/<name>.md`, never as a file in the repo.
+
+In practice:
+
+- A worker reads the plan its task names before it starts, or searches the
+  wiki for one (`shelbi wiki search "<topic>"`).
+- The orchestrator writes the plans you ask for into `Plans/`, records your
+  decisions in them, names the plan in the issues it makes from it, and checks
+  a plan's tasks off as they land.
+- Agents edit one section at a time (`--section "## Design"`), so two writers
+  working on different parts of a document don't step on each other.
+
+The skill is reserved: a project skill named `shelbi-wiki` is replaced by
+Shelbi's. Projects created before the wiki get the preamble section and the
+orchestrator rule added on their next start, by the
+[config upgrade](/docs/concepts/config-upgrade) pass, unless their copy
+already mentions `shelbi wiki`.

@@ -62,6 +62,7 @@ pub mod submit;
 pub mod supervision;
 pub mod system_plugin;
 pub mod awareness_plugin;
+pub mod wiki_plugin;
 pub mod tracker_connect;
 pub mod transition;
 pub mod wake;
