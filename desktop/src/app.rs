@@ -3173,6 +3173,22 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// The New tab shows with nothing over it: the keyboard is its launch
+    /// screen's. Opening it gives it the keys ([`Self::open_new_tab`]), but a
+    /// path that lands them back on the window (Switch Project… from the
+    /// palette, whose close hands them to the view it opened over) would
+    /// leave ↑/↓, Return and Esc dead until a click. The palette, the tab
+    /// menu or a dialog open over it keep them where they are.
+    fn keep_new_tab_keys(&self, launch: &Entity<LaunchView>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay.is_some() || self.tab_menu.is_open() || self.modal_open() {
+            return;
+        }
+        let on_window = window.focused(cx).is_none_or(|f| f == self.focus_handle);
+        if on_window {
+            launch.update(cx, |l, cx| l.focus(window, cx));
+        }
+    }
+
     /// Close the New tab (its `×`, ⌘W on it): nothing to confirm, nothing
     /// stops, and its `×` turns back into the `+`. Selected, the window moves
     /// to its neighbor tab, else to the chooser; `or_close` closes the window
@@ -7948,6 +7964,7 @@ impl ShelbiWindow {
             // two surfaces: translucent, it paints nothing.
             .bg(theme.nested(theme.canvas));
         let shell = if let Some(launch) = self.new_tab.clone().filter(|_| self.chooser) {
+            self.keep_new_tab_keys(&launch, window, cx);
             // The New tab: the launch screen fills the window under the bar,
             // in place of the sidebar and the main area alike.
             shell.child(

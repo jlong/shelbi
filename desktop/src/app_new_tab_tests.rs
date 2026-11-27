@@ -448,3 +448,62 @@ fn a_tab_dragged_to_the_end_lands_before_the_new_tab(cx: &mut TestAppContext) {
     release_at(cx, a, past);
     assert_eq!(tabs_of(cx, a), ["beta", "alpha", NEW_TAB]);
 }
+
+#[gpui::test]
+fn switch_project_from_the_palette_gives_the_new_tab_the_keys(cx: &mut TestAppContext) {
+    let f = setup(cx);
+    let h = open(cx, &f, "alpha", 0);
+    draw(cx, h);
+    // The real dispatch, not the tap: Switch Project… runs its effect.
+    update(cx, h, |w, window, cx| {
+        w.tap = None;
+        w.open_palette(window, cx);
+    });
+    draw(cx, h);
+    // Picked as a person does: typed into the palette, then Return.
+    let mut v = vcx(cx, h);
+    v.simulate_input("switch project");
+    cx.run_until_parked();
+    draw(cx, h);
+    let top = read(cx, h, |w, _| match &w.overlay {
+        Some(ActiveOverlay::Palette { palette, .. }) => {
+            palette.results().get(palette.selected()).map(|(e, _)| e.id.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(top.as_deref(), Some("action:switch-project"), "Switch Project… is the pick");
+    let mut v = vcx(cx, h);
+    v.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    draw(cx, h);
+    assert!(on_new_tab(cx, h), "Switch Project… opened the New tab");
+    let launch = read(cx, h, |w, _| w.new_tab.clone()).unwrap();
+    let mut v = vcx(cx, h);
+    v.simulate_keystrokes("down down");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| launch.read(cx).selected()), 2, "↓ walks the rows, as after the +");
+}
+
+#[gpui::test]
+fn keys_left_on_the_window_go_back_to_the_new_tab(cx: &mut TestAppContext) {
+    let f = setup(cx);
+    let h = with_new_tab(cx, &f);
+    let launch = read(cx, h, |w, _| w.new_tab.clone()).unwrap();
+    // What a palette close does: the keys back on the window itself.
+    update(cx, h, |w, window, cx| w.focus_handle.focus(window, cx));
+    draw(cx, h);
+    let mut v = vcx(cx, h);
+    v.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| launch.read(cx).selected()), 1, "the launch screen has them again");
+    // The palette over the New tab keeps them while it's up.
+    update(cx, h, |w, window, cx| w.open_palette(window, cx));
+    draw(cx, h);
+    let window_has_keys = cx.update(|cx| h.update(cx, |w, window, _| w.focus_handle.is_focused(window)).unwrap());
+    assert!(window_has_keys, "the palette's keys stay with it");
+    let mut v = vcx(cx, h);
+    v.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| launch.read(cx).selected()), 1, "the launch screen got none of them");
+    assert!(read(cx, h, |w, _| w.overlay.is_some()));
+}
