@@ -1359,17 +1359,11 @@ fn daemon_recheck(
     }
 }
 
-/// `desktop-board-start-right-after-assign-is-refused-as-changed-elsewhere`:
-/// a card just assigned has no branch, so its first start cuts one and writes
-/// `branch:`, which moves its revision past the one the client sent (the
-/// assign's landed state). That write is the start's own, not a change made
-/// elsewhere, so the start goes on instead of being refused. The client's
-/// pre-assign view is still refused, before the start writes anything.
-#[test]
-fn start_right_after_assign_is_not_refused_for_its_own_branch_write() {
-    let _g = crate::test_lock::acquire();
-    let home = fresh_home();
-    std::env::set_var("SHELBI_HOME", &home);
+/// Project `s`: a local repo with one commit on `main` (so a start can cut a
+/// branch) and one workspace `dev`, whose runner isn't declared. The launch
+/// then fails and rolls back once a start is past its recheck, so no agent is
+/// spawned. Keep the returned repo alive for the test.
+fn startable_project() -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")
@@ -1381,8 +1375,6 @@ fn start_right_after_assign_is_not_refused_for_its_own_branch_write() {
     };
     git(&["init", "-q", "-b", "main", "."]);
     git(&["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-q", "--allow-empty", "-m", "init"]);
-    // The workspace's runner isn't declared, so the launch fails (and rolls
-    // back) once the start is past its recheck: no agent is spawned.
     std::fs::write(
         shelbi_state::projects_dir().unwrap().join("s.yaml"),
         format!(
@@ -1395,6 +1387,21 @@ fn start_right_after_assign_is_not_refused_for_its_own_branch_write() {
         ),
     )
     .unwrap();
+    repo
+}
+
+/// `desktop-board-start-right-after-assign-is-refused-as-changed-elsewhere`:
+/// a card just assigned has no branch, so its first start cuts one and writes
+/// `branch:`, which moves its revision past the one the client sent (the
+/// assign's landed state). That write is the start's own, not a change made
+/// elsewhere, so the start goes on instead of being refused. The client's
+/// pre-assign view is still refused, before the start writes anything.
+#[test]
+fn start_right_after_assign_is_not_refused_for_its_own_branch_write() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    let _repo = startable_project();
     shelbi_state::save_task("s", &task(Column::todo(), "t"), "body").unwrap();
     let read = current_state("s", "t").unwrap();
 
@@ -1446,4 +1453,98 @@ fn start_right_after_assign_is_not_refused_for_its_own_branch_write() {
 
     std::env::remove_var("SHELBI_HOME");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `start-after-move-refused-stale`: Zen's promote-then-dispatch runs
+/// `shelbi issue move <id> --to todo` and then `shelbi issue start <id>
+/// --workspace <ws>`, which reads the issue right before it sends the start.
+/// The card was never assigned and has no branch, so the start cuts one and
+/// writes `branch:` (`lifecycle::ensure_branch_for_in_progress`): that is the
+/// write that moved the revision 1-2s after the move (the branch cut is the
+/// slow part), and before #2440 the late recheck took it for a change made
+/// elsewhere. A real change made after the client's read is still refused,
+/// before the start writes anything.
+#[test]
+fn start_right_after_move_is_not_refused_for_its_own_branch_write() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    let _repo = startable_project();
+    shelbi_state::save_task("s", &task(Column::backlog(), "t"), "body").unwrap();
+    shelbi_state::save_task("s", &task(Column::backlog(), "u"), "body").unwrap();
+
+    let mut sink = RecordingSink::default();
+    let promote = MutationKind::Move {
+        to: "todo".into(),
+        reason: Some("orchestrator:zen-promote category=1".into()),
+        skip_transition_actions: false,
+    };
+    let start = MutationKind::Start {
+        workspace: Some("dev".into()),
+        branch: None,
+        reason: None,
+        force: false,
+        take: false,
+    };
+
+    // `issue move`, then `issue start` reading the issue as the CLI does.
+    let read = current_state("s", "t").unwrap();
+    apply("s", "t", &promote, &mut sink, &mut daemon_recheck("s", "t", read)).unwrap();
+    let read = current_state("s", "t").unwrap();
+    assert_eq!(read.status, "todo");
+    let mut rechecks = 0;
+    let mut inner = daemon_recheck("s", "t", read.clone());
+    let mut counted = || {
+        rechecks += 1;
+        inner()
+    };
+    let result = apply("s", "t", &start, &mut sink, &mut counted);
+    assert!(
+        !matches!(result, Err(MutateError::Stale { .. })),
+        "the start's own branch write isn't a change made elsewhere: {result:?}"
+    );
+    assert!(matches!(result, Err(MutateError::LaunchSpawn(_))), "{result:?}");
+    assert_eq!(rechecks, 1, "the client's view is checked once, before any write");
+    let after = shelbi_state::load_task("s", "t").unwrap().task;
+    assert!(after.branch.is_some(), "the branch was cut and written");
+    assert_ne!(state_of(&after), read, "the branch write moved the revision");
+
+    // A change made elsewhere between the read and the start is still refused,
+    // and leaves no branch behind: the card moved back to another column...
+    let read = current_state("s", "u").unwrap();
+    apply("s", "u", &promote, &mut sink, &mut daemon_recheck("s", "u", read)).unwrap();
+    let read = current_state("s", "u").unwrap();
+    shelbi_state::move_task("s", "u", Column::backlog()).unwrap();
+    let err = apply("s", "u", &start, &mut sink, &mut daemon_recheck("s", "u", read)).unwrap_err();
+    assert!(matches!(err, MutateError::Stale { .. }), "{err}");
+    assert_eq!(shelbi_state::load_task("s", "u").unwrap().task.branch, None);
+
+    // ...or someone else took it, in the same column.
+    apply("s", "u", &promote, &mut sink, &mut daemon_recheck("s", "u", current_state("s", "u").unwrap())).unwrap();
+    let read = current_state("s", "u").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store_set_assignee("s", "u", "someone-else");
+    let err = apply("s", "u", &start, &mut sink, &mut daemon_recheck("s", "u", read)).unwrap_err();
+    match &err {
+        MutateError::Stale { expected, actual } => assert_eq!(expected.status, actual.status),
+        other => panic!("expected Stale, got {other}"),
+    }
+    assert_eq!(shelbi_state::load_task("s", "u").unwrap().task.branch, None);
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Assign `id` out of band, as another client would.
+fn store_set_assignee(project: &str, id: &str, workspace: &str) {
+    issue_store(project)
+        .unwrap()
+        .set_fields(
+            id,
+            shelbi_state::IssueFields {
+                assigned_to: Some(Some(workspace.to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 }
