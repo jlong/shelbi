@@ -299,9 +299,20 @@ pub fn apply(
             Ok(change_note(store.as_ref(), project, &created, kind.verb()))
         }
         MutationKind::Edit(spec) => {
-            add_edit::edit(project, id, spec, sink, recheck)?;
-            let store = issue_store(project)?;
-            Ok(change_note(store.as_ref(), project, id, kind.verb()))
+            match add_edit::edit(project, id, spec, sink, recheck)? {
+                // The read the edit made after its write.
+                Some(after) => Ok(ChangeNote {
+                    project: project.to_string(),
+                    id: id.to_string(),
+                    verb: kind.verb().to_string(),
+                    status: after.task.column.as_str().to_string(),
+                    updated_at: after.task.updated_at.to_rfc3339(),
+                }),
+                None => {
+                    let store = issue_store(project)?;
+                    Ok(change_note(store.as_ref(), project, id, kind.verb()))
+                }
+            }
         }
         MutationKind::Approve => {
             apply_approve(project, id, sink, recheck)?;

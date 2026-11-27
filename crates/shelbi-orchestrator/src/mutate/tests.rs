@@ -1173,6 +1173,142 @@ fn apply_edit_on_github_refuses_a_save_over_a_body_it_hasnt_seen() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A body that opens with (and holds) `---` rules, the shape that looks like a
+/// frontmatter fence: the one the 2026-11-27 `wiki` save carried.
+const RULED_BODY: &str =
+    "---\n\n**Hold in review for John to check before merging**\n\n---\n\nUmbrella for the Wiki.\n\n---\n\n## Subtasks\n";
+
+fn edit_body(project: &str, body: &str, expect_body: Option<&str>) -> Result<ChangeNote, MutateError> {
+    let mut sink = RecordingSink::default();
+    let mut recheck = no_recheck();
+    apply(
+        project,
+        "t",
+        &MutationKind::Edit(Box::new(EditSpec {
+            body_replace: Some(body.into()),
+            expect_body: expect_body.map(str::to_string),
+            ..Default::default()
+        })),
+        &mut sink,
+        &mut recheck,
+    )
+}
+
+/// `---` rules at the top of a body and inside it are body text on a
+/// filesystem board, never a frontmatter fence: they round-trip byte for byte
+/// through the edit and every read, and an edit to the same text is no edit.
+#[test]
+fn apply_edit_keeps_a_body_of_rules_byte_for_byte_on_the_filesystem() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+
+    let mut t = task(Column::backlog(), "t");
+    t.branch = Some("feat/x".into());
+    shelbi_state::save_task("p", &t, "Umbrella for the Wiki.\n").unwrap();
+
+    edit_body("p", RULED_BODY, Some("Umbrella for the Wiki.\n")).unwrap();
+    let after = shelbi_state::load_task("p", "t").unwrap();
+    assert_eq!(after.body, RULED_BODY);
+    assert_eq!(after.task.branch.as_deref(), Some("feat/x"), "the frontmatter is the file's own");
+    let store = shelbi_state::issue_store_for("p").unwrap();
+    assert_eq!(store.get("t").unwrap().unwrap().body, RULED_BODY);
+    assert_eq!(store.list().unwrap()[0].body, RULED_BODY);
+    let edited = |log: &str| log.lines().filter(|l| l.contains("task=t edited")).count();
+    assert_eq!(edited(&events_log()), 1, "{}", events_log());
+
+    // The same text again changes nothing, so it isn't reported as an edit.
+    edit_body("p", RULED_BODY, Some(RULED_BODY)).unwrap();
+    assert_eq!(edited(&events_log()), 1, "{}", events_log());
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A fake GitHub holding issue #7 (`t`). With `keeps_writes` a body PATCH is
+/// stored and every later read returns it; without, GitHub answers the PATCH
+/// and keeps the body it had. Returns the body GitHub holds.
+fn github_body_fake(body: &str, keeps_writes: bool) -> std::sync::Arc<std::sync::Mutex<String>> {
+    let stored = std::sync::Arc::new(std::sync::Mutex::new(body.to_string()));
+    let held = stored.clone();
+    shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+        let joined = args.join(" ");
+        if joined.contains("-X PATCH") {
+            if let Some(new) = args.iter().find_map(|a| a.strip_prefix("body=")) {
+                if keeps_writes {
+                    *held.lock().unwrap() = new.to_string();
+                }
+            }
+        }
+        let body = held.lock().unwrap().clone();
+        let labels = serde_json::json!([{"name": "shelbi:id/t"}, {"name": "shelbi:status/todo"}]);
+        if args.contains(&"graphql") && joined.contains("IdSearch") {
+            return Ok(r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[{"number":7}]}}}"#.to_string());
+        }
+        if args.contains(&"graphql") {
+            return Ok(serde_json::json!({"data": {"rateLimit": {"remaining": 4999}, "repository": {"issue": {
+                "number": 7, "title": "T", "state": "OPEN", "stateReason": null,
+                "createdAt": "2026-08-01T00:00:00Z", "updatedAt": "2026-08-02T00:00:00Z",
+                "body": body, "assignees": {"nodes": []}, "labels": {"nodes": labels},
+            }}}})
+            .to_string());
+        }
+        Ok(serde_json::json!({
+            "number": 7, "title": "T", "body": body, "state": "open", "assignees": [], "labels": labels,
+            "created_at": "2026-08-01T00:00:00Z", "updated_at": "2026-08-02T00:00:00Z",
+        })
+        .to_string())
+    });
+    stored
+}
+
+/// The same body on a GitHub board: the PATCH carries it whole, GitHub's copy
+/// and the read back match it byte for byte, and the save reports one edit.
+#[test]
+fn apply_edit_keeps_a_body_of_rules_byte_for_byte_on_github() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    let stored = github_body_fake("Umbrella for the Wiki.", true);
+
+    edit_body("gh", RULED_BODY, Some("Umbrella for the Wiki.")).unwrap();
+    assert_eq!(*stored.lock().unwrap(), RULED_BODY, "GitHub got the body as typed");
+    let store = shelbi_state::issue_store_for("gh").unwrap();
+    // A GitHub body is stored without its final newline.
+    assert_eq!(store.get("t").unwrap().unwrap().body, RULED_BODY.trim_end());
+    assert!(events_log().contains("task=t edited fields=body"), "{}", events_log());
+
+    shelbi_state::clear_test_gh_runner();
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A tracker that answers a write and keeps the body it had (the 2026-11-27
+/// `wiki` save: `edited` on `events.log`, GitHub unchanged): the edit is refused
+/// with the reason, and nothing is reported as edited.
+#[test]
+fn apply_edit_refuses_a_body_the_tracker_did_not_keep() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    let stored = github_body_fake("Umbrella for the Wiki.", false);
+
+    let err = edit_body("gh", RULED_BODY, Some("Umbrella for the Wiki.")).unwrap_err();
+    assert!(matches!(err, MutateError::Backend(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "the issue tracker didn't keep the description as sent: it still has the old one"
+    );
+    assert_eq!(*stored.lock().unwrap(), "Umbrella for the Wiki.");
+    assert!(!events_log().contains("task=t edited"), "{}", events_log());
+
+    shelbi_state::clear_test_gh_runner();
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // --- `ensure_workspace_dispatchable` (the dispatch guard) --------------------
 //
 // Moved from `shelbi-cli`'s `commands/issue.rs` when its duplicate of this guard

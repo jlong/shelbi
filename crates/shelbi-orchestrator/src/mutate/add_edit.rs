@@ -121,13 +121,19 @@ pub(crate) fn add(
 
 /// Revise an issue's content (non-interactive). The `$EDITOR` path stays on the
 /// client; this is only reached once the client has resolved body sources.
+///
+/// A title or body equal to the stored one is no change. After the write the
+/// issue is read back: a title or body the tracker didn't keep as sent is
+/// refused with the reason (never reported as edited), and the `edited` event
+/// names only the fields whose stored value changed. Returns that read, the
+/// issue as it now stands, or `None` when nothing was written.
 pub(crate) fn edit(
     project: &str,
     id: &str,
     spec: &EditSpec,
     sink: &mut dyn OutputSink,
     recheck: Recheck<'_>,
-) -> Result<(), MutateError> {
+) -> Result<Option<shelbi_state::IssueFile>, MutateError> {
     let has_body_source = spec.body_replace.is_some() || spec.body_append.is_some();
     if !spec.subs.is_empty() && has_body_source {
         return Err(MutateError::Backend(
@@ -176,26 +182,34 @@ pub(crate) fn edit(
         });
     }
 
+    let before_title = tf.task.title.clone();
+    let before_body = tf.body.clone();
+
     // Compute the new body (substitutions OR a whole-body source).
-    if !spec.subs.is_empty() {
+    let new_body = if !spec.subs.is_empty() {
         let (new_body, report) = apply_substitutions(&tf.body, &spec.subs, spec.allow_no_match)?;
         for (label, count) in &report {
             sink.out(&format!("  {label}: {count} replacement(s)"));
         }
-        tf.body = new_body;
-        fields.push("body");
+        Some(new_body)
     } else if let Some(raw) = &spec.body_replace {
-        tf.body = format!("{}\n", raw.trim_end());
-        fields.push("body");
-    } else if let Some(raw) = &spec.body_append {
-        tf.body = append_body(&tf.body, raw);
-        fields.push("body");
+        Some(format!("{}\n", raw.trim_end()))
+    } else {
+        spec.body_append.as_ref().map(|raw| append_body(&tf.body, raw))
+    };
+    if let Some(new_body) = new_body {
+        if !same_text(&new_body, &tf.body) {
+            tf.body = new_body;
+            fields.push("body");
+        }
     }
 
     // Apply the frontmatter field edits.
     if let Some(title) = &spec.title {
-        tf.task.title = title.clone();
-        fields.push("title");
+        if !same_text(title, &tf.task.title) {
+            tf.task.title = title.clone();
+            fields.push("title");
+        }
     }
     if let Some(name) = &spec.workflow {
         tf.task.workflow = Some(name.clone());
@@ -221,7 +235,7 @@ pub(crate) fn edit(
 
     if fields.is_empty() {
         sink.out("(no change)");
-        return Ok(());
+        return Ok(None);
     }
 
     let mut updates = frontmatter.updates;
@@ -242,10 +256,37 @@ pub(crate) fn edit(
     }
     store.set_fields(id, updates).map_err(MutateError::backend)?;
 
+    // Read the issue back: a tracker can answer a write and keep something
+    // other than what was sent (or nothing at all), and a save reported as
+    // landed when it didn't leaves the app's editor waiting for a copy that
+    // never comes.
+    let after = load_issue(store.as_ref(), id)?;
+    let mut lost: Vec<(&str, bool)> = Vec::new();
+    fields.retain(|field| {
+        let (sent, before, stored) = match *field {
+            "title" => (&tf.task.title, &before_title, &after.task.title),
+            "body" => (&tf.body, &before_body, &after.body),
+            _ => return true,
+        };
+        if !same_text(sent, stored) {
+            lost.push((field, same_text(before, stored)));
+        }
+        !same_text(before, stored)
+    });
+
     let fields_csv = fields.join(",");
-    let reason = spec.reason.as_deref().unwrap_or("user:cli");
-    if let Err(e) = shelbi_state::append_task_edit_event(project, id, &fields_csv, reason) {
-        sink.warn(&format!("warning: append_task_edit_event failed: {e}"));
+    if !fields.is_empty() {
+        let reason = spec.reason.as_deref().unwrap_or("user:cli");
+        if let Err(e) = shelbi_state::append_task_edit_event(project, id, &fields_csv, reason) {
+            sink.warn(&format!("warning: append_task_edit_event failed: {e}"));
+        }
+    }
+    if let Some((field, unchanged)) = lost.first() {
+        let what = if *field == "body" { "description" } else { "title" };
+        let holds = if *unchanged { "the old one" } else { "a different one" };
+        return Err(MutateError::Backend(format!(
+            "the issue tracker didn't keep the {what} as sent: it still has {holds}"
+        )));
     }
 
     sink.out(&format!("✓ {id} edited ({fields_csv})"));
@@ -256,7 +297,14 @@ pub(crate) fn edit(
             tf.task.column
         ));
     }
-    Ok(())
+    Ok(Some(after))
+}
+
+/// Whether two titles or bodies store as the same text: what the stores fold
+/// (line endings, whitespace around the text) is not a difference.
+fn same_text(a: &str, b: &str) -> bool {
+    let fold = |s: &str| s.replace("\r\n", "\n");
+    fold(a).trim() == fold(b).trim()
 }
 
 /// Refuse a workflow name that is malformed or has no file.

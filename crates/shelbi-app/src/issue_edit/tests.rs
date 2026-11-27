@@ -244,6 +244,60 @@ fn a_refused_save_with_no_new_copy_gives_up_and_says_so() {
     assert!(e.retry("T").is_some());
 }
 
+/// The 2026-11-27 `wiki` save: a body opening with `---` rules, acked by the
+/// daemon at the revision it was sent from because the tracker kept the body
+/// it had. The editor says so at once, never "changed elsewhere", and a retry
+/// replaces the text the store still holds, so it isn't refused as stale.
+#[test]
+fn a_save_the_store_did_not_keep_says_so_and_a_retry_can_land() {
+    let (mut e, t0) = open();
+    let ruled = format!("---\n\n**Hold in review**\n\n---\n\n{BODY}");
+    e.edit("T", Field::Body, &ruled, t0);
+    let job = e.poll(ms(t0, 900)).pop().unwrap();
+    assert_eq!(job.body.as_deref(), Some(ruled.as_str()));
+    e.finish(&job, Ok(Some(at("todo", 0))), ms(t0, 1000));
+    let not_kept = SaveStatus::Failed(NOT_KEPT.into());
+    assert_eq!(e.status("T"), not_kept);
+    assert_eq!(body(&e), ruled, "the draft is intact");
+    // The store's copy is the old text: no conflict, no wait for a new copy.
+    e.observe(&[read("todo", 0, "Title", BODY)]);
+    assert!(e.take_updates().is_empty());
+    assert!(e.poll(ms(t0, 1000) + STALE_WAIT).is_empty(), "no retry loop");
+    assert_eq!(e.status("T"), not_kept);
+    let retry = e.retry("T").expect("retry sends it");
+    assert_eq!(retry.body.as_deref(), Some(ruled.as_str()));
+    assert_eq!(retry.expect_body.as_deref(), Some(BODY), "it replaces what is stored");
+    e.finish(&retry, Ok(Some(at("todo", 9))), ms(t0, 20_000));
+    assert_eq!(e.status("T"), SaveStatus::Saved);
+}
+
+/// An ack that only looked unmoved (two saves in one second of a tracker's
+/// revision clock): the next read showing the text stored clears the failure.
+#[test]
+fn a_save_that_looked_not_kept_clears_once_a_read_shows_it() {
+    let (mut e, t0) = open();
+    e.edit("T", Field::Body, "mine\n", t0);
+    let job = e.flush("T").unwrap();
+    e.finish(&job, Ok(Some(at("todo", 0))), ms(t0, 10));
+    assert_eq!(e.status("T"), SaveStatus::Failed(NOT_KEPT.into()));
+    e.observe(&[read("todo", 0, "Title", "mine")]);
+    assert_eq!(e.status("T"), SaveStatus::Saved);
+    assert!(e.poll(ms(t0, 60_000)).is_empty());
+}
+
+/// A daemon that reads its write back refuses a body the tracker didn't keep;
+/// the editor shows its reason, and the retry replaces the stored text.
+#[test]
+fn a_body_the_daemon_found_not_kept_shows_the_reason() {
+    let (mut e, t0) = open();
+    e.edit("T", Field::Body, "---\nmine\n---\n", t0);
+    let job = e.flush("T").unwrap();
+    let why = "the issue tracker didn't keep the description as sent: it still has the old one";
+    e.finish(&job, Err(ExecError::Backend(why.into())), ms(t0, 10));
+    assert_eq!(e.status("T").label(), Some(format!("Not saved: {why}")));
+    assert_eq!(e.retry("T").unwrap().expect_body.as_deref(), Some(BODY));
+}
+
 #[test]
 fn a_failed_save_keeps_the_draft_until_a_retry_or_the_next_edit() {
     let (mut e, t0) = open();

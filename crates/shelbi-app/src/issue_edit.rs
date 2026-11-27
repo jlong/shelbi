@@ -73,6 +73,10 @@ pub const STALE_WAIT: Duration = Duration::from_secs(15);
 /// failed, and a resend could then still land after the user was told so.
 pub const WRITE_DEADLINE: Duration = shelbi_state::DAEMON_RESTART_WINDOW;
 
+/// Why a save failed when the daemon acked it at the revision it was sent
+/// from: the store took the write and kept the text it had.
+pub const NOT_KEPT: &str = "the issue tracker didn't keep the change; try again";
+
 /// Refusals as changed elsewhere in a row (each followed by a read that
 /// showed nothing new) before the draft stops retrying on its own.
 const STALE_RETRY_LIMIT: u32 = 3;
@@ -696,7 +700,32 @@ impl IssueEdits {
             return;
         };
         let sent_workflow = draft.sent_workflow.take();
+        // An ack at the revision the save was sent from, for a save that
+        // changed the text: the store answered and kept what it had (a
+        // tracker that drops a body it won't store; a daemon from before it
+        // read its writes back). Taking the sent text as stored would make
+        // the next save expect it, and every save after be refused as
+        // changed elsewhere while no read ever shows anything new.
+        let unmoved = match (&landed, &job.expected) {
+            (Some(landed), Some(from)) => {
+                landed.status == from.status && revision_at_or_after(&from.updated_at, &landed.updated_at)
+            }
+            _ => false,
+        };
+        let changes_text = Field::ALL.into_iter().any(|f| {
+            let fd = draft.field(f);
+            fd.sent.as_deref().is_some_and(|sent| sent.trim() != fd.base.trim())
+        });
         match result {
+            Ok(_) if unmoved && changes_text => {
+                for f in Field::ALL {
+                    draft.field_mut(f).sent = None;
+                }
+                if draft.workflow.is_none() {
+                    draft.workflow = sent_workflow;
+                }
+                draft.failure = Some(NOT_KEPT.into());
+            }
             Ok(_) => {
                 for f in Field::ALL {
                     let fd = draft.field_mut(f);
@@ -895,8 +924,10 @@ impl IssueEdits {
             draft.awaiting = None;
             draft.due = true;
         }
-        if !draft.dirty() && draft.failure.as_deref() == Some(&ExecError::NoAnswer.to_string()) {
-            // The save that got no answer landed after all.
+        let unconfirmed = [ExecError::NoAnswer.to_string(), NOT_KEPT.to_string()];
+        if !draft.dirty() && draft.failure.as_ref().is_some_and(|f| unconfirmed.contains(f)) {
+            // The save that got no answer (or looked kept as it was) landed
+            // after all.
             draft.failure = None;
             draft.saved = true;
         }
