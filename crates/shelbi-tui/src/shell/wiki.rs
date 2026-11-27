@@ -443,6 +443,15 @@ impl WikiPage {
 
     // ---- actions -----------------------------------------------------------
 
+    /// Open `path` and select it in the tree (the palette's wiki result, a
+    /// `wiki:` link): now when the tree is in, else once it lands.
+    pub(crate) fn reveal(&mut self, path: &str) {
+        if !self.tree.select_path(path) {
+            self.pending_select = Some(path.to_string());
+        }
+        self.open_doc(path);
+    }
+
     /// Show `path` in the main area (read through the hub).
     pub(crate) fn open_doc(&mut self, path: &str) {
         if self.doc_path() != Some(path) {

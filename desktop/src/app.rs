@@ -977,6 +977,7 @@ pub enum HostCall {
     OpenEditor(EditTarget),
     OpenIssue(String),
     OpenChangelogEntry(String),
+    OpenWikiDoc(String),
 }
 
 /// How a confirmed Close Project reaches the daemon that quits it: a remote
@@ -1116,6 +1117,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn open_changelog_entry(&mut self, id: &str) {
         self.push(HostCall::OpenChangelogEntry(id.to_string()));
+    }
+    fn open_wiki_doc(&mut self, path: &str) {
+        self.push(HostCall::OpenWikiDoc(path.to_string()));
     }
 }
 
@@ -4012,6 +4016,7 @@ impl ShelbiWindow {
             HostCall::OpenAddProject => self.open_add_project(window, cx),
             HostCall::OpenIssue(id) => self.open_task(&id, window, cx),
             HostCall::OpenChangelogEntry(id) => self.open_changelog_entry(id, window, cx),
+            HostCall::OpenWikiDoc(path) => self.open_wiki_doc(path, window, cx),
             HostCall::ConnectRemote => self.open_connect(window, cx),
             // Its own window, after this update (as New Window).
             HostCall::ShowLaunchScreen => cx.defer(|cx| {
@@ -5225,6 +5230,14 @@ impl ShelbiWindow {
         changelog.update(cx, |v, cx| v.reveal(&id, window, cx));
     }
 
+    /// Show the Wiki with document `path` open (its row selected, its
+    /// folders opened): the palette's wiki result, a `wiki:` link.
+    fn open_wiki_doc(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let wiki = self.ensure_wiki(window, cx);
+        wiki.update(cx, |w, cx| w.open_at(&path, window, cx));
+        self.perform(HostCall::ShowView(View::Wiki), window, cx);
+    }
+
     /// Show task `id`'s detail: route to the board and open it there.
     fn open_task(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.run(CommandKind::ShowView(View::Issues), window, cx);
@@ -6422,7 +6435,8 @@ impl ShelbiWindow {
         // and the changelog read off the UI thread.
         let (issues, changelog) = self.palette_corpus_held(cx);
         let complete = issues.is_some() && changelog.is_some();
-        let corpus = SearchCorpus::new(issues.unwrap_or_default(), changelog.unwrap_or_default());
+        let corpus = SearchCorpus::new(issues.unwrap_or_default(), changelog.unwrap_or_default())
+            .with_wiki(self.palette_wiki(cx));
         let search = self.palette_search(corpus);
         self.open_overlay(ActiveOverlay::palette(entries, projects, search), window, cx);
         // Re-read the inputs off the UI thread; the open palette picks them up.
@@ -6431,6 +6445,25 @@ impl ShelbiWindow {
             self.read_palette_corpus(cx);
         }
         self.poll_palette_search(cx);
+    }
+
+    /// How the palette searches the project's wiki: its hub, through the
+    /// window's link (the far hub for a remote tab), asked once per query
+    /// on the search's thread. A test's or the visual check's asks their
+    /// fake hub ([`crate::views::wiki::WikiPorts`]), else nothing: a real
+    /// ask would start a daemon.
+    fn palette_wiki(&self, cx: &App) -> Option<shelbi_app::overlay::palette_search::WikiSearch> {
+        use shelbi_app::overlay::palette_search::WikiSearch;
+        #[cfg(any(test, feature = "visual-check"))]
+        if let Some(ports) = cx.try_global::<crate::views::wiki::WikiPorts>() {
+            return Some(WikiSearch::over(ports.ask.clone()));
+        }
+        let _ = cx;
+        if cfg!(test) {
+            return None;
+        }
+        let link = self.project_handle.link.clone();
+        Some(WikiSearch::over(Arc::new(move |req| shelbi_app::wiki::ask(&link, req))))
     }
 
     /// Where the palette's searches run: their own thread (a test window
@@ -6478,7 +6511,8 @@ impl ShelbiWindow {
                 let corpus = SearchCorpus::new(
                     issues.unwrap_or_else(|| read.issues.to_vec()),
                     changelog.unwrap_or_else(|| read.changelog.to_vec()),
-                );
+                )
+                .with_wiki(this.palette_wiki(cx));
                 if let Some(ActiveOverlay::Palette { palette, .. }) = &mut this.overlay {
                     palette.set_corpus(corpus);
                 }
@@ -8045,6 +8079,10 @@ impl ShelbiWindow {
             .capture_key_down(cx.listener(Self::on_capture_key_down))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            // A `wiki:` link clicked in a task body (or a wiki document).
+            .on_action(cx.listener(|this, link: &crate::links::OpenWikiLink, window, cx| {
+                this.run(CommandKind::OpenWikiDoc { path: link.path.clone() }, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(None, window, cx)))
             .on_action(cx.listener(|this, _: &CloseWindow, window, cx| this.close_window(window, cx)))
             .on_modifiers_changed(cx.listener(|this, e: &gpui::ModifiersChangedEvent, _, cx| {

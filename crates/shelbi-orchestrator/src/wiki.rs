@@ -353,6 +353,11 @@ fn answer_for(svc: &WikiService, source_kind: WikiSource, project: Option<&str>,
                         date: c.date,
                         subject: c.subject,
                         paths: c.paths,
+                        by: match c.by.as_slice() {
+                            [one] if one == "agent" => Some(Author::Agent),
+                            [one] if one == "person" => Some(Author::Person),
+                            _ => None,
+                        },
                     })
                     .collect(),
             )

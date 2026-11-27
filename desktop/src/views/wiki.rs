@@ -40,8 +40,8 @@
 //!
 //! A project without a wiki shows the set-up screen in the main area: the
 //! two sources, and one click sets either up (the shared Settings ▸ Wiki
-//! form's Set up, [`WikiForm`]). The document itself shows read-only here;
-//! the in-place editor is `wiki-desktop-doc`'s.
+//! form's Set up, [`WikiForm`]). The open document is edited in place, its
+//! saves going through the hub ([`doc`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,7 +51,6 @@ use gpui::{
     div, prelude::*, px, AnyElement, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter, Focusable,
     FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Subscription, Task, Window,
 };
-use gpui_kit::base::text::TextViewState;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use shelbi_app::settings::store::Store;
 use shelbi_app::settings::wiki::{self as wk, Ask, Tone, WikiForm};
@@ -62,11 +61,16 @@ use shelbi_app::wiki_tree::{TreeRow, WikiTree};
 use shelbi_app::wiki_tree_edit::{self as edit, DropAt};
 use shelbi_core::WikiSource;
 
-use super::{markdown, sidebar, task_panel};
+use super::{sidebar, task_panel};
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::placed::placed;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
+
+#[path = "wiki_doc.rs"]
+pub mod doc;
+
+use doc::DocMenu;
 
 /// A tree row's height.
 pub const ROW_H: f32 = 26.0;
@@ -194,10 +198,19 @@ pub struct WikiView {
     /// The row and edge a drag hovers.
     drop_target: Option<(String, DropAt)>,
     undo: Option<Undo>,
-    /// The document shown in the main area, its text once read.
+    /// The document shown in the main area; whether its read landed (or
+    /// why it failed).
     open: Option<String>,
-    doc: Option<Result<String, String>>,
-    doc_state: Option<Entity<TextViewState>>,
+    doc: Option<Result<(), String>>,
+    /// The open document's editor and its saves, once read.
+    pane: Option<doc::DocPane>,
+    /// Who last changed the open document, and when.
+    updated: Option<shelbi_app::wiki_doc::Updated>,
+    /// The toolbar's ⋯ menu, or its history.
+    doc_menu: Option<DocMenu>,
+    doc_menu_anchor: style::Anchor,
+    /// The save debounce's wake.
+    save_timer: Option<Task<()>>,
     setup: WikiForm,
     /// Increments on every reload, so a stale answer is dropped.
     generation: u64,
@@ -280,7 +293,11 @@ impl WikiView {
             undo: None,
             open: None,
             doc: None,
-            doc_state: None,
+            pane: None,
+            updated: None,
+            doc_menu: None,
+            doc_menu_anchor: Default::default(),
+            save_timer: None,
             setup: WikiForm::default(),
             generation: 0,
             shown: false,
@@ -395,11 +412,20 @@ impl WikiView {
         let mut tree = false;
         let mut doc = false;
         let mut status = false;
+        let mut log = false;
         for wake in wakes {
             match wake {
-                WikiWake::Changed { paths } => {
+                WikiWake::Changed { paths, source } => {
                     tree = true;
-                    doc |= self.open.as_ref().is_some_and(|open| paths.iter().any(|p| p == open));
+                    if self.open.as_ref().is_some_and(|open| paths.iter().any(|p| p == open)) {
+                        doc = true;
+                        // Who changed it: the change says (a pull's commit
+                        // does).
+                        match shelbi_app::wiki_doc::Updated::of_change(&source, chrono::Utc::now()) {
+                            Some(u) => self.updated = Some(u),
+                            None => log = true,
+                        }
+                    }
                 }
                 WikiWake::Status(_) => status = true,
                 WikiWake::Open(path) => {
@@ -411,12 +437,17 @@ impl WikiView {
         }
         if status {
             self.read_status(window, cx);
+            // A commit may have landed: it says who.
+            log = true;
         }
         if tree {
             self.read_tree(window, cx);
         }
         if doc {
             self.read_doc(window, cx);
+        }
+        if log && self.pane.is_some() {
+            self.read_updated(window, cx);
         }
     }
 
@@ -491,9 +522,9 @@ impl WikiView {
             }
             match self.open.clone() {
                 Some(open) if self.tree.select_path(&open) => self.read_doc(window, cx),
-                Some(_) => {
-                    self.open = None;
-                    self.doc = None;
+                Some(open) => {
+                    self.notice = Some(format!("There's no {open} in this wiki."));
+                    self.close_doc();
                 }
                 None => {}
             }
@@ -507,9 +538,7 @@ impl WikiView {
         }
         // The open document went away (removed elsewhere).
         if self.open.as_ref().is_some_and(|p| self.tree.node(p).is_none()) {
-            self.open = None;
-            self.doc = None;
-            self.doc_state = None;
+            self.close_doc();
             cx.emit(WikiEvent::Remember);
         }
         cx.notify();
@@ -523,22 +552,15 @@ impl WikiView {
             path: path.clone(),
             section: None,
         };
-        self.request(req, window, cx, move |this, reply, _, cx| {
+        self.request(req, window, cx, move |this, reply, window, cx| {
             if this.open.as_deref() != Some(path.as_str()) {
                 return;
             }
-            let doc = match reply {
-                WikiReply::Doc { content, .. } => Ok(content),
-                WikiReply::Failed(f) => Err(f.message),
-                other => Err(format!("the hub answered {other:?}")),
-            };
-            if let Ok(text) = &doc {
-                match &this.doc_state {
-                    Some(state) => state.update(cx, |s, cx| s.set_text(text, cx)),
-                    None => this.doc_state = Some(cx.new(|cx| TextViewState::markdown(text, cx))),
-                }
+            match reply {
+                WikiReply::Doc { content, .. } => this.take_doc(path, content, window, cx),
+                WikiReply::Failed(f) => this.doc = Some(Err(f.message)),
+                other => this.doc = Some(Err(format!("the hub answered {other:?}"))),
             }
-            this.doc = Some(doc);
         });
     }
 
@@ -602,8 +624,10 @@ impl WikiView {
     /// Show the document at `path` in the main area.
     pub fn open_doc(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.open.as_deref() != Some(path) {
+            // What's typed in the one open now saves first.
+            self.flush_save(window, cx);
+            self.close_doc();
             self.open = Some(path.to_string());
-            self.doc = None;
             self.read_doc(window, cx);
             cx.emit(WikiEvent::Remember);
         }
@@ -735,6 +759,12 @@ impl WikiView {
             if let Some(open) = this.open.clone() {
                 let now = edit::moved(&open, &from, &to);
                 if now != open {
+                    // The editor stays (with its caret and undo); its saves
+                    // go to the new path.
+                    if let Some(pane) = this.pane.as_mut().filter(|p| p.path == open) {
+                        pane.path = now.clone();
+                        pane.sync.moved_to(now.clone());
+                    }
                     this.open = Some(now);
                     this.read_doc(window, cx);
                 }
@@ -798,9 +828,7 @@ impl WikiView {
                     until: Instant::now() + UNDO_FOR,
                 });
                 if this.open.as_ref().is_some_and(|o| *o == path || o.starts_with(&format!("{path}/"))) {
-                    this.open = None;
-                    this.doc = None;
-                    this.doc_state = None;
+                    this.close_doc();
                     cx.emit(WikiEvent::Remember);
                 }
             }
@@ -1227,9 +1255,9 @@ impl WikiView {
             None => note("wiki-main-loading", "Loading the wiki…", None, &theme).into_any_element(),
             Some(Err(e)) => note("wiki-main-error", "Couldn't reach the wiki", Some(e.clone()), &theme).into_any_element(),
             Some(Ok(s)) if !s.set_up => self.render_setup(&theme, cx),
-            Some(Ok(_)) => match (&self.open, &self.doc) {
-                (Some(path), doc) => self.render_doc(path.clone(), doc.clone(), &theme),
-                (None, _) => {
+            Some(Ok(_)) => match &self.open {
+                Some(path) => self.render_doc(path.clone(), &theme, cx),
+                None => {
                     let count = edit::document_count(self.tree.nodes());
                     let detail = match count {
                         0 => "This wiki has no documents yet. ⌘N makes one.".to_string(),
@@ -1248,55 +1276,6 @@ impl WikiView {
             .size_full()
             .min_w_0()
             .bg(theme.background)
-            .child(body)
-            .into_any_element()
-    }
-
-    fn render_doc(&self, path: String, doc: Option<Result<String, String>>, theme: &Theme) -> AnyElement {
-        let crumbs = edit::breadcrumb(self.tree.nodes(), &path);
-        let last = crumbs.len().saturating_sub(1);
-        let crumb_row = div()
-            .debug_selector(|| "wiki-breadcrumb".into())
-            .flex()
-            .flex_row()
-            .flex_none()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(44.0))
-            .px(px(24.0))
-            .border_b_1()
-            .border_color(theme.divider)
-            .type_style(Type::Base)
-            .children(crumbs.into_iter().enumerate().flat_map(|(i, c)| {
-                let sep = (i > 0).then(|| div().text_color(theme.muted).child("›").into_any_element());
-                let label = div()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(if i == last { theme.text_loud } else { theme.muted })
-                    .child(c)
-                    .into_any_element();
-                sep.into_iter().chain([label])
-            }));
-        let body = match (doc, &self.doc_state) {
-            (Some(Ok(_)), Some(state)) => div()
-                .id("wiki-doc-body")
-                .debug_selector(|| "wiki-doc-body".into())
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .px(px(32.0))
-                .py(px(24.0))
-                .child(div().max_w(px(760.0)).child(markdown::body_with_state(state, theme, None, None)))
-                .into_any_element(),
-            (Some(Err(e)), _) => note("wiki-doc-error", "Couldn't read this document", Some(e), theme).into_any_element(),
-            _ => note("wiki-doc-loading", "Loading…", None, theme).into_any_element(),
-        };
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_h_0()
-            .child(crumb_row)
             .child(body)
             .into_any_element()
     }
@@ -1946,6 +1925,10 @@ impl Render for WikiView {
     }
 }
 
+#[cfg(test)]
+#[path = "wiki_doc_tests.rs"]
+mod doc_tests;
+
 /// A fake hub for the tests and the visual check: a wiki in memory.
 #[cfg(any(test, feature = "visual-check"))]
 pub(crate) mod fake {
@@ -1953,7 +1936,7 @@ pub(crate) mod fake {
     use std::sync::{Arc, Mutex};
 
     use shelbi_app::settings::wiki::Ask;
-    use shelbi_app::wiki::{NodeKind, SyncState, WikiNode, WikiReply, WikiRequest, WikiStatus};
+    use shelbi_app::wiki::{NodeKind, SyncState, WikiCommit, WikiNode, WikiReply, WikiRequest, WikiStatus};
     use shelbi_app::wiki_tree_edit as edit;
 
     /// A hub over a flat list of entries (`Plans/a.md`, `Plans`), answering
@@ -1967,6 +1950,10 @@ pub(crate) mod fake {
         /// path → (folder?, title, text).
         pub entries: BTreeMap<String, Entry>,
         pub icons: BTreeMap<String, String>,
+        /// Each document's commits, newest first (`Log`).
+        pub commits: BTreeMap<String, Vec<WikiCommit>>,
+        /// Refuse writes with this.
+        pub refuse_writes: Option<String>,
         pub asked: Vec<WikiRequest>,
         trashed: Vec<Vec<(String, Entry)>>,
     }
@@ -2046,6 +2033,45 @@ pub(crate) mod fake {
                     Some((false, _, text)) => WikiReply::Doc { path, content: text.clone() },
                     _ => WikiReply::failed(shelbi_app::wiki::FailureKind::NotFound, path),
                 },
+                WikiRequest::Write { path, content, .. } => {
+                    if let Some(why) = self.refuse_writes.clone() {
+                        return WikiReply::failed(shelbi_app::wiki::FailureKind::Conflict, why);
+                    }
+                    let title = content
+                        .lines()
+                        .find_map(|l| l.strip_prefix("# "))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| edit::name_of(&path).trim_end_matches(".md").to_string());
+                    self.entries.insert(path, (false, title, content));
+                    WikiReply::Done
+                }
+                WikiRequest::Log { path, limit } => WikiReply::Log(
+                    path.and_then(|p| self.commits.get(&p).cloned())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(limit)
+                        .collect(),
+                ),
+                WikiRequest::Search { query, .. } => {
+                    let q = query.to_lowercase();
+                    WikiReply::Matches(
+                        self.entries
+                            .iter()
+                            .filter(|(_, (folder, _, _))| !folder)
+                            .flat_map(|(path, (_, _, text))| {
+                                text.lines().enumerate().filter(|(_, l)| l.to_lowercase().contains(&q)).map(|(i, l)| {
+                                    shelbi_app::wiki::WikiMatch {
+                                        path: path.clone(),
+                                        line: i + 1,
+                                        text: l.to_string(),
+                                        start: 0,
+                                        end: 0,
+                                    }
+                                })
+                            })
+                            .collect(),
+                    )
+                }
                 WikiRequest::New { path, .. } => {
                     let folder = !path.ends_with(".md");
                     let title = edit::name_of(&path).trim_end_matches(".md").to_string();
@@ -2102,14 +2128,14 @@ pub(crate) mod tests {
     pub(crate) use super::fake::{ask_of, FakeHub};
     use super::*;
 
-    struct T {
-        cx: VisualTestContext,
-        view: Entity<WikiView>,
-        hub: Arc<Mutex<FakeHub>>,
+    pub(super) struct T {
+        pub(super) cx: VisualTestContext,
+        pub(super) view: Entity<WikiView>,
+        pub(super) hub: Arc<Mutex<FakeHub>>,
     }
 
     impl T {
-        fn open(cx: &mut TestAppContext, hub: FakeHub) -> T {
+        pub(super) fn open(cx: &mut TestAppContext, hub: FakeHub) -> T {
             super::super::about::tests::init(cx);
             let hub = Arc::new(Mutex::new(hub));
             let ask = ask_of(&hub);
@@ -2130,40 +2156,40 @@ pub(crate) mod tests {
             T { cx, view, hub }
         }
 
-        fn read<R>(&mut self, f: impl FnOnce(&WikiView) -> R) -> R {
+        pub(super) fn read<R>(&mut self, f: impl FnOnce(&WikiView) -> R) -> R {
             self.view.read_with(&self.cx, |v, _| f(v))
         }
 
-        fn update<R>(&mut self, f: impl FnOnce(&mut WikiView, &mut Window, &mut Context<WikiView>) -> R) -> R {
+        pub(super) fn update<R>(&mut self, f: impl FnOnce(&mut WikiView, &mut Window, &mut Context<WikiView>) -> R) -> R {
             let view = self.view.clone();
             let r = self.cx.update(|window, cx| view.update(cx, |v, cx| f(v, window, cx)));
             self.cx.run_until_parked();
             r
         }
 
-        fn keys(&mut self, keys: &str) {
+        pub(super) fn keys(&mut self, keys: &str) {
             self.cx.simulate_keystrokes(keys);
             self.cx.run_until_parked();
         }
 
-        fn titles(&mut self) -> Vec<String> {
+        pub(super) fn titles(&mut self) -> Vec<String> {
             self.read(|v| v.tree.rows().iter().map(|r| r.title.clone()).collect())
         }
 
-        fn selected(&mut self) -> Option<String> {
+        pub(super) fn selected(&mut self) -> Option<String> {
             self.read(|v| v.tree.selected_path().map(str::to_string))
         }
 
-        fn asked(&self) -> Vec<WikiRequest> {
+        pub(super) fn asked(&self) -> Vec<WikiRequest> {
             std::mem::take(&mut self.hub.lock().unwrap().asked)
         }
 
-        fn drawn(&mut self, selector: &str) -> bool {
+        pub(super) fn drawn(&mut self, selector: &str) -> bool {
             self.cx.run_until_parked();
             self.cx.debug_bounds(Box::leak(selector.to_string().into_boxed_str())).is_some()
         }
 
-        fn click(&mut self, selector: &str) {
+        pub(super) fn click(&mut self, selector: &str) {
             let b = self.cx.debug_bounds(Box::leak(selector.to_string().into_boxed_str())).unwrap_or_else(|| panic!("{selector} isn't drawn"));
             self.cx.simulate_click(b.center(), Modifiers::none());
             self.cx.run_until_parked();
@@ -2409,12 +2435,14 @@ pub(crate) mod tests {
         }
         t.asked();
         t.update(|v, window, cx| {
-            v.woke(vec![WikiWake::Changed { paths: vec!["Plans/new.md".into(), "README.md".into()] }], window, cx)
+            let paths = vec!["Plans/new.md".into(), "README.md".into()];
+            v.woke(vec![WikiWake::Changed { paths, source: "agent".into() }], window, cx)
         });
         assert!(t.titles().contains(&"From an agent".to_string()));
         let asked = t.asked();
         assert!(asked.iter().any(|r| matches!(r, WikiRequest::Read { path, .. } if path == "README.md")), "{asked:?}");
-        assert_eq!(t.read(|v| v.doc.clone()), Some(Ok("# Read me\n\nChanged.\n".to_string())));
+        let editor = t.read(|v| v.doc_editor()).unwrap();
+        assert_eq!(editor.read_with(&t.cx, |e, _| e.text().to_string()), "# Read me\n\nChanged.\n");
         // A status change reads the status (its last-synced time) again.
         t.update(|v, window, cx| v.woke(vec![WikiWake::Status("syncing".into())], window, cx));
         assert!(t.asked().contains(&WikiRequest::Status));

@@ -199,3 +199,75 @@ fn the_empty_state_sets_the_wiki_up_in_one_click(cx: &mut TestAppContext) {
     assert!(!w.drawn("wiki-setup"), "the tree takes over once it's set up");
     assert!(w.drawn("wiki-row-Plans"));
 }
+
+#[gpui::test]
+fn a_wiki_link_runs_open_wiki_doc(cx: &mut TestAppContext) {
+    let mut w = W::open(cx);
+    w.settle();
+    w.update(|_, window, cx| {
+        crate::links::open("wiki:Plans/awareness-v2.md", window, cx);
+    });
+    assert_eq!(w.h.take_calls(), [HostCall::OpenWikiDoc("Plans/awareness-v2.md".into())]);
+}
+
+#[gpui::test]
+fn open_wiki_doc_shows_the_wiki_at_the_document(cx: &mut TestAppContext) {
+    let mut w = W::open(cx);
+    w.settle();
+    // From another view: the Wiki is built, then its tree read, and the
+    // document opens once it is.
+    w.update(|w, window, cx| w.perform(HostCall::OpenWikiDoc("Plans/Archive/old.md".into()), window, cx));
+    for _ in 0..3 {
+        w.h.cx.run_until_parked();
+        w.settle();
+    }
+    assert_eq!(w.read(|w, _| w.client.view().clone()), View::Wiki);
+    let (open, selected) = w.read(|w, cx| {
+        let v = w.wiki.as_ref().unwrap().read(cx);
+        (v.open_path().map(str::to_string), v.tree().selected_path().map(str::to_string))
+    });
+    assert_eq!(open.as_deref(), Some("Plans/Archive/old.md"));
+    assert_eq!(selected.as_deref(), Some("Plans/Archive/old.md"), "its folder opens to show it");
+    assert!(w.drawn("wiki-doc-body"));
+    // Again while it shows: straight there.
+    w.update(|w, window, cx| w.perform(HostCall::OpenWikiDoc("README.md".into()), window, cx));
+    w.settle();
+    let open = w.read(|w, cx| w.wiki.as_ref().unwrap().read(cx).open_path().map(str::to_string));
+    assert_eq!(open.as_deref(), Some("README.md"));
+}
+
+#[gpui::test]
+fn the_palette_finds_wiki_documents_by_title_and_text(cx: &mut TestAppContext) {
+    use shelbi_app::overlay::palette_search::SearchFilter;
+    let mut w = W::open(cx);
+    w.settle();
+    w.h.focus_window();
+    w.h.key("ctrl-space");
+    w.h.draw();
+    // A title.
+    w.h.key("o p e n c o d e");
+    w.h.draw();
+    let wiki = w.h.palette(|p| p.chips().iter().find(|c| c.filter == SearchFilter::Wiki).map(|c| c.count));
+    assert_eq!(wiki, Some(1));
+    assert!(w.drawn("palette-heading-Wiki"));
+    assert!(w.drawn("palette-wiki-Plans/opencode-integration.md"));
+    w.h.click_selector("palette-wiki-Plans/opencode-integration.md");
+    assert!(!w.h.overlay_open());
+    assert_eq!(w.h.take_calls(), [HostCall::OpenWikiDoc("Plans/opencode-integration.md".into())]);
+
+    // The text: a line no title holds.
+    w.hub.lock().unwrap().entries.get_mut("README.md").unwrap().2 = "# Read me\n\nThe merge flow, step by step.\n".into();
+    w.h.key("ctrl-space");
+    w.h.draw();
+    w.h.key("s t e p space b y");
+    w.h.draw();
+    let detail = w.h.palette(|p| {
+        p.rows()
+            .iter()
+            .find_map(|r| match r.item() {
+                Some(shelbi_app::overlay::palette_search::ResultItem::Wiki(h)) => Some((h.path.clone(), h.detail.clone())),
+                _ => None,
+            })
+    });
+    assert_eq!(detail, Some(("README.md".to_string(), "Wiki · The merge flow, step by step.".to_string())));
+}

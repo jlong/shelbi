@@ -497,6 +497,30 @@ fn diff_and_log_answer_wiki_relative_paths_in_folder_mode() {
     assert!(svc.log(Some("../main.txt"), 5).is_err());
 }
 
+/// A commit says who made its changes (`Shelbi-By`), and `log` reads it
+/// back: an agent's write alone, a person's alone, both when mixed.
+#[test]
+fn log_says_who_made_each_commits_changes() {
+    let fx = Fixture::new();
+    let (svc, _) = WikiService::start(fx.spec(fx.branch_layout(), false), Arc::new(Recorder::default())).unwrap();
+    svc.write("plan.md", "# Plan\n", ChangeSource::Agent).unwrap();
+    let _ = svc.sync_now(SYNC);
+    assert_eq!(svc.log(Some("plan.md"), 1).unwrap()[0].by, vec!["agent".to_string()]);
+
+    svc.write("plan.md", "# Plan\n\nMine.\n", ChangeSource::Local).unwrap();
+    let _ = svc.sync_now(SYNC);
+    let last = &svc.log(Some("plan.md"), 1).unwrap()[0];
+    assert_eq!(last.by, vec!["person".to_string()]);
+    assert!(!last.subject.contains("Shelbi-By"), "the trailer stays out of the subject: {last:?}");
+
+    svc.write("plan.md", "# Plan\n\nBoth.\n", ChangeSource::Local).unwrap();
+    svc.write("plan.md", "# Plan\n\nBoth, then.\n", ChangeSource::Agent).unwrap();
+    let _ = svc.sync_now(SYNC);
+    let mut by = svc.log(Some("plan.md"), 1).unwrap()[0].by.clone();
+    by.sort();
+    assert_eq!(by, vec!["agent".to_string(), "person".to_string()]);
+}
+
 /// A trashed document or folder (empty subfolders too) comes back where it
 /// was on undo, once; a path taken since refuses it.
 #[test]

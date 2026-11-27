@@ -17,6 +17,9 @@ pub struct CommitInfo {
     pub subject: String,
     /// The wiki-relative files it touched (within the asked-for path).
     pub paths: Vec<String>,
+    /// Who made its changes, from its [`super::BY_TRAILER`] lines
+    /// (`person`, `agent`); empty for a commit made elsewhere.
+    pub by: Vec<String>,
 }
 
 impl Engine {
@@ -77,7 +80,7 @@ impl Engine {
         let mut args = vec![
             "log",
             "--no-color",
-            "--format=%x1e%H%x1f%an%x1f%aI%x1f%s",
+            "--format=%x1e%H%x1f%an%x1f%aI%x1f%s%x1f%(trailers:key=Shelbi-By,valueonly,separator=%x2c)",
             "--name-only",
             "-z",
             &max,
@@ -96,6 +99,13 @@ impl Engine {
             else {
                 continue;
             };
+            let by = fields
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .map(|w| w.trim().to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
             let paths = files
                 .split('\0')
                 .map(|f| f.trim_matches('\n'))
@@ -108,6 +118,7 @@ impl Engine {
                 date: date.to_string(),
                 subject: subject.to_string(),
                 paths,
+                by,
             });
         }
         Ok(commits)

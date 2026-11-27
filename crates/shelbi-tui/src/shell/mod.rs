@@ -3134,7 +3134,12 @@ impl ShellState {
             workflows: &k.input.workflows,
             default_workflow_name: &k.input.default_workflow_name,
         };
-        SearchCorpus::new(issue_docs(&k.tasks, &k.input.project_statuses, rules), self.changelog.entries())
+        // The wiki is asked as each query is searched (the hub greps it).
+        let wiki = self
+            .client
+            .project()
+            .map(|project| shelbi_app::overlay::palette_search::WikiSearch::over((self.wiki_ports)(project).1));
+        SearchCorpus::new(issue_docs(&k.tasks, &k.input.project_statuses, rules), self.changelog.entries()).with_wiki(wiki)
     }
 
     /// Hand the open palette's search what the shell holds now (a board or
@@ -4838,6 +4843,15 @@ impl ShellState {
             Effect::OpenChangelogEntry { id, .. } => {
                 self.show_view_effect(View::Changelog);
                 self.changelog.reveal(&id);
+            }
+            // The palette's wiki result: the Wiki, that document open (its
+            // row selected) and the keys on it.
+            Effect::OpenWikiDoc { path, .. } => {
+                self.show_view_effect(View::Wiki);
+                if let Some(page) = self.ensure_wiki() {
+                    page.reveal(&path);
+                }
+                self.client.focus_main();
             }
             Effect::OpenEditor { target } => self.open_editor(&target),
             Effect::OpenSettings => self.open_settings(),
@@ -14926,7 +14940,7 @@ workspaces:
         let counts: Vec<(&str, usize)> = p.inner().chips().iter().map(|c| (c.label, c.count)).collect();
         assert_eq!(
             counts,
-            [("All", 2), ("Issues", 1), ("Changelog Entries", 1), ("Commands", 0)],
+            [("All", 2), ("Issues", 1), ("Wiki", 0), ("Changelog Entries", 1), ("Commands", 0)],
             "the issue and the sample's Settings polish pass entry"
         );
         press(&mut st, KeyCode::Enter);
@@ -14943,7 +14957,9 @@ workspaces:
         st.show(RowTarget::Native(View::Issues));
         st.open_palette();
         search_palette(&mut st, "faster board");
-        // Under the Changelog Entries filter (Tab twice), Enter opens it.
+        // Under the Changelog Entries filter (Tab three times: Issues, Wiki,
+        // Changelog Entries), Enter opens it.
+        press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Enter);
