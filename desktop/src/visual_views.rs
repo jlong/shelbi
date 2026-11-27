@@ -87,7 +87,7 @@ pub fn run(out: PathBuf) -> ! {
     let platform = gpui_platform::current_platform(false);
     let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(crate::assets::Assets));
     cx.update(|cx| {
-        crate::visual_check::install_theme(cx);
+        crate::visual_theme::install_theme(cx);
         crate::assets::load_fonts(cx);
     });
     let mut failures = 0;
@@ -387,7 +387,7 @@ pub fn run(out: PathBuf) -> ! {
         settings.update(&mut cx, |v, cx| v.offscreen_show_app_icon(icon, cx));
         // Reading config.yaml put its look on; paint the run's own theme,
         // contrast and opacity (`SHELBI_VISUAL_*`) instead.
-        cx.update(crate::visual_check::install_theme);
+        cx.update(crate::visual_theme::install_theme);
         wait(&mut cx, window, Duration::from_millis(300), |_| false);
         save(&mut cx, window, &out, name);
     }
@@ -406,7 +406,7 @@ pub fn run(out: PathBuf) -> ! {
             })
             .expect("open the offscreen window")
             .into();
-        cx.update(crate::visual_check::install_theme);
+        cx.update(crate::visual_theme::install_theme);
         save(&mut cx, window, &out, name);
     }
     let (_, window) = open(&mut cx, |cx| {

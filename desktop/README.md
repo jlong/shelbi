@@ -409,6 +409,7 @@ desktop/
   src/drops/           image and file-promise drops onto a terminal (AppKit hooks on gpui's window)
   src/spike.rs         `--spike <session>`: one terminal element on one session
   src/visual_check.rs  `--visual-check <dir>` (feature `visual-check`): offscreen render + input checks
+  src/visual_fixtures.rs `--visual-figma-fixtures <root>` (feature `visual-check`): the Figma fixture project, any OS
   src/bench/           `--bench-term` (feature `bench`): the terminal performance bench and its helpers
   src/bench_push.rs    `--bench-push` (feature `visual-check`): frame timing of the column push
 ```
@@ -485,6 +486,7 @@ cd desktop
 shelbi session new --name spike/sh -- zsh -l     # or `-- claude`
 cargo run -- --spike spike/sh                    # one window, one terminal element
 RUST_LOG=shelbi_desktop=debug cargo run -- --spike spike/sh   # + frame stats every 2s while painting
+# The offscreen modes are macOS-only (gpui's VisualTestAppContext); see docs/gpui.md.
 cargo run --features visual-check -- --visual-check /tmp/vc   # offscreen: frames + input checks, no screen needed
 cargo run --features visual-check -- --visual-workspace /tmp/vw   # offscreen: the Workspace view's states, fake sessions
 ```

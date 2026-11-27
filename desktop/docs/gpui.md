@@ -649,10 +649,28 @@ Zed-git comparison is in "The channel evaluation" above.
   clips a long detail. `main` installs `views::prompt::build` with
   `App::set_prompt_builder` off macOS, so the confirmations are the app's
   dialog. The Mac keeps its `NSAlert` sheet.
-- **`visual-check` is macOS-only.** gpui-pre 0.3.9 exports
-  `VisualTestAppContext` only on macOS, so `--visual-check`, the Figma QA,
-  `--visual-figma-fixtures` and the `--bench-*` modes don't build on Linux
-  (filed: `desktop-the-visual-check-feature-doesn-t-build-on-linux`).
+- **`visual-check`'s offscreen modes are macOS-only.** gpui-pre 0.3.9
+  exports `VisualTestAppContext` (the offscreen render-to-image) only on
+  macOS. The feature builds on Linux, but `main` compiles the modes that
+  render through it only on macOS; off macOS each exits 2 with a line
+  saying so. Since `desktop-the-visual-check-feature-doesn-t-build-on-linux`:
+
+  | Mode | macOS | Linux |
+  | --- | --- | --- |
+  | `--visual-figma-fixtures <root>` (`visual_fixtures`) | yes | yes: it only writes files |
+  | `--bench-push` (a real window, or `--offscreen`'s hidden one) | yes | yes |
+  | `--visual-check` | yes | no |
+  | `--visual-views`, `--visual-workspace`, `--visual-review` | yes | no |
+  | `--visual-figma` (the offscreen Figma QA) | yes | no |
+  | `--bench-board`, `--bench-builder`, `--bench-activity` | yes | no |
+
+  The run's theme helpers (`visual_theme`) and the fixture project
+  (`visual_fixtures`) moved out of `visual_check` and `visual_figma` so the
+  two cross-platform modes don't pull the offscreen modules in. The views'
+  `visual-check` hooks mostly serve the offscreen modes, so the Linux
+  feature build allows dead code (`main.rs`). `scripts/figma-window-walk.sh`
+  itself still captures with `screencapture` (macOS); on Linux the seeded
+  sandbox is opened by hand.
 - **Keysyms with Shift.** Hyprland and `wtype` deliver Ctrl+Shift+1 as the
   keysym `exclam`, Ctrl+Shift+, as `less`; gpui maps them back, so the
   Ctrl+Shift chords work from a real keyboard.

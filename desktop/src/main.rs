@@ -6,16 +6,23 @@
 //! README.md for the architecture map and which `dt-*` subtask fills each
 //! module.
 
+// Off macOS the visual-check feature builds only `--visual-figma-fixtures`
+// and `--bench-push`: the offscreen modes, which most of the views'
+// `visual-check` hooks serve, need gpui's macOS-only `VisualTestAppContext`
+// (`docs/gpui.md`). Those hooks would read as dead code there; every other
+// build (the default, `test`, macOS with the feature) still checks it.
+#![cfg_attr(all(feature = "visual-check", not(target_os = "macos")), allow(dead_code))]
+
 mod app;
 mod app_icon;
 mod assets;
 #[cfg(feature = "bench")]
 mod bench;
-#[cfg(feature = "visual-check")]
+#[cfg(all(feature = "visual-check", target_os = "macos"))]
 mod bench_activity;
-#[cfg(feature = "visual-check")]
+#[cfg(all(feature = "visual-check", target_os = "macos"))]
 mod bench_board;
-#[cfg(feature = "visual-check")]
+#[cfg(all(feature = "visual-check", target_os = "macos"))]
 mod bench_builder;
 #[cfg(feature = "visual-check")]
 mod bench_push;
@@ -40,15 +47,19 @@ mod test_env;
 mod remote_fixture;
 mod theme;
 mod views;
-#[cfg(feature = "visual-check")]
+#[cfg(all(feature = "visual-check", target_os = "macos"))]
 mod visual_check;
-#[cfg(feature = "visual-check")]
+#[cfg(all(feature = "visual-check", target_os = "macos"))]
 mod visual_figma;
 #[cfg(feature = "visual-check")]
+mod visual_fixtures;
+#[cfg(all(feature = "visual-check", target_os = "macos"))]
 mod visual_views;
-#[cfg(feature = "visual-check")]
+#[cfg(all(feature = "visual-check", target_os = "macos"))]
 mod visual_review;
 #[cfg(feature = "visual-check")]
+mod visual_theme;
+#[cfg(all(feature = "visual-check", target_os = "macos"))]
 mod visual_workspace;
 mod window_state;
 
@@ -75,24 +86,24 @@ enum Mode {
     PrintVersion,
     /// `--visual-check [dir]`: render the terminal element offscreen and
     /// check its input handling (feature `visual-check`).
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     VisualCheck(Option<String>),
     /// `--visual-views [dir]`: render the Activity and Machines views
     /// offscreen against a sandboxed home (feature `visual-check`).
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     VisualViews(Option<String>),
     /// `--visual-workspace [dir]`: render the Workspace view offscreen over
     /// fake sessions, one frame per state (feature `visual-check`).
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     VisualWorkspace(Option<String>),
     /// `--visual-review [dir]`: render the Review view offscreen over fake
     /// sessions, one frame per state (feature `visual-check`).
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     VisualReview(Option<String>),
     /// `--visual-figma [dir] [--2x]`: render every Figma mockup screen in
     /// the real shell over the mockups' own content, at the reference PNGs'
     /// size (feature `visual-check`).
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     VisualFigma(Option<String>, bool),
     /// `--visual-figma-fixtures <root>`: write `--visual-figma`'s mockup
     /// content into a Shelbi root and exit, for the real-window walk
@@ -105,17 +116,17 @@ enum Mode {
     BenchPush(Vec<String>),
     /// `--bench-board [options]`: time the Issues board's frames on a large
     /// fixture board, offscreen (feature `visual-check`).
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     BenchBoard(Vec<String>),
     /// `--bench-builder [options]`: time the workflow editor's Builder
     /// frames on a 20-status, 40-transition workflow, offscreen (feature
     /// `visual-check`).
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     BenchBuilder(Vec<String>),
     /// `--bench-activity [options]`: time the Activity feed's first paint
     /// and frames on a large fixture events log, offscreen (feature
     /// `visual-check`).
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     BenchActivity(Vec<String>),
     /// `--bench-term [options]`, `--bench-feed ...`, `--bench-record ...`:
     /// the terminal performance bench and its helpers (feature `bench`).
@@ -132,15 +143,15 @@ fn parse_args() -> Mode {
             None => usage("--spike needs a session (see `shelbi session ls`)"),
         },
         Some("--print-version") => Mode::PrintVersion,
-        #[cfg(feature = "visual-check")]
+        #[cfg(all(feature = "visual-check", target_os = "macos"))]
         Some("--visual-check") => Mode::VisualCheck(args.next()),
-        #[cfg(feature = "visual-check")]
+        #[cfg(all(feature = "visual-check", target_os = "macos"))]
         Some("--visual-views") => Mode::VisualViews(args.next()),
-        #[cfg(feature = "visual-check")]
+        #[cfg(all(feature = "visual-check", target_os = "macos"))]
         Some("--visual-workspace") => Mode::VisualWorkspace(args.next()),
-        #[cfg(feature = "visual-check")]
+        #[cfg(all(feature = "visual-check", target_os = "macos"))]
         Some("--visual-review") => Mode::VisualReview(args.next()),
-        #[cfg(feature = "visual-check")]
+        #[cfg(all(feature = "visual-check", target_os = "macos"))]
         Some("--visual-figma") => {
             let rest: Vec<String> = args.collect();
             let dir = rest.iter().find(|a| !a.starts_with("--")).cloned();
@@ -153,12 +164,19 @@ fn parse_args() -> Mode {
         },
         #[cfg(feature = "visual-check")]
         Some("--bench-push") => Mode::BenchPush(args.collect()),
-        #[cfg(feature = "visual-check")]
+        #[cfg(all(feature = "visual-check", target_os = "macos"))]
         Some("--bench-board") => Mode::BenchBoard(args.collect()),
-        #[cfg(feature = "visual-check")]
+        #[cfg(all(feature = "visual-check", target_os = "macos"))]
         Some("--bench-builder") => Mode::BenchBuilder(args.collect()),
-        #[cfg(feature = "visual-check")]
+        #[cfg(all(feature = "visual-check", target_os = "macos"))]
         Some("--bench-activity") => Mode::BenchActivity(args.collect()),
+        // gpui-pre 0.3.9 has `VisualTestAppContext` (the offscreen render
+        // these modes draw through) only on macOS (`docs/gpui.md`).
+        #[cfg(all(feature = "visual-check", not(target_os = "macos")))]
+        Some(
+            flag @ ("--visual-check" | "--visual-views" | "--visual-workspace" | "--visual-review"
+            | "--visual-figma" | "--bench-board" | "--bench-builder" | "--bench-activity"),
+        ) => macos_only(flag),
         #[cfg(feature = "bench")]
         Some(flag @ ("--bench-term" | "--bench-feed" | "--bench-record" | "--bench-client")) => {
             Mode::Bench(flag.to_string(), args.collect())
@@ -166,6 +184,19 @@ fn parse_args() -> Mode {
         Some(project) if !project.starts_with('-') => Mode::App,
         Some(other) => usage(&format!("unknown argument `{other}`")),
     }
+}
+
+/// An offscreen visual-check mode asked for on a platform whose gpui can't
+/// render offscreen: say so and exit (`--visual-figma-fixtures` and
+/// `--bench-push` run everywhere).
+#[cfg(all(feature = "visual-check", not(target_os = "macos")))]
+fn macos_only(flag: &str) -> ! {
+    eprintln!(
+        "shelbi-desktop: {flag} renders offscreen through gpui's VisualTestAppContext, which gpui-pre 0.3.9 \
+         provides only on macOS; run it on a Mac. On this platform the visual-check feature offers \
+         --visual-figma-fixtures <root> and --bench-push (see desktop/docs/gpui.md)"
+    );
+    std::process::exit(2);
 }
 
 fn usage(problem: &str) -> ! {
@@ -198,44 +229,44 @@ fn main() {
     platform::font_smoothing::apply();
     // Before any window (or offscreen render) builds its Metal pipelines.
     platform::metal_blend::install();
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     if let Mode::VisualCheck(dir) = mode {
-        visual_check::run(visual_check::out_dir(dir));
+        visual_check::run(visual_theme::out_dir(dir));
     }
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     if let Mode::VisualViews(dir) = mode {
-        visual_views::run(visual_check::out_dir(dir));
+        visual_views::run(visual_theme::out_dir(dir));
     }
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     if let Mode::VisualWorkspace(dir) = mode {
-        visual_workspace::run(visual_check::out_dir(dir));
+        visual_workspace::run(visual_theme::out_dir(dir));
     }
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     if let Mode::VisualReview(dir) = mode {
-        visual_review::run(visual_check::out_dir(dir));
+        visual_review::run(visual_theme::out_dir(dir));
     }
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     if let Mode::VisualFigma(dir, native) = mode {
-        let (dir, theme) = visual_check::per_theme(dir);
+        let (dir, theme) = visual_theme::per_theme(dir);
         visual_figma::run(dir, theme, native);
     }
     #[cfg(feature = "visual-check")]
     if let Mode::VisualFigmaFixtures(root) = &mode {
-        visual_figma::export_fixtures(root.into());
+        visual_fixtures::export_fixtures(root.into());
     }
     #[cfg(feature = "visual-check")]
     if let Mode::BenchPush(args) = &mode {
         bench_push::run(args);
     }
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     if let Mode::BenchBoard(args) = &mode {
         bench_board::run(args);
     }
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     if let Mode::BenchBuilder(args) = &mode {
         bench_builder::run(args);
     }
-    #[cfg(feature = "visual-check")]
+    #[cfg(all(feature = "visual-check", target_os = "macos"))]
     if let Mode::BenchActivity(args) = &mode {
         bench_activity::run(args);
     }
