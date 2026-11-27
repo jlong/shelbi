@@ -34,6 +34,8 @@
 //!   and the poll intervals), with its validation and save.
 //! - [`tracker`]: the Issues page's form (where the project's issues live,
 //!   its connection's fields and agent rules, and Connect).
+//! - [`wiki`]: the Wiki page's form (where the project's wiki lives, its
+//!   auto-sync, and the hub's sync status with Sync now / Set up wiki).
 //! - [`orchestrator`]: the Orchestrator page's event delivery radio
 //!   (`orchestrator.awareness:`) and its Restart orchestrator.
 //! - [`workspaces`] and [`workspace_form`]: the Workspaces page (the pool,
@@ -62,6 +64,7 @@ pub mod store;
 pub mod summary;
 pub mod terminal_preview;
 pub mod tracker;
+pub mod wiki;
 pub mod workflow_builder;
 pub mod workflow_editor;
 pub mod workflow_graph;
@@ -94,6 +97,9 @@ pub enum SettingsPage {
     /// Where the project's issues live: its issue tracker (the local board,
     /// GitHub or Linear), that connection's fields and its agent rules.
     Issues,
+    /// Where the project's wiki lives (the `wiki:` block), its auto-sync,
+    /// and the hub's sync status.
+    Wiki,
 }
 
 /// Whose settings a page edits.
@@ -117,23 +123,25 @@ impl SettingsPage {
             SettingsPage::Orchestrator => "Orchestrator",
             SettingsPage::Properties => "Properties",
             SettingsPage::Issues => "Issues",
+            SettingsPage::Wiki => "Wiki",
         }
     }
 
     /// Its number while Settings is open: ⌃N in the desktop app (⌘N are
     /// the project tabs), the digit key in the TUI. Counted in the order the
     /// sidebar lists every page, as the Figma frame (2252:27532) numbers
-    /// them: General 1 through Workspaces 9. Both clients offer every page,
-    /// so the count is the same whichever client draws it.
-    pub fn shortcut(self) -> u8 {
+    /// them: General 1 onward. Only nine keys exist, so a page past the
+    /// ninth (Workspaces, since Wiki joined) has no number. Both clients
+    /// offer every page, so the count is the same whichever client draws it.
+    pub fn shortcut(self) -> Option<u8> {
         let at = pages().position(|p| p == self).expect("every page is in a section");
-        at as u8 + 1
+        (at < 9).then_some(at as u8 + 1)
     }
 
     /// The page numbered `n`, offered or not ([`PageSet::for_shortcut`]
     /// asks a client's set).
     pub fn for_shortcut(n: u8) -> Option<SettingsPage> {
-        pages().find(|p| p.shortcut() == n)
+        pages().find(|p| p.shortcut() == Some(n))
     }
 
     pub fn scope(self) -> Scope {
@@ -146,7 +154,8 @@ impl SettingsPage {
             | SettingsPage::Workflows
             | SettingsPage::Agents
             | SettingsPage::Orchestrator
-            | SettingsPage::Issues => Scope::Project,
+            | SettingsPage::Issues
+            | SettingsPage::Wiki => Scope::Project,
         }
     }
 
@@ -162,6 +171,7 @@ impl SettingsPage {
             SettingsPage::Orchestrator => 1 << 6,
             SettingsPage::Properties => 1 << 7,
             SettingsPage::Issues => 1 << 8,
+            SettingsPage::Wiki => 1 << 9,
         }
     }
 }
@@ -200,6 +210,7 @@ pub const SECTIONS: &[Section] = &[
             SettingsPage::Orchestrator,
             SettingsPage::Agents,
             SettingsPage::Issues,
+            SettingsPage::Wiki,
             SettingsPage::Workflows,
             SettingsPage::Workspaces,
         ],
@@ -226,7 +237,8 @@ impl PageSet {
             | SettingsPage::Agents.bit()
             | SettingsPage::Orchestrator.bit()
             | SettingsPage::Properties.bit()
-            | SettingsPage::Issues.bit(),
+            | SettingsPage::Issues.bit()
+            | SettingsPage::Wiki.bit(),
     );
 
     /// No page.
@@ -584,7 +596,7 @@ mod tests {
     fn the_pages_are_numbered_in_order() {
         let all: Vec<_> = pages().collect();
         // Properties leads the project section, then Orchestrator, Agents,
-        // Issues, Workflows, Workspaces.
+        // Issues, Wiki, Workflows, Workspaces.
         assert_eq!(
             all,
             [
@@ -595,23 +607,27 @@ mod tests {
                 SettingsPage::Orchestrator,
                 SettingsPage::Agents,
                 SettingsPage::Issues,
+                SettingsPage::Wiki,
                 SettingsPage::Workflows,
                 SettingsPage::Workspaces,
             ]
         );
-        // Numbered ⌃1 to ⌃9 in that order.
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        // Numbered ⌃1 to ⌃9 in that order; the tenth has no key.
+        assert_eq!(
+            all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9].map(Some).into_iter().chain([None]).collect::<Vec<_>>()
+        );
         assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Properties));
         assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Orchestrator));
         assert_eq!(SettingsPage::for_shortcut(6), Some(SettingsPage::Agents));
         assert_eq!(SettingsPage::for_shortcut(7), Some(SettingsPage::Issues));
-        assert_eq!(SettingsPage::for_shortcut(8), Some(SettingsPage::Workflows));
-        assert_eq!(SettingsPage::for_shortcut(9), Some(SettingsPage::Workspaces));
+        assert_eq!(SettingsPage::for_shortcut(8), Some(SettingsPage::Wiki));
+        assert_eq!(SettingsPage::for_shortcut(9), Some(SettingsPage::Workflows));
         assert_eq!(SettingsPage::for_shortcut(10), None);
         assert_eq!(SettingsPage::for_shortcut(0), None);
         assert_eq!(
             SECTIONS.iter().map(|s| (s.header, s.pages.len())).collect::<Vec<_>>(),
-            [(Header::Title("Global"), 3), (Header::Project, 6)]
+            [(Header::Title("Global"), 3), (Header::Project, 7)]
         );
         assert_eq!(SettingsPage::Terminal.scope(), Scope::Global);
         assert_eq!(SettingsPage::Properties.scope(), Scope::Project);
@@ -619,13 +635,18 @@ mod tests {
         assert_eq!(SettingsPage::Workflows.scope(), Scope::Project);
         assert_eq!(SettingsPage::Orchestrator.scope(), Scope::Project);
         assert_eq!(SettingsPage::Issues.scope(), Scope::Project);
+        assert_eq!(SettingsPage::Wiki.scope(), Scope::Project);
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
-                assert_ne!(a.shortcut(), b.shortcut(), "{a:?} and {b:?} share a number");
+                if a.shortcut().is_some() {
+                    assert_ne!(a.shortcut(), b.shortcut(), "{a:?} and {b:?} share a number");
+                }
                 assert_ne!(a.label(), b.label());
                 assert_ne!(a.bit(), b.bit());
             }
-            assert_eq!(SettingsPage::for_shortcut(a.shortcut()), Some(*a), "its number opens it");
+            if let Some(n) = a.shortcut() {
+                assert_eq!(SettingsPage::for_shortcut(n), Some(*a), "its number opens it");
+            }
             assert!(PageSet::ALL.contains(*a));
         }
     }
@@ -638,7 +659,7 @@ mod tests {
         assert_eq!(tui.pages().collect::<Vec<_>>(), [SettingsPage::General]);
         assert_eq!(tui.for_shortcut(1), Some(SettingsPage::General));
         assert_eq!(tui.for_shortcut(6), None, "Agents isn't offered");
-        assert_eq!(PageSet::ALL.pages().count(), 9);
+        assert_eq!(PageSet::ALL.pages().count(), 10);
         assert_eq!(PageSet::NONE.first(), None);
         // Reversed input still walks in sidebar order.
         let set = PageSet::of(&[SettingsPage::Agents, SettingsPage::General]);

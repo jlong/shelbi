@@ -624,6 +624,78 @@ fn the_orchestrator_awareness_saves_to_the_project_yaml_alone() {
 }
 
 #[test]
+fn the_wiki_block_saves_to_the_project_yaml_and_round_trips() {
+    use shelbi_core::{WikiSource, WikiSyncMode};
+    let home = Home::new();
+    let cfg = load();
+    assert_eq!(cfg.wiki(), None, "no block");
+    assert!(!cfg.set_wiki(None).unwrap().is_dirty(), "no change, no write");
+
+    let block = WikiConfig {
+        branch: Some("docs/planning".into()),
+        ..WikiConfig::default()
+    };
+    let saved = save(&cfg.set_wiki(Some(block.clone())).unwrap());
+    assert_eq!(saved.written, vec![home.projects.join(format!("{PROJECT}.yaml"))]);
+    let text = home.project_yaml();
+    assert!(text.starts_with("## Project header.\n"), "the comments stay: {text}");
+    assert!(
+        text.ends_with("wiki:\n  source: branch\n  branch: docs/planning\n  sync: auto\n"),
+        "{text}"
+    );
+    assert_eq!(load().wiki(), Some(&block));
+    let project = crate::load_project(PROJECT).unwrap();
+    assert_eq!(project.wiki.as_ref(), Some(&block), "the loader reads it");
+
+    // A change patches the block in place.
+    let folder = WikiConfig {
+        source: WikiSource::Folder,
+        path: Some("handbook".into()),
+        sync: WikiSyncMode::Manual,
+        ..block.clone()
+    };
+    save(&load().set_wiki(Some(folder.clone())).unwrap());
+    assert_eq!(load().wiki(), Some(&folder));
+    assert!(home.project_yaml().contains("  source: folder\n"), "{}", home.project_yaml());
+
+    // None takes the block out again.
+    save(&load().set_wiki(None).unwrap());
+    assert_eq!(home.project_yaml(), PROJECT_YAML);
+}
+
+#[test]
+fn an_invalid_wiki_block_is_refused_with_its_field() {
+    let _home = Home::new();
+    let cfg = load();
+    let bad = WikiConfig {
+        path: Some("/etc".into()),
+        ..WikiConfig::default()
+    };
+    let err = cfg.set_wiki(Some(bad)).unwrap_err().to_string();
+    assert!(err.contains("wiki.path `/etc`") && err.contains("relative"), "{err}");
+    let bad = WikiConfig {
+        branch: Some("has space".into()),
+        ..WikiConfig::default()
+    };
+    assert!(cfg.set_wiki(Some(bad)).unwrap_err().to_string().contains("wiki.branch"));
+}
+
+#[test]
+fn a_wiki_block_that_doesnt_parse_says_why_and_is_left_alone() {
+    let home = Home::new();
+    let text = format!("{PROJECT_YAML}wiki:\n  source: git\n");
+    fs::write(home.projects.join(format!("{PROJECT}.yaml")), &text).unwrap();
+    let cfg = load();
+    assert_eq!(cfg.wiki(), None);
+    assert!(cfg.wiki_unreadable().unwrap().contains("unknown wiki source `git`"));
+    // Another setting's save doesn't touch it.
+    assert!(!cfg.set_wiki(None).unwrap().is_dirty());
+    // Replacing it writes a good block.
+    save(&cfg.set_wiki(Some(WikiConfig::default())).unwrap());
+    assert!(home.project_yaml().ends_with("wiki:\n  source: branch\n  sync: auto\n"), "{}", home.project_yaml());
+}
+
+#[test]
 fn the_default_and_the_last_workflow_cant_be_deleted() {
     let home = Home::new();
     let cfg = load();

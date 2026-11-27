@@ -24,6 +24,7 @@ use shelbi_app::wiki::{
     Author, EntryKind, FailureKind, NodeKind, SyncOp, WikiEntry, WikiFailure, WikiNode, WikiReply, WikiRequest,
     WikiStatus,
 };
+use shelbi_core::{WikiConfig, WikiSource};
 
 /// `shelbi wiki --help`: the commands grouped as `cstore help` groups them.
 pub const HELP_TEMPLATE: &str = "\
@@ -58,6 +59,7 @@ TASKS
 
 SYNC
   sync        Show the sync's status, or sync now, pause, resume
+  init        Set up the wiki (an orphan branch, or a repo folder)
 
 APP INTEGRATION
   open        Show the wiki (or a document) in the desktop app
@@ -404,6 +406,49 @@ EXAMPLES
         #[arg(value_enum, default_value_t = SyncAction::Status)]
         action: SyncAction,
     },
+    /// Set up the project's wiki: write the project YAML's `wiki:` block and
+    /// have the hub create it.
+    #[command(after_help = "\
+By default the wiki is the orphan branch docs/planning, checked out by the hub
+beside the repo and created (and pushed) when origin doesn't have it. With
+--source folder it's a folder of the repo (docs unless --path says), whose
+edits go to one rolling pull request. Run it again to change the source,
+branch or folder; flags left out keep what the block already says.
+
+EXAMPLES
+  shelbi wiki init                           The orphan branch docs/planning
+  shelbi wiki init --branch wiki             Another orphan branch
+  shelbi wiki init --source folder           The repo's docs/ folder
+  shelbi wiki init --path handbook           The repo's handbook/ folder")]
+    Init {
+        /// Where the wiki lives: `branch` (an orphan branch) or `folder` (a
+        /// folder of the repo). Inferred from --branch or --path when left
+        /// out.
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+        /// The orphan branch (`--source branch`; default docs/planning).
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+        /// The repo folder, relative to its root (`--source folder`;
+        /// default docs).
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SourceArg {
+    Branch,
+    Folder,
+}
+
+impl From<SourceArg> for WikiSource {
+    fn from(s: SourceArg) -> Self {
+        match s {
+            SourceArg::Branch => WikiSource::Branch,
+            SourceArg::Folder => WikiSource::Folder,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -442,6 +487,16 @@ pub struct ContentArg {
 /// Where requests go: this machine's hub in production.
 pub trait Hub {
     fn ask(&self, req: WikiRequest) -> WikiReply;
+
+    /// The project YAML's `wiki:` block (`init` reads it first).
+    fn wiki_block(&self) -> Result<Option<WikiConfig>, Failure> {
+        Err(Failure::failed("this hub can't read the project's settings"))
+    }
+
+    /// Write the project YAML's `wiki:` block (`init`).
+    fn write_wiki_block(&self, _block: &WikiConfig) -> Result<(), Failure> {
+        Err(Failure::failed("this hub can't write the project's settings"))
+    }
 }
 
 /// This machine's hub daemon, started on demand.
@@ -452,6 +507,22 @@ struct LocalHub {
 impl Hub for LocalHub {
     fn ask(&self, req: WikiRequest) -> WikiReply {
         shelbi_app::wiki::ask_local(&self.project, req)
+    }
+
+    fn wiki_block(&self) -> Result<Option<WikiConfig>, Failure> {
+        let config = shelbi_state::workflow_config::WorkflowConfig::load(&self.project)
+            .map_err(|e| Failure::failed(format!("reading the project's settings: {e}")))?;
+        Ok(config.wiki().cloned())
+    }
+
+    fn write_wiki_block(&self, block: &WikiConfig) -> Result<(), Failure> {
+        // The comment-preserving, hash-checked write Settings ▸ Wiki makes.
+        let config = shelbi_state::workflow_config::WorkflowConfig::load(&self.project)
+            .map_err(|e| Failure::failed(format!("reading the project's settings: {e}")))?;
+        let next = config.set_wiki(Some(block.clone())).map_err(|e| Failure::invalid(e.to_string()))?;
+        next.save()
+            .map(|_| ())
+            .map_err(|e| Failure::failed(format!("writing the project's settings: {e}")))
     }
 }
 
@@ -846,7 +917,82 @@ pub fn execute(hub: &dyn Hub, input: &dyn Input, cmd: WikiCmd, json: bool) -> Ou
                 other => Err(unexpected(other)),
             }
         }
+        WikiCmd::Init { source, branch, path } => init(hub, source.map(WikiSource::from), branch, path, json),
     }
+}
+
+/// `init`: the block the flags ask for (over the one the project YAML has),
+/// written when it changed, then the hub's setup.
+fn init(
+    hub: &dyn Hub,
+    source: Option<WikiSource>,
+    branch: Option<String>,
+    path: Option<String>,
+    json: bool,
+) -> Outcome {
+    let source = match (source, &branch, &path) {
+        (Some(s), _, _) => Some(s),
+        (None, Some(_), Some(_)) => {
+            return Err(Failure::invalid("pass --branch (an orphan branch) or --path (a repo folder), not both"))
+        }
+        (None, Some(_), None) => Some(WikiSource::Branch),
+        (None, None, Some(_)) => Some(WikiSource::Folder),
+        (None, None, None) => None,
+    };
+    match source {
+        Some(WikiSource::Folder) if branch.is_some() => {
+            return Err(Failure::invalid("--branch is for --source branch; a folder wiki takes --path"))
+        }
+        Some(WikiSource::Branch) if path.is_some() => {
+            return Err(Failure::invalid("--path is for --source folder; a branch wiki takes --branch"))
+        }
+        _ => {}
+    }
+    let existing = hub.wiki_block()?;
+    let mut block = existing.clone().unwrap_or_default();
+    if let Some(s) = source {
+        block.source = s;
+    }
+    if let Some(b) = branch {
+        block.branch = Some(b.trim().to_string());
+    }
+    if let Some(p) = path {
+        block.path = Some(p.trim().trim_end_matches('/').to_string()).filter(|p| !p.is_empty());
+    }
+    let block = shelbi_app::settings::wiki::filled(block);
+    block.validate().map_err(|e| Failure::invalid(e.to_string()))?;
+    let wrote = existing.as_ref() != Some(&block);
+    if wrote {
+        hub.write_wiki_block(&block)?;
+    }
+    let status = match hub.ask(WikiRequest::Init) {
+        WikiReply::Status(s) => s,
+        WikiReply::Failed(f) => {
+            let mut f = Failure::from_wire(f);
+            if wrote {
+                f.message.push_str(" (the `wiki:` block is written; the hub tries again on its own)");
+            }
+            return Err(f);
+        }
+        other => return Err(unexpected(other)),
+    };
+    if json {
+        let mut value: Value = serde_json::from_str(&render_status(&status, true)).unwrap_or(Value::Null);
+        if let Value::Object(map) = &mut value {
+            map.insert("wrote_block".into(), Value::Bool(wrote));
+        }
+        return Ok(pretty(&value));
+    }
+    let place = match block.source {
+        WikiSource::Branch => format!("the orphan branch {}", block.worktree_branch()),
+        WikiSource::Folder => format!("the repo folder {}/", block.folder().unwrap_or("docs")),
+    };
+    let lead = if wrote {
+        format!("The wiki is set up on {place}.\n")
+    } else {
+        format!("The wiki was already set up on {place}.\n")
+    };
+    Ok(format!("{lead}{}", render_status(&status, false)))
 }
 
 /// A path as the hub takes it: no leading or trailing `/`. `""` (or `/`)
@@ -1228,7 +1374,7 @@ pub fn render_status(s: &WikiStatus, json: bool) -> String {
         }));
     }
     if !s.set_up {
-        return "This project has no wiki yet.\n".into();
+        return "This project has no wiki yet; `shelbi wiki init` sets one up.\n".into();
     }
     let mut state = s.state.to_string();
     if s.paused {
@@ -1372,6 +1518,102 @@ mod tests {
             path: path.into(),
             content: content.into(),
         }
+    }
+
+    /// A hub over an in-memory `wiki:` block.
+    struct ConfigHub {
+        inner: FakeHub,
+        block: RefCell<Option<WikiConfig>>,
+        writes: RefCell<usize>,
+    }
+
+    impl Hub for ConfigHub {
+        fn ask(&self, req: WikiRequest) -> WikiReply {
+            self.inner.ask(req)
+        }
+        fn wiki_block(&self) -> Result<Option<WikiConfig>, Failure> {
+            Ok(self.block.borrow().clone())
+        }
+        fn write_wiki_block(&self, block: &WikiConfig) -> Result<(), Failure> {
+            *self.block.borrow_mut() = Some(block.clone());
+            *self.writes.borrow_mut() += 1;
+            Ok(())
+        }
+    }
+
+    fn config_hub(block: Option<WikiConfig>) -> ConfigHub {
+        ConfigHub {
+            inner: FakeHub::new(|_| {
+                WikiReply::Status(WikiStatus {
+                    set_up: true,
+                    branch: "docs/planning".into(),
+                    source: "branch".into(),
+                    ..WikiStatus::not_set_up()
+                })
+            }),
+            block: RefCell::new(block),
+            writes: RefCell::new(0),
+        }
+    }
+
+    fn exec_on(hub: &dyn Hub, argv: &[&str]) -> Outcome {
+        let args = parse(argv);
+        let json = args.agent || args.format == Format::Json;
+        execute(hub, &FakeInput(None), args.cmd, json)
+    }
+
+    #[test]
+    fn init_writes_the_default_branch_block_and_asks_the_hub() {
+        let hub = config_hub(None);
+        let out = exec_on(&hub, &["init"]).unwrap();
+        assert!(out.starts_with("The wiki is set up on the orphan branch docs/planning."), "{out}");
+        let block = hub.block.borrow().clone().unwrap();
+        assert_eq!(block.source, WikiSource::Branch);
+        assert_eq!(block.branch.as_deref(), Some("docs/planning"), "the default is spelled out");
+        assert_eq!(hub.inner.asked.borrow().as_slice(), [WikiRequest::Init]);
+        // Again: nothing to write, the hub is asked again.
+        let out = exec_on(&hub, &["init"]).unwrap();
+        assert!(out.starts_with("The wiki was already set up"), "{out}");
+        assert_eq!(*hub.writes.borrow(), 1);
+    }
+
+    #[test]
+    fn init_sets_up_folder_mode_and_keeps_what_the_flags_leave_out() {
+        let hub = config_hub(Some(WikiConfig {
+            sync: shelbi_core::WikiSyncMode::Manual,
+            ..WikiConfig::default()
+        }));
+        exec_on(&hub, &["init", "--source", "folder"]).unwrap();
+        let block = hub.block.borrow().clone().unwrap();
+        assert_eq!((block.source, block.path.as_deref()), (WikiSource::Folder, Some("docs")));
+        assert_eq!(block.sync, shelbi_core::WikiSyncMode::Manual, "kept");
+        // --path alone means folder mode.
+        let hub = config_hub(None);
+        exec_on(&hub, &["init", "--path", "handbook/"]).unwrap();
+        let block = hub.block.borrow().clone().unwrap();
+        assert_eq!((block.source, block.path.as_deref()), (WikiSource::Folder, Some("handbook")));
+        let json: Value = serde_json::from_str(&exec_on(&hub, &["init", "--format", "json"]).unwrap()).unwrap();
+        assert_eq!(json["wrote_block"], Value::Bool(false));
+        assert_eq!(json["set_up"], Value::Bool(true));
+    }
+
+    #[test]
+    fn init_refuses_a_bad_value_or_mixed_flags_before_writing() {
+        for argv in [
+            &["init", "--path", "/abs"][..],
+            &["init", "--source", "folder", "--path", "../x"],
+            &["init", "--branch", "has space"],
+            &["init", "--source", "folder", "--branch", "wiki"],
+            &["init", "--source", "branch", "--path", "docs"],
+            &["init", "--branch", "wiki", "--path", "docs"],
+        ] {
+            let hub = config_hub(None);
+            let err = exec_on(&hub, argv).unwrap_err();
+            assert_eq!(err.kind.exit_code(), 3, "{argv:?}: {}", err.message);
+            assert!(hub.block.borrow().is_none() && hub.inner.asked.borrow().is_empty(), "{argv:?}");
+        }
+        let err = exec_on(&config_hub(None), &["init", "--path", "../x"]).unwrap_err();
+        assert!(err.message.contains("wiki.path `../x`"), "{}", err.message);
     }
 
     #[test]

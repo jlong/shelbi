@@ -54,6 +54,7 @@ impl PageLook for SettingsPage {
             SettingsPage::Properties => icons::LIST_BULLET,
             // The sidebar's Issues view's stack.
             SettingsPage::Issues => icons::RECTANGLE_STACK,
+            SettingsPage::Wiki => icons::BOOK_OPEN,
         }
     }
 
@@ -68,6 +69,7 @@ impl PageLook for SettingsPage {
             SettingsPage::Orchestrator => "settings-nav-orchestrator",
             SettingsPage::Properties => "settings-nav-properties",
             SettingsPage::Issues => "settings-nav-issues",
+            SettingsPage::Wiki => "settings-nav-wiki",
         }
     }
 }
@@ -215,10 +217,11 @@ pub fn render<H: SidebarHost>(
                         )
                     });
                     // The frame's hotkeys sit at the row's padding, no inset of their own.
-                    let hotkey = style::hotkey(&row_hotkey(page.shortcut()), theme)
-                        .px_0()
-                        .into_any_element();
-                    nav_item(painted, page.icon(), page.label(), Some(hotkey), on, theme).on_click(
+                    // A page past the ninth has no number.
+                    let hotkey = page
+                        .shortcut()
+                        .map(|n| style::hotkey(&row_hotkey(n), theme).px_0().into_any_element());
+                    nav_item(painted, page.icon(), page.label(), hotkey, on, theme).on_click(
                         cx.listener(move |this, _, window, cx| {
                             this.sidebar_event(SidebarEvent::ShowSettingsPage(page), window, cx)
                         }),
@@ -284,9 +287,13 @@ mod tests {
         let icons: Vec<String> = all.iter().map(|p| format!("{:?}", p.icon())).collect();
         let distinct: std::collections::HashSet<_> = icons.iter().collect();
         assert_eq!(distinct.len(), all.len());
-        // This client offers every page, numbered ⌃1 to ⌃9 in sidebar order.
+        // This client offers every page, numbered ⌃1 to ⌃9 in sidebar order
+        // (the tenth has no number).
         assert_eq!(SettingsNav::default().available(), shelbi_app::settings::PageSet::ALL);
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9].map(Some).into_iter().chain([None]).collect::<Vec<_>>()
+        );
         // The frame's icons: Properties' list, Agents' robot (John's drawing).
         assert_eq!(SettingsPage::Properties.icon(), icons::LIST_BULLET);
         assert_eq!(SettingsPage::Agents.icon(), icons::ROBOT);
@@ -294,5 +301,6 @@ mod tests {
         assert_eq!(SettingsPage::Workspaces.icon(), icons::FOLDER);
         assert_eq!(SettingsPage::Workflows.icon(), icons::VIEW_COLUMNS);
         assert_eq!(SettingsPage::Issues.icon(), icons::RECTANGLE_STACK);
+        assert_eq!(SettingsPage::Wiki.icon(), icons::BOOK_OPEN);
     }
 }

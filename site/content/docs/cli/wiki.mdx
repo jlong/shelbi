@@ -243,6 +243,19 @@ shelbi wiki open Plans/auth.md
 
 ### init
 
-Sets the project's wiki up when it has none: from its `wiki:` block, or on the
-default orphan branch, `docs/planning`, when it has no block. See
-[Where it lives](/docs/concepts/wiki#where-it-lives).
+Sets the project's wiki up: writes the project YAML's `wiki:` block, then has
+the hub create the wiki. With no flags it's the orphan branch `docs/planning`
+(or what the block already says). `--branch` picks another orphan branch;
+`--source folder` uses a folder of the repo, `docs` unless `--path` names
+another (relative to the repo's root, inside it). `--branch` alone implies
+`--source branch` and `--path` alone `--source folder`. Flags left out keep
+what the block says, so running it again changes only what you pass. A branch
+git won't take, or a path outside the repo, is refused (exit 3) before
+anything is written. See [Where it lives](/docs/concepts/wiki#where-it-lives).
+
+```sh
+shelbi wiki init                       # the orphan branch docs/planning
+shelbi wiki init --branch wiki         # another orphan branch
+shelbi wiki init --source folder       # the repo's docs/ folder
+shelbi wiki init --path handbook       # the repo's handbook/ folder
+```

@@ -167,6 +167,13 @@ pub enum Error {
     #[error("{0}")]
     InvalidReleases(String),
 
+    /// A project's `wiki:` block names a branch git won't take or a folder
+    /// outside the repo. The message names the field (`wiki.branch`,
+    /// `wiki.path`). Never fails a project load; the hub refuses to set the
+    /// wiki up and `shelbi config lint` reports it.
+    #[error("{0}")]
+    InvalidWiki(String),
+
     /// A project's `issue_tracker` block selects a valid remote backend whose
     /// live store is not built yet (`jira`). Distinct from
     /// [`Error::InvalidIssueTracker`] (a config error the
