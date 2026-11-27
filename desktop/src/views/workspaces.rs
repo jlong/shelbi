@@ -47,7 +47,7 @@ use gpui::{
 use shelbi_app::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
 use shelbi_core::MachineKind;
 
-use super::workflows::{popup, row_button, table, MENU_GAP};
+use super::workflows::{name_and_columns, popup, row_button, table, MENU_GAP};
 use shelbi_app::settings::workspace_form::Outcome;
 use shelbi_app::settings::workspaces::{
     kind_label, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
@@ -59,7 +59,8 @@ use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// The table's columns (`Workspace columns`, 2523:9166): the machine, the
-/// tags, the slot and the buttons; the workspace takes the rest.
+/// tags, the slot and the buttons; the workspace takes the rest, and a
+/// narrow table wraps the columns under it ([`name_and_columns`]).
 const MACHINE_W: f32 = 140.0;
 const TAGS_W: f32 = 268.0;
 const SLOT_W: f32 = 56.0;
@@ -419,17 +420,16 @@ impl WorkspacesPage {
                     this.button_key(e, Intent::NewWorkspace, Origin::New, cx)
                 }))
                 .on_click(cx.listener(|this, _, _, cx| this.open(Intent::NewWorkspace, Origin::New, cx)));
-        let headings = div()
-            .flex()
-            .flex_row()
-            .gap(px(24.0))
-            .px(px(12.0))
-            .py(px(6.0))
-            .child(div().flex_1().min_w_0().child("Workspace"))
-            .child(div().w(px(MACHINE_W)).flex_none().child("Machine"))
-            .child(div().w(px(TAGS_W)).flex_none().child("Tags"))
-            .child(div().w(px(SLOT_W)).flex_none().child("Slot"))
-            .child(div().w(px(ACTIONS_W)).flex_none());
+        let headings = name_and_columns(
+            div().px(px(12.0)).py(px(6.0)),
+            div().child("Workspace"),
+            [
+                div().w(px(MACHINE_W)).flex_none().child("Machine").into_any_element(),
+                div().w(px(TAGS_W)).min_w_0().child("Tags").into_any_element(),
+                div().w(px(SLOT_W)).flex_none().child("Slot").into_any_element(),
+                div().w(px(ACTIONS_W)).flex_none().into_any_element(),
+            ],
+        );
         let rows: Vec<AnyElement> = match self.state.load() {
             Load::Loading => vec![table_message("workspaces-loading", "Loading workspaces…", theme)],
             Load::Failed(_) => Vec::new(),
@@ -587,7 +587,7 @@ impl WorkspacesPage {
             .flex()
             .flex_row()
             .flex_wrap()
-            .flex_none()
+            .min_w_0()
             .items_center()
             .gap_x(px(12.0))
             .gap_y(px(4.0))
@@ -628,25 +628,20 @@ impl WorkspacesPage {
         let row_id = SharedString::from(format!("workspace-row-{name}"));
         let selector = row_id.clone();
         let edit_row = name.clone();
-        div()
+        let row = div()
             .id(row_id)
             .debug_selector(move || selector.to_string())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(24.0))
             .px(px(12.0))
             .py(px(16.0))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.open(Intent::EditWorkspace(edit_row.clone()), Origin::Edit(edit_row.clone()), cx)
-            }))
-            .child(
-                div()
+            }));
+        name_and_columns(
+            row,
+            div()
                     .flex()
                     .flex_col()
-                    .flex_1()
-                    .min_w_0()
                     .gap(px(2.0))
                     .child(
                         clipped(format!("workspace-name-{name}"), w.name.clone())
@@ -658,11 +653,10 @@ impl WorkspacesPage {
                             .type_style(Type::Small)
                             .text_color(theme.form_hint),
                     ),
-            )
-            .child(machine)
-            .child(tags)
-            .child(slot)
-            .child(
+            [
+                machine.into_any_element(),
+                tags.into_any_element(),
+                slot.into_any_element(),
                 div()
                     .relative()
                     .flex()
@@ -673,9 +667,11 @@ impl WorkspacesPage {
                     .w(px(ACTIONS_W))
                     .child(edit)
                     .child(more)
-                    .children(menu),
-            )
-            .into_any_element()
+                    .children(menu)
+                    .into_any_element(),
+            ],
+        )
+        .into_any_element()
     }
 
     /// A workspace's ⋮ menu: Edit, a rule, Remove.

@@ -130,3 +130,29 @@ fn an_existing_project_goes_straight_to_the_chat(cx: &mut TestAppContext) {
     let h = open(cx);
     assert!(onboarding(&h).is_none());
 }
+
+/// A window tiled at half a 1920pt screen (Hyprland's second window): the
+/// columns narrow to the main area instead of running off its left edge.
+#[gpui::test]
+fn the_steps_fit_a_narrow_window(cx: &mut TestAppContext) {
+    let _home = home();
+    let mut h = open(cx);
+    h.cx.simulate_resize(gpui::size(gpui::px(940.0), gpui::px(900.0)));
+    h.draw();
+    h.draw();
+    let inside = |h: &mut Harness, selector: &'static str| {
+        let area = h.cx.debug_bounds("onboarding").unwrap();
+        let b = h.cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} drawn"));
+        assert!(b.left() >= area.left() && b.right() <= area.right(), "{selector} {b:?} inside {area:?}");
+        b
+    };
+    inside(&mut h, "onboarding-intro-step");
+    inside(&mut h, "onboarding-title");
+    h.click_selector("onboarding-get-started");
+    h.draw();
+    let step = inside(&mut h, "onboarding-harness-step");
+    let picker = inside(&mut h, "onboarding-harness");
+    assert!(f32::from(picker.size.width) < 620.0, "narrower than the Figma column");
+    assert_eq!(picker.size.width, step.size.width, "as wide as its column");
+    inside(&mut h, "onboarding-continue");
+}

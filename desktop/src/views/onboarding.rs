@@ -15,6 +15,10 @@
 //!    `Markdown` at the right over a 400pt monospace editor, a rule, and
 //!    Back (left) and Launch Orchestrator (right).
 //!
+//! The columns are their widest: a narrower main area (a window tiled at
+//! half a screen) draws them as wide as it is, inside the 40pt inset, and
+//! the pickers' menus as wide as their column.
+//!
 //! Esc goes Back from step 3 (and 2); Enter presses Get started on step 1.
 //! The reads and saves run off the UI thread; once Launch Orchestrator's
 //! save lands the view emits [`OnboardingEvent::Launched`] and the window
@@ -66,6 +70,9 @@ pub struct OnboardingView {
     state: OnboardingState,
     menu: Option<Menu>,
     menu_anchor: style::Anchor,
+    /// Where step 2's column last painted: narrower than [`COLUMN_W`] in a
+    /// narrow window, and its pickers' menus are as wide.
+    column: style::Anchor,
     instructions: Entity<TextareaState>,
     focus: FocusHandle,
     /// Default model ▸ Custom model…, while it's open.
@@ -98,6 +105,7 @@ impl OnboardingView {
             state: OnboardingState::new(project),
             menu: None,
             menu_anchor: Default::default(),
+            column: Default::default(),
             instructions,
             focus: cx.focus_handle(),
             custom_model: None,
@@ -311,7 +319,7 @@ impl OnboardingView {
             .flex()
             .flex_col()
             .gap(px(12.0))
-            .w(px(INTRO_W))
+            .w_full()
             .text_center()
             .child(
                 div()
@@ -339,7 +347,8 @@ impl OnboardingView {
             .flex_none()
             .items_center()
             .gap(px(24.0))
-            .w(px(INTRO_W))
+            .w_full()
+            .max_w(px(INTRO_W))
             .child(disc)
             .child(text)
             .child(start)
@@ -387,7 +396,7 @@ impl OnboardingView {
                 enabled: !m.loading && !m.busy,
                 model_enabled: m.model_enabled,
                 model_note: m.model_note.clone(),
-                width: COLUMN_W,
+                width: self.column.get().map_or(COLUMN_W, |b| f32::from(b.size.width).min(COLUMN_W)),
                 ring: (false, false),
                 custom: self.custom_model.as_ref(),
             },
@@ -413,11 +422,14 @@ impl OnboardingView {
         };
         div()
             .debug_selector(|| "onboarding-harness-step".into())
+            .relative()
             .flex()
             .flex_col()
             .flex_none()
             .gap(px(32.0))
-            .w(px(COLUMN_W))
+            .w_full()
+            .max_w(px(COLUMN_W))
+            .child(style::anchor_probe(&self.column))
             .child(Self::heading(HARNESS_TITLE, HARNESS_BODY, theme))
             .child(fields)
             .children(m.error.as_deref().map(|e| error_line("onboarding-error".into(), e, theme)))
@@ -458,7 +470,8 @@ impl OnboardingView {
             .flex_col()
             .flex_none()
             .gap(px(24.0))
-            .w(px(COLUMN_W))
+            .w_full()
+            .max_w(px(COLUMN_W))
             .child(Self::heading(INSTRUCTIONS_TITLE, INSTRUCTIONS_BODY, theme))
             .child(
                 div()

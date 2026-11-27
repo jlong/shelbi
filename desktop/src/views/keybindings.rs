@@ -403,7 +403,7 @@ impl KeybindingsPage {
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .w(px(controls::LABELED_MAX_W))
+            .w_full()
             .debug_selector(move || format!("keybindings-group-{}", context.mode))
             .child(
                 div()
@@ -413,16 +413,18 @@ impl KeybindingsPage {
                     .gap(px(12.0))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .flex_none()
                             .type_style(Type::BaseMedium)
                             .text_color(theme.text_loud)
                             .child(context.title),
                     )
                     .child(
+                        // A narrow window cuts the hint short, never the title.
                         div()
-                            .flex_none()
-                            .whitespace_nowrap()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_right()
                             .type_style(Type::XSmall)
                             .text_color(theme.form_hint)
                             .child(context.hint),
@@ -444,7 +446,7 @@ impl KeybindingsPage {
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .w(px(controls::LABELED_MAX_W))
+            .w_full()
             .debug_selector(|| "keybindings-group-app".into())
             .child(
                 div()
@@ -454,16 +456,18 @@ impl KeybindingsPage {
                     .gap(px(12.0))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .flex_none()
                             .type_style(Type::BaseMedium)
                             .text_color(theme.text_loud)
                             .child("App"),
                     )
                     .child(
+                        // A narrow window cuts the hint short, never the title.
                         div()
-                            .flex_none()
-                            .whitespace_nowrap()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_right()
                             .type_style(Type::XSmall)
                             .text_color(theme.form_hint)
                             .child("Built in, everywhere in the window; not set in keys.yaml"),
@@ -672,13 +676,16 @@ impl Render for KeybindingsPage {
             .debug_selector(|| "keybindings-list".into())
             .flex_1()
             .min_h_0()
-            .w(px(controls::LABELED_MAX_W + HOVER_W))
+            .w_full()
+            .max_w(px(controls::LABELED_MAX_W + HOVER_W))
             .overflow_y_scroll()
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(24.0))
+                    // Room for the hover buttons past the rows' right edge.
+                    .pr(px(HOVER_W))
                     .children(groups.iter().map(|g| self.render_group(g, &theme, cx)))
                     .when(!app.is_empty(), |d| d.child(self.render_app_shortcuts(&app, &theme)))
                     .when(groups.is_empty() && app.is_empty(), |d| {
