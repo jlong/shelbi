@@ -1091,14 +1091,17 @@ pub enum RebaseOutcome {
         default_sha: String,
         stderr_excerpt: String,
         /// Paths git left in a conflicted (unmerged) state, captured before
-        /// the abort. Empty when git couldn't enumerate them. Callers that
-        /// report conflicts machine-readably (e.g. `zen probe`'s
+        /// the abort. Never empty: a failed rebase with no unmerged paths is
+        /// not a conflict and comes back as [`RebaseOutcome::Skipped`].
+        /// Callers that report conflicts machine-readably (e.g. `zen probe`'s
         /// `rebase_conflict`) surface this list.
         files: Vec<String>,
     },
-    /// The rebase couldn't even be attempted (default branch missing,
-    /// uncommitted changes that aren't ours to absorb, git itself errored).
-    /// The reason field explains why so the events.log row is actionable.
+    /// The rebase couldn't be attempted (default branch missing, uncommitted
+    /// changes that aren't ours to absorb, git itself errored) or failed for
+    /// a reason other than a content conflict (`rebase_failed:<git error>`,
+    /// e.g. commit signing that can't reach its key). The reason field
+    /// explains why so the events.log row is actionable.
     Skipped { reason: String },
 }
 
@@ -1364,16 +1367,17 @@ pub fn rebase_workspace_branch_onto_default(
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let combined = format!("{stderr}{stdout}");
-        let excerpt = combined
-            .lines()
+        // Split on `\r` too: git's `Rebasing (1/1)` progress shares a line
+        // with the message that follows it.
+        let lines = || combined.split(['\n', '\r']);
+        let excerpt = lines()
             .find(|l| {
                 let lc = l.to_ascii_lowercase();
                 lc.contains("conflict") || lc.contains("error")
             })
             .map(|l| l.trim().to_string())
             .unwrap_or_else(|| {
-                combined
-                    .lines()
+                lines()
                     .map(|l| l.trim())
                     .find(|l| !l.is_empty())
                     .unwrap_or("rebase failed")
@@ -1420,6 +1424,16 @@ pub fn rebase_workspace_branch_onto_default(
                 reason: format!(
                     "rebase_abort_restored_wrong_HEAD(expected_{before_sha},found_{restored_head})"
                 ),
+            };
+        }
+        // A conflict stops the rebase with unmerged paths in the index. A
+        // failure with none (commit signing that can't reach its key, a
+        // hook, a missing identity) is not a conflict: calling it one tells
+        // every caller the branch needs a human to resolve paths that don't
+        // exist. Report git's own reason instead.
+        if files.is_empty() {
+            return RebaseOutcome::Skipped {
+                reason: format!("rebase_failed:{excerpt}"),
             };
         }
         return RebaseOutcome::Conflict {
@@ -13019,6 +13033,48 @@ mod rebase_git_tests {
             stdout.trim().is_empty(),
             "worktree must be clean after abort, got: {stdout}"
         );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn non_conflict_rebase_failure_is_skipped_with_git_reason() {
+        // Regression (zen-probe-false-rebase-conflict): a branch one commit
+        // behind main, touching none of main's files, whose rebase fails
+        // because commit signing can't run. There are no unmerged paths, so
+        // it must not come back as a Conflict (with an empty file list), but
+        // as Skipped carrying git's reason, with HEAD restored.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("sign-fails");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "feature\n", "feature work");
+        let feature_before = head_sha(&repo);
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq landed");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+
+        // Signing is required from here on, and the signer always fails.
+        run_git_in(&repo, &["config", "commit.gpgsign", "true"]);
+        run_git_in(&repo, &["config", "gpg.format", "openpgp"]);
+        run_git_in(&repo, &["config", "gpg.program", "false"]);
+
+        let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
+        match &outcome {
+            RebaseOutcome::Skipped { reason } => {
+                assert!(
+                    reason.starts_with("rebase_failed:"),
+                    "expected a rebase_failed reason, got {reason:?}"
+                );
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert_eq!(outcome.status_token(), "skipped");
+        assert_eq!(head_sha(&repo), feature_before, "HEAD must be restored");
+        let status = run_git_in(&repo, &["status", "--porcelain"]);
+        assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
 
         let _ = std::fs::remove_dir_all(&repo);
     }
