@@ -65,6 +65,7 @@ pub mod awareness_plugin;
 pub mod tracker_connect;
 pub mod transition;
 pub mod wake;
+pub mod wiki;
 pub mod workspace;
 pub mod workspace_session;
 pub mod zen;

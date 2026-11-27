@@ -488,6 +488,7 @@ pub(crate) mod test_support {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
         };

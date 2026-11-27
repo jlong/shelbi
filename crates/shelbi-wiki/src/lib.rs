@@ -19,15 +19,26 @@
 //!   ContextStore's UI: document titles and sort order, renaming a file after
 //!   its H1, and frontmatter as an ordered property list.
 //!
-//! Everything is synchronous and does no networking; hub, CLI and UI
-//! behavior live elsewhere.
+//! Shelbi's own modules sit beside the copied ones:
+//!
+//! - [`git`]: the git CLI, run non-interactively under a deadline.
+//! - [`sync`]: the wiki's git sync (worktree setup, commit, pull and merge,
+//!   conflict hold, push), over the git CLI rather than libgit2.
+//! - [`service`]: the hub's per-project wiki service: the single writer of
+//!   the wiki's files, its filesystem watcher, and the commit and pull clocks.
+//!
+//! Everything is synchronous (std threads, no async runtime); the CLI, the
+//! hub protocol and the UIs live elsewhere.
 
 pub mod doc_rename;
 pub mod domain;
 pub mod frontmatter;
 pub mod fs;
+pub mod git;
 pub mod ignore;
 pub mod markdown;
 pub mod merge;
 pub mod model;
 pub mod search;
+pub mod service;
+pub mod sync;

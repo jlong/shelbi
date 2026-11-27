@@ -8288,6 +8288,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
         }
     }
 
@@ -14141,6 +14142,7 @@ mod sync_worktree_git_tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
         }
     }
 
@@ -15412,6 +15414,7 @@ mod sync_worktree_freshcut_tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
         }
     }
 
@@ -15880,6 +15883,7 @@ mod sync_worktree_freshcut_tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
         }
     }
 

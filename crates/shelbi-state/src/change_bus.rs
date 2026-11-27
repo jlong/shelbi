@@ -59,6 +59,17 @@ pub enum ChangeNotification {
     /// client should place. Nested rather than flattened so the layout variants
     /// evolve independently of the top-level `change` tag.
     Layout { project: String, event: LayoutEvent },
+    /// Documents of `project`'s wiki changed: `paths` (wiki-relative), by
+    /// `source` (`local`, `agent` or `pull`). A client refreshes the tree and
+    /// any open document. A client too old for it skips the line.
+    Wiki {
+        project: String,
+        paths: Vec<String>,
+        source: String,
+    },
+    /// `project`'s wiki sync status is now `status` (`synced`, `syncing`,
+    /// `pending`, `offline`, `conflict`, `error <detail>`).
+    WikiStatus { project: String, status: String },
 }
 
 impl ChangeNotification {
@@ -70,6 +81,8 @@ impl ChangeNotification {
             ChangeNotification::Board { project } => project,
             ChangeNotification::Workspace { project, .. } => project,
             ChangeNotification::Layout { project, .. } => project,
+            ChangeNotification::Wiki { project, .. } => project,
+            ChangeNotification::WikiStatus { project, .. } => project,
         }
     }
 
