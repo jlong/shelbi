@@ -73,6 +73,19 @@ pub fn needs_onboarding(project: &str) -> bool {
     !shelbi_state::orchestrator_onboarded(project)
 }
 
+/// Record `project` open while it shows the onboarding, as the
+/// orchestrator's launch would have. A client shows it, so it counts as
+/// open: the daemon doesn't idle-exit under it, and its tab follows the open
+/// set like any other project's. Nothing starts: the supervisor only
+/// relaunches an orchestrator it saw alive, and this one never ran.
+/// Best-effort (a failed write is logged, not shown) and blocking: run it
+/// off the UI thread.
+pub fn hold_open(project: &str) {
+    if let Err(error) = shelbi_state::set_project_open(project, true) {
+        tracing::warn!(project, %error, "couldn't record the onboarding project as open");
+    }
+}
+
 /// What [`load`] reads: the project's agents and the runner the
 /// orchestrator launches on.
 #[derive(Debug, Clone)]

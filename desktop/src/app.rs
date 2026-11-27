@@ -2923,9 +2923,11 @@ impl ShelbiWindow {
         let needs_onboarding = self.needs_onboarding;
         // A project whose orchestrator was never set up shows the onboarding
         // and starts nothing (`orch-onboarding`); its Launch Orchestrator
-        // comes back here.
+        // comes back here. It is open all the same: the window shows it, so
+        // the daemon stays up under it and its tab survives a switch away.
         let open = cx.background_executor().spawn(async move {
             if needs_onboarding(&project) {
+                shelbi_app::onboarding::hold_open(&project);
                 return Ok(false);
             }
             projects::open_project(&project, &cli, &env).map(|()| true)
@@ -2940,6 +2942,12 @@ impl ShelbiWindow {
                 if result == Ok(false) {
                     this.status = None;
                     this.onboarding_wanted = true;
+                    // Recorded open: its tab stays when the window switches
+                    // away, and every window gets one.
+                    if let Some(catalog) = cx.try_global::<Catalog>() {
+                        catalog.note_open(&opening, true);
+                    }
+                    this.refresh_catalog(cx);
                     cx.notify();
                     return;
                 }

@@ -53,6 +53,9 @@ fn a_project_never_set_up_shows_the_onboarding_and_starts_nothing(cx: &mut TestA
     assert!(!chat_shown, "no chat attaches");
     let status = h.window.read_with(&h.cx, |w, _| w.status.clone());
     assert_eq!(status, None, "nothing is starting");
+    // Shown, so open: the daemon stays up under it and its tab follows the
+    // open set like any other.
+    assert!(shelbi_state::is_project_open("alpha").unwrap(), "recorded open");
     for selector in ["onboarding-disc", "onboarding-title", "onboarding-intro", "onboarding-get-started"] {
         assert!(h.cx.debug_bounds(selector).is_some(), "{selector} drawn");
     }

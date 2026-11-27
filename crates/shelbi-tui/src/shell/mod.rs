@@ -1132,6 +1132,10 @@ trait Bootstrap: Send + Sync {
 
     /// Start the daemon only (a project still onboarding). Blocking.
     fn start_daemon(&self) {}
+
+    /// Record a project still onboarding as open, so the daemon doesn't
+    /// idle-exit under it (`shelbi_app::onboarding::hold_open`). Blocking.
+    fn hold_open(&self, _project: &str) {}
 }
 
 /// What the startup job did.
@@ -1174,6 +1178,10 @@ impl Bootstrap for DaemonBootstrap {
         if let Err(e) = shelbi_state::ensure_daemon_running() {
             tracing::warn!(error = %e, "could not start the hub daemon");
         }
+    }
+
+    fn hold_open(&self, project: &str) {
+        shelbi_app::onboarding::hold_open(project);
     }
 }
 
@@ -4488,6 +4496,7 @@ impl ShellState {
                 bootstrap.start_daemon();
                 crate::startup::log_phase("daemon", t.elapsed());
                 let started = if bootstrap.needs_onboarding(&job_project) {
+                    bootstrap.hold_open(&job_project);
                     Ok(Started::Onboarding)
                 } else {
                     job_phase.set(PHASE_ORCHESTRATOR);
@@ -10184,6 +10193,7 @@ mod tests {
     struct OnboardingBootstrap {
         set_up: std::sync::atomic::AtomicBool,
         launched: Mutex<Vec<String>>,
+        held_open: Mutex<Vec<String>>,
     }
     impl Bootstrap for OnboardingBootstrap {
         fn bootstrap(&self, project: &str) -> Result<(), String> {
@@ -10192,6 +10202,9 @@ mod tests {
         }
         fn needs_onboarding(&self, _project: &str) -> bool {
             !self.set_up.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn hold_open(&self, project: &str) {
+            self.held_open.lock().unwrap().push(project.to_string());
         }
     }
 
@@ -10214,6 +10227,7 @@ mod tests {
         assert!(wait_until(Duration::from_secs(2), || st.poll_startup()));
         assert!(st.onboarding_shown(), "the Orchestrator view shows the onboarding");
         assert!(boot.launched.lock().unwrap().is_empty(), "no orchestrator started on its own");
+        assert_eq!(*boot.held_open.lock().unwrap(), ["proj"], "recorded open, so the daemon stays up");
 
         // Its keys reach the page, not a session: Enter is Get started.
         st.client.focus_main();
