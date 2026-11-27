@@ -17,7 +17,10 @@
 //! the desktop's high contrast, or a session that can't composite) makes
 //! every window opaque whatever the setting says; [`sync_reduce_transparency`]
 //! reads it when a window activates, as Reduce Motion is. On Linux the
-//! compositor blurs, at its own radius ([`crate::platform::blur`]).
+//! compositor blurs, at its own radius; under Hyprland the blur setting turns
+//! that blur off (0) or on for the app's windows, and does nothing while
+//! Hyprland's global blur is off ([`WindowLook::compositor_blur_off`],
+//! [`crate::platform::blur`]).
 
 use std::ops::RangeInclusive;
 
@@ -115,6 +118,9 @@ pub struct WindowLook {
     pub setting: Translucency,
     /// Reduce Transparency is on: every window is opaque.
     pub reduce_transparency: bool,
+    /// The compositor blurs no window (Hyprland's `decoration:blur:enabled`
+    /// is off): the blur setting has no effect, and Settings disables it.
+    pub compositor_blur_off: bool,
 }
 
 impl Global for WindowLook {}
@@ -142,7 +148,39 @@ pub(super) fn init(setting: Translucency, cx: &mut App) {
     cx.set_global(WindowLook {
         setting,
         reduce_transparency: reduce_transparency(),
+        compositor_blur_off: compositor_blur_off(),
     });
+    if !cfg!(test) {
+        follow_compositor_blur(cx);
+    }
+}
+
+/// Re-read whether the compositor blurs whenever it may have changed (a
+/// Hyprland config reload), so Settings enables or disables Background blur.
+fn follow_compositor_blur(cx: &mut App) {
+    use futures::StreamExt;
+    let (changed, mut changes) = futures::channel::mpsc::unbounded();
+    crate::platform::blur::observe_compositor_blur(changed);
+    cx.spawn(async move |cx| {
+        while changes.next().await.is_some() {
+            cx.update(|cx| {
+                let look = WindowLook {
+                    compositor_blur_off: compositor_blur_off(),
+                    ..WindowLook::current(cx)
+                };
+                if look != WindowLook::current(cx) {
+                    install(look, cx);
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+/// The compositor's global blur switch; a test's app never reads the
+/// machine's.
+fn compositor_blur_off() -> bool {
+    !cfg!(test) && crate::platform::blur::compositor_blur_off()
 }
 
 /// Change the setting: the theme's surfaces and every open window follow at
@@ -178,6 +216,17 @@ fn reduce_transparency() -> bool {
 pub fn set_reduce_transparency(on: bool, cx: &mut App) {
     let look = WindowLook {
         reduce_transparency: on,
+        ..WindowLook::current(cx)
+    };
+    install(look, cx);
+}
+
+/// Turn the compositor's global blur off or on, as a Hyprland config reload
+/// would (a test's app never reads the machine's).
+#[cfg(test)]
+pub fn set_compositor_blur_off(off: bool, cx: &mut App) {
+    let look = WindowLook {
+        compositor_blur_off: off,
         ..WindowLook::current(cx)
     };
     install(look, cx);
@@ -226,12 +275,15 @@ pub fn apply_to(window: &mut Window, cx: &App) {
 fn apply(look: Translucency, window: &mut Window) {
     let id = window.window_handle().window_id();
     let before = APPLIED.with(|a| a.borrow_mut().insert(id, look));
+    let first = before.is_none();
     // A window opens opaque with no blur.
     let before = before.unwrap_or_default();
     if before.background() != look.background() {
         window.set_background_appearance(look.background());
     }
-    if before.blur_radius() != look.blur_radius() {
+    // A new window's first apply always sets the blur: Hyprland blurs a
+    // window it hasn't been told not to, so 0 has to be said too.
+    if first || before.blur_radius() != look.blur_radius() {
         crate::platform::blur::set_blur_radius(window, look.blur_radius());
     }
 }
@@ -287,6 +339,7 @@ mod tests {
         let look = WindowLook {
             setting: Translucency { opacity: 50, blur: 40 },
             reduce_transparency: true,
+            compositor_blur_off: false,
         };
         assert_eq!(look.effective(), Translucency::default());
         assert_eq!(WindowLook { reduce_transparency: false, ..look }.effective(), look.setting);
