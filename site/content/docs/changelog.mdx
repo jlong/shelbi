@@ -9,6 +9,38 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### November 28, 2026
+
+**v0.16.0. Documentation: your project's docs, in both clients.**
+
+**Documentation.** Every project gets its own docs: plans, designs, decisions
+and research, shared by you and every agent. They live in a docs worktree the
+hub commits and syncs, read and written in the desktop app, the TUI and with
+`shelbi docs`. Open them with ⌘D (Ctrl+Shift+D on Linux). The main area looks
+like the terminals, the document sits in a centered column on comfortable
+line height, and the tree's rows wear the sidebar's chip. Agents get a
+`shelbi-docs` skill, and existing Wiki setups migrate on boot
+([#2467](https://github.com/jlong/shelbi/pull/2467),
+[#2487](https://github.com/jlong/shelbi/pull/2487),
+[#2471](https://github.com/jlong/shelbi/pull/2471),
+[#2473](https://github.com/jlong/shelbi/pull/2473),
+[#2485](https://github.com/jlong/shelbi/pull/2485),
+[#2486](https://github.com/jlong/shelbi/pull/2486),
+[#2491](https://github.com/jlong/shelbi/pull/2491)).
+
+**Tables in the editor.** GitHub-flavored Markdown tables render as tables in
+the doc editor and the TUI, and a line of only `<br />` shows as a blank line
+([#2488](https://github.com/jlong/shelbi/pull/2488),
+[#2480](https://github.com/jlong/shelbi/pull/2480)).
+
+**Smaller fixes.** Status menus and pickers draw their glyphs at the right
+size, the waiting glyph's dots are black in every theme, and an issue save the
+tracker didn't keep is no longer reported as changed elsewhere
+([#2464](https://github.com/jlong/shelbi/pull/2464),
+[#2475](https://github.com/jlong/shelbi/pull/2475),
+[#2478](https://github.com/jlong/shelbi/pull/2478),
+[#2465](https://github.com/jlong/shelbi/pull/2465)).
+
 ### November 27, 2026
 
 **v0.15.0. OpenCode as a runner, projects in tabs, jobs and reminders, Linear, and the desktop app on Linux.**

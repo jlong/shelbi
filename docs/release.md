@@ -13,7 +13,7 @@ verifies, and publishes every artifact. **You do not run `goreleaser release
 `shelbi` binary; `scripts/release/check-version.sh` enforces this in CI and you
 can run it locally.
 
-The latest release is `v0.15.0` (2026-11-27). Read the current version from
+The latest release is `v0.16.0` (2026-11-28). Read the current version from
 `Cargo.toml` and use it wherever a version appears below:
 
 ```bash
