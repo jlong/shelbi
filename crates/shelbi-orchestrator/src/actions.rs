@@ -2195,6 +2195,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: shelbi_core::GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
         }
@@ -2269,6 +2270,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: shelbi_core::GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
         };
@@ -2361,6 +2363,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: shelbi_core::GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
         }
@@ -2457,6 +2460,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: shelbi_core::GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
         };
@@ -2771,6 +2775,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: shelbi_core::GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
         };
@@ -3106,6 +3111,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: shelbi_core::GitConfig {
                 base_branch: None,
                 merge_strategy: strategy,

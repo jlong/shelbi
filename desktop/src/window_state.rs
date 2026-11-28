@@ -334,6 +334,10 @@ pub struct ProjectViewState {
     pub workflow_filter: Option<String>,
     /// The sidebar sections collapsed (`ready`, `queued`, `workspaces`).
     pub collapsed_sections: Vec<String>,
+    /// The Wiki tree's open folders (wiki-relative paths).
+    pub wiki_expanded: Vec<String>,
+    /// The Wiki's open document.
+    pub wiki_doc: Option<String>,
 }
 
 impl ProjectViewState {
@@ -642,6 +646,8 @@ mod tests {
             workspace_return: Some("tasks".into()),
             workflow_filter: Some("task".into()),
             collapsed_sections: vec!["queued".into()],
+            wiki_expanded: vec!["Plans".into(), "Plans/Archive".into()],
+            wiki_doc: Some("Plans/a.md".into()),
         };
         write_json(&path, &view).unwrap();
         assert_eq!(load_json::<ProjectViewState>(&path), view);

@@ -180,6 +180,20 @@ pub fn write_state(project: &str, write: StateWrite) -> ExecOutcome {
     on_local_daemon(|client| write_state_over(client, project, write.clone()))
 }
 
+/// Run one of the app's requests ([`crate::far::Request`]) on this
+/// machine's daemon, started on demand (the wiki's reads and writes, which
+/// the daemon is the single writer of). Blocking.
+pub fn app_request(project: &str, request: &crate::far::Request) -> Result<crate::far::Reply, ExecError> {
+    let body = serde_json::to_value(request).map_err(|e| ExecError::Backend(e.to_string()))?;
+    let req = shelbi_proto::control::AppRequest {
+        request_id: 1,
+        project: project.to_string(),
+        body,
+    };
+    let body = on_local_daemon(|client| client.app_request(&req).map_err(map_client_err))?;
+    serde_json::from_value(body).map_err(|e| ExecError::Backend(format!("the daemon answered something this build can't read: {e}")))
+}
+
 /// [`write_state`] over an already connected control client (a remote
 /// window's, on its host's `control` service).
 pub(crate) fn write_state_over(client: &mut ControlClient, project: &str, write: StateWrite) -> ExecOutcome {

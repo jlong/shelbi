@@ -877,6 +877,7 @@ fn lint_project(
                             ));
                         }
                         lint_releases(entry, text, &p, out);
+                        lint_wiki(entry, text, &p, out);
                         match p.validate_workspaces() {
                             Ok(()) => Some(p),
                             Err(e) => {
@@ -924,6 +925,7 @@ fn lint_project(
                             ));
                         }
                         lint_releases(shared_entry, shared, &p, out);
+                        lint_wiki(shared_entry, shared, &p, out);
                         match p.validate_workspaces() {
                             Ok(()) => Some(p),
                             Err(e) => {
@@ -1536,6 +1538,28 @@ fn lint_releases(entry: &InventoryEntry, text: &str, project: &Project, out: &mu
                     .into(),
             ),
             locate_key(text, "releases"),
+        ));
+    }
+}
+
+/// A `wiki:` block whose branch git won't take or whose path leaves the
+/// repo. Like `releases:`, it never fails the project's load; the hub won't
+/// set such a wiki up, and lint says why.
+fn lint_wiki(entry: &InventoryEntry, text: &str, project: &Project, out: &mut Vec<Diagnostic>) {
+    let Some(wiki) = &project.wiki else {
+        return;
+    };
+    if let Err(e) = wiki.validate() {
+        out.push(diag(
+            entry,
+            Severity::Error,
+            "PROJECT_WIKI_INVALID",
+            e.to_string(),
+            Some(
+                "Set wiki.branch to a branch name git takes (docs/planning by default) and wiki.path to a folder inside the repo, relative to its root (docs by default)."
+                    .into(),
+            ),
+            locate_key(text, "wiki"),
         ));
     }
 }

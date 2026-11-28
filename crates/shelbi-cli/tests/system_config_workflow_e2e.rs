@@ -807,6 +807,30 @@ fn a_releases_block_lints_and_a_bad_glob_is_a_config_error() {
     }
 }
 
+/// The registration's `wiki:` block: a good one lints clean, a branch git
+/// won't take or a path out of the repo is a config error naming the field.
+#[test]
+fn a_wiki_block_lints_and_a_bad_path_or_branch_is_a_config_error() {
+    let base = "name: Demo\ndefault_branch: main\ndefault_workflow: task\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\nrepo: /tmp/demo-repo\nmachines:\n  - name: hub\n    kind: local\n    work_dir: /tmp\nworkspaces:\n  - name: alpha\n    machine: hub\n    runner: claude\n    tags: [build]\n";
+    let (_fixture, root) = scaffold_flat("claude");
+    let session = Session::open(&root, "demo");
+    session.edit(
+        "project.demo.registration",
+        &format!("{base}wiki:\n  source: folder\n  path: docs/handbook\n  sync: manual\n"),
+    );
+    let (clean, report) = session.lint_staged();
+    assert!(clean, "a good wiki block lints clean: {report}");
+
+    for bad in ["wiki:\n  source: folder\n  path: ../elsewhere\n", "wiki:\n  branch: \"has space\"\n"] {
+        let (_fixture, root) = scaffold_flat("claude");
+        let session = Session::open(&root, "demo");
+        session.edit("project.demo.registration", &format!("{base}{bad}"));
+        let (clean, report) = session.lint_staged();
+        assert!(!clean, "a bad wiki block fails lint: {report}");
+        assert!(has_code(&report, "PROJECT_WIKI_INVALID"), "expected PROJECT_WIKI_INVALID: {report}");
+    }
+}
+
 /// The split registration family (`project.yaml` + `local.yaml`) only exists in
 /// the in-repo layout, so it gets its own valid/invalid pair.
 #[test]

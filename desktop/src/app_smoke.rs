@@ -247,7 +247,7 @@ impl Harness {
         })
     }
 
-    fn overlay_open(&self) -> bool {
+    pub(super) fn overlay_open(&self) -> bool {
         self.window.read_with(&self.cx, |w, _| w.overlay.is_some())
     }
 }
@@ -453,7 +453,7 @@ impl Harness {
         self.draw();
     }
 
-    fn palette<T>(&self, f: impl FnOnce(&shelbi_app::overlay::palette::Palette) -> T) -> T {
+    pub(super) fn palette<T>(&self, f: impl FnOnce(&shelbi_app::overlay::palette::Palette) -> T) -> T {
         self.window.read_with(&self.cx, |w, _| {
             let Some(ActiveOverlay::Palette { palette, .. }) = &w.overlay else {
                 panic!("the palette is open");
@@ -492,7 +492,7 @@ fn typing_in_the_palette_searches_issues_and_changelog_entries(cx: &mut TestAppC
     // The filter row, each chip with its count.
     assert!(h.cx.debug_bounds("palette-filters").is_some());
     let counts: Vec<(&str, usize)> = h.palette(|p| p.chips().iter().map(|c| (c.label, c.count)).collect());
-    assert_eq!(counts, [("All", 3), ("Issues", 2), ("Changelog Entries", 1), ("Commands", 0)]);
+    assert_eq!(counts, [("All", 3), ("Issues", 2), ("Wiki", 0), ("Changelog Entries", 1), ("Commands", 0)]);
     assert!(h.cx.debug_bounds("palette-projects").is_none(), "the Projects column steps aside");
     // Grouped under All, a heading over each kind, best match first.
     let issues = h.top_of("palette-heading-Issues");
@@ -512,6 +512,8 @@ fn typing_in_the_palette_searches_issues_and_changelog_entries(cx: &mut TestAppC
     // ↑ from the first result reaches the filter row, where ←/→ move.
     h.key("up");
     assert!(h.palette(|p| p.filter_focused()));
+    h.key("left");
+    assert_eq!(h.palette(|p| p.filter()), SearchFilter::Wiki);
     h.key("left");
     assert_eq!(h.palette(|p| p.filter()), SearchFilter::Issues);
     h.key("down");

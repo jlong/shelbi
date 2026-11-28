@@ -7,6 +7,7 @@ set -euo pipefail
 DIST_DIR="${1:-dist}"
 PLUGIN_REL="plugins/update-shelbi-configuration"
 AWARENESS_REL="plugins/shelbi-awareness"
+WIKI_REL="plugins/shelbi-wiki"
 ARCHIVE_FILES=(
   "$PLUGIN_REL/.claude-plugin/plugin.json"
   "$PLUGIN_REL/.codex-plugin/plugin.json"
@@ -15,6 +16,9 @@ ARCHIVE_FILES=(
   "$AWARENESS_REL/hooks/hooks.json"
   "$AWARENESS_REL/monitors/monitors.json"
   "$AWARENESS_REL/README.md"
+  "$WIKI_REL/.claude-plugin/plugin.json"
+  "$WIKI_REL/.codex-plugin/plugin.json"
+  "$WIKI_REL/skills/shelbi-wiki/SKILL.md"
 )
 DEB_PREFIX="usr/share/shelbi"
 

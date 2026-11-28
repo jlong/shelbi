@@ -41,6 +41,7 @@ pub mod session_cli;
 pub mod status;
 mod temp_dir;
 pub mod tracker;
+pub mod wiki;
 pub mod wizard;
 pub mod workflow;
 pub mod workspace;
@@ -488,6 +489,7 @@ pub(crate) mod test_support {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
         };

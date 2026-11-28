@@ -32,6 +32,7 @@ mod elements;
 mod feeds;
 mod keys;
 mod licenses;
+mod links;
 mod menus;
 mod notify;
 mod platform;
