@@ -4382,7 +4382,7 @@ mod tests {
         assert!(body.read_with(&cx, |b, _| b.shown_rows()).contains(&delimiter));
 
         // The source is edited as text.
-        cx.simulate_keystrokes("cmd-right");
+        cx.simulate_keystrokes("end");
         cx.simulate_input("x");
         assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), src.replace("one each |", "one each |x"));
         cx.simulate_keystrokes("backspace");
