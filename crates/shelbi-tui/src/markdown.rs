@@ -459,8 +459,27 @@ fn styled_segments(display: &str, styles: &[(std::ops::Range<usize>, shelbi_app:
 }
 
 /// Word-wrap styled `segs` to `width`, the first line led by `first`, the
-/// rest by `rest`, each segment's style over `base`.
+/// rest by `rest`, each segment's style over `base`. A `\n` in them (a hard
+/// break, a `<br>`) starts a new line.
 fn wrap_segments(segs: Vec<(String, Style)>, width: usize, first: &str, rest: &str, base: Style, out: &mut Vec<Line<'static>>) {
+    let mut lines: Vec<Vec<(String, Style)>> = vec![Vec::new()];
+    for (text, style) in segs {
+        for (k, part) in text.split('\n').enumerate() {
+            if k > 0 {
+                lines.push(Vec::new());
+            }
+            if !part.is_empty() {
+                lines.last_mut().expect("starts with a line").push((part.to_string(), style));
+            }
+        }
+    }
+    for (k, line) in lines.into_iter().enumerate() {
+        wrap_line(line, width, if k == 0 { first } else { rest }, rest, base, out);
+    }
+}
+
+/// [`wrap_segments`] for one line of text (no `\n` in it).
+fn wrap_line(segs: Vec<(String, Style)>, width: usize, first: &str, rest: &str, base: Style, out: &mut Vec<Line<'static>>) {
     // Words (runs of non-space, possibly across segments) and the spaces
     // between them, each a list of styled pieces.
     let mut words: Vec<(bool, Vec<(String, Style)>)> = Vec::new();
@@ -720,6 +739,15 @@ mod tests {
         for l in render_document("A long paragraph that has to wrap somewhere", 12) {
             assert!(l.width() <= 12, "{:?}", line_text(&l));
         }
+    }
+
+    #[test]
+    fn br_tags_break_lines_and_space_blocks() {
+        // A line of only `<br />` is a blank line; one inside a paragraph
+        // breaks it, the next line under the item's marker.
+        let lines = doc_text("Tagline here.\n\n<br />\n\nNext\n\n- one<br/>two", 30);
+        assert_eq!(lines, ["Tagline here.", "", "", "", "Next", "", "• one", "  two"]);
+        assert!(!doc_text("a<br>b\\\nc", 30).iter().any(|l| l.contains('\n')));
     }
 
     #[test]

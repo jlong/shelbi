@@ -86,6 +86,114 @@ fn unsupported_markdown_shows_as_its_source() {
         .any(|r| r.contains("![img](a.png) <kbd>x</kbd>")));
 }
 
+// ---- <br> tags ------------------------------------------------------------------------------
+
+/// Each row's kind and display.
+fn rows(src: &str) -> Vec<(RowKind, String)> {
+    Doc::parse(src)
+        .rows
+        .iter()
+        .map(|r| (r.kind.clone(), r.display.clone()))
+        .collect()
+}
+
+#[test]
+fn a_line_of_only_a_br_tag_is_a_blank_line() {
+    for tag in [
+        "<br>", "<br/>", "<br />", "<BR>", "<Br />", "  <br />  ", "<br\t/>", "   <br>",
+    ] {
+        let src = format!("**Tagline:** One agent.\n\n{tag}\n\nNext");
+        let doc = Doc::parse(&src);
+        assert_eq!(
+            rows(&src),
+            [
+                (RowKind::Paragraph, "Tagline: One agent.".to_string()),
+                (RowKind::Paragraph, String::new()),
+                (RowKind::Paragraph, "Next".to_string()),
+            ],
+            "{tag:?}"
+        );
+        let br = &doc.rows[1];
+        assert_eq!(br.gap, Gap::Block);
+        assert!(br.styles.iter().all(|(_, s)| !s.raw), "{tag:?}");
+        // The caret sits on the line, before the tag.
+        assert_eq!(br.source_of(0), src.find(tag.trim_start()).unwrap());
+    }
+}
+
+#[test]
+fn a_br_tag_inside_a_paragraph_breaks_the_line() {
+    for tag in ["<br>", "<br/>", "<br />", "<BR/>"] {
+        let src = format!("one{tag}two");
+        let doc = Doc::parse(&src);
+        let r = &doc.rows[0];
+        assert_eq!(r.kind, RowKind::Paragraph, "{tag:?}");
+        assert_eq!(r.display, "one\ntwo", "{tag:?}");
+        assert!(r.styles.is_empty(), "{tag:?}");
+        // The caret after the break lands before `two`.
+        assert_eq!(&src[r.source_of(4)..], "two");
+    }
+    // Spaces after it don't start the next line; a source line break right
+    // after it is the one break; a last one in the block shows nothing.
+    assert_eq!(rows("one<br/>  two")[0].1, "one\ntwo");
+    assert_eq!(rows("one<br/>\ntwo")[0].1, "one\ntwo");
+    assert_eq!(rows("> one<br>\n> two")[0].1, "one\ntwo");
+    assert_eq!(rows("- one<br />two")[0].1, "one\ntwo");
+    assert_eq!(rows("one<br>")[0].1, "one");
+    assert_eq!(rows("a<br><br>b")[0].1, "a\n\nb");
+    // Not a `<br>`: still source.
+    assert_eq!(rows("a <bra> b")[0].1, "a <bra> b");
+    assert_eq!(rows("a <br x> b")[0].1, "a <br x> b");
+}
+
+#[test]
+fn other_html_blocks_still_show_as_source() {
+    let src = "<div>\n<br />\n</div>\n\n<details>\n\n<bra>\n\n<br x=\"1\">\n\n<!-- note -->";
+    let raw = |s: &str| (RowKind::Raw, s.to_string());
+    assert_eq!(
+        rows(src),
+        [
+            raw("<div>"),
+            raw("<br />"),
+            raw("</div>"),
+            raw("<details>"),
+            raw("<bra>"),
+            raw("<br x=\"1\">"),
+            raw("<!-- note -->"),
+        ]
+    );
+}
+
+#[test]
+fn deleting_a_br_break_takes_the_tag_with_it() {
+    let mut e = ed("one<br/>|two");
+    e.backspace(false);
+    assert_eq!(show(&e), "one|two");
+    let mut e = ed("one<br>\n|two");
+    e.backspace(false);
+    assert_eq!(show(&e), "one|two");
+}
+
+#[test]
+fn editing_around_br_tags_keeps_them_as_written() {
+    let src = "Tagline.\n\n<br />\n\nA line<BR>break.\n\n<br>\n";
+    let mut e = Editor::markdown(src);
+    let at = src.find("Tagline").unwrap() + "Tagline".len();
+    e.select(at, at);
+    typed(&mut e, " here");
+    let at = e.text().find("break").unwrap() + "break".len();
+    e.select(at, at);
+    typed(&mut e, "s");
+    assert_eq!(
+        e.text(),
+        "Tagline here.\n\n<br />\n\nA line<BR>breaks.\n\n<br>\n"
+    );
+    assert_eq!(
+        shown(&e),
+        ["Tagline here.", "", "A line\nbreaks.", ""]
+    );
+}
+
 // ---- typing --------------------------------------------------------------------------
 
 #[test]
