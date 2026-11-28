@@ -82,6 +82,12 @@ pub(crate) mod test_lock {
     //! process-wide `SHELBI_HOME` env var. `actions.rs` and `lifecycle.rs`
     //! both spin up fixture homes; without a *single* lock they race the
     //! env var and produce flaky "No such file or directory" failures.
+    //!
+    //! The same lock covers `HOME`, `SHELL` and `PATH`: tests that stub a
+    //! tool (usually `gh`) point `HOME` at a tempdir whose `.profile` puts the
+    //! stub on the login shell's `PATH`. So a test that runs `gh` through the
+    //! login-shell runner takes this lock too, even if it sets no env itself,
+    //! or it can run a sibling's stub or a `HOME` with no gh setup.
     use std::sync::{Mutex, MutexGuard};
 
     pub static LOCK: Mutex<()> = Mutex::new(());
