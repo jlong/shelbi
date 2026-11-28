@@ -37,3 +37,13 @@ instead of blocking on it; run quick ones directly:
   cancel <id>` stops a job.
 - If `shelbi` isn't on your PATH (a remote machine without it), run the
   command directly.
+
+## Wiki
+
+The project's wiki holds its plans, designs, decisions and other long-form
+context, shared by everyone on the project. Before starting work, read the plan
+your task names, or look for one with `shelbi wiki search "<topic>"`. Write any
+plan, design doc or decision record there (`shelbi wiki new Plans/<name>.md`),
+never as a file in the repo. Read and write it only through `shelbi wiki`; the
+hub commits and syncs every change. The `shelbi-wiki` skill has the commands and
+the rules.

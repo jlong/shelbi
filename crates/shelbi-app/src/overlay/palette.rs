@@ -775,7 +775,13 @@ mod tests {
         let counts: Vec<(&str, usize, bool)> = p.chips().iter().map(|c| (c.label, c.count, c.selected)).collect();
         assert_eq!(
             counts,
-            [("All", 6, true), ("Issues", 5, false), ("Changelog Entries", 0, false), ("Commands", 1, false)]
+            [
+                ("All", 6, true),
+                ("Issues", 5, false),
+                ("Wiki", 0, false),
+                ("Changelog Entries", 0, false),
+                ("Commands", 1, false)
+            ]
         );
         // Enter on an issue opens it.
         let PaletteStep::Activate(e) = press(&mut p, key(Key::Enter)) else {
@@ -822,7 +828,7 @@ mod tests {
         assert!(p.filter_focused());
         press(&mut p, key(Key::Right));
         press(&mut p, key(Key::Right));
-        assert_eq!(p.filter(), SearchFilter::Changelog);
+        assert_eq!(p.filter(), SearchFilter::Wiki);
         press(&mut p, key(Key::Left));
         assert_eq!(p.filter(), SearchFilter::Issues);
         // Down (or Enter) hands the keys back to the results.

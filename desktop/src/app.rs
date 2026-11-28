@@ -155,6 +155,7 @@ use crate::views::session_view::SessionDeps;
 use crate::views::jobs_reminders::{JobsRemindersEvent, JobsRemindersView, Segment};
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::changelog::{ChangelogEvent, ChangelogView};
+use crate::views::wiki::{WikiEvent, WikiView};
 use crate::views::diff_view::DiffKeys;
 use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
@@ -976,6 +977,7 @@ pub enum HostCall {
     OpenEditor(EditTarget),
     OpenIssue(String),
     OpenChangelogEntry(String),
+    OpenWikiDoc(String),
 }
 
 /// How a confirmed Close Project reaches the daemon that quits it: a remote
@@ -1115,6 +1117,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn open_changelog_entry(&mut self, id: &str) {
         self.push(HostCall::OpenChangelogEntry(id.to_string()));
+    }
+    fn open_wiki_doc(&mut self, path: &str) {
+        self.push(HostCall::OpenWikiDoc(path.to_string()));
     }
 }
 
@@ -1587,6 +1592,14 @@ pub struct ShelbiWindow {
     jobs_reminders: Option<Entity<JobsRemindersView>>,
     /// The Changelog page, created the first time it is shown.
     changelog: Option<Entity<ChangelogView>>,
+    /// The Wiki (its tree in the leading column, its document in the main
+    /// area), created the first time it is shown.
+    wiki: Option<Entity<WikiView>>,
+    /// The view the Wiki was opened over: its ‹ returns there.
+    wiki_return: Option<View>,
+    /// Where the project's Wiki was left (its open folders and document),
+    /// for the Wiki built next.
+    wiki_saved: (Vec<String>, Option<String>),
     /// The open overlay (palette or dialog), mirrored in `client.overlay()`.
     overlay: Option<ActiveOverlay>,
     palette_inputs: PaletteInputs,
@@ -2009,7 +2022,8 @@ impl ShelbiWindow {
             || self.activity.is_some()
             || self.machines.is_some()
             || self.jobs_reminders.is_some()
-            || self.changelog.is_some();
+            || self.changelog.is_some()
+            || self.wiki.is_some();
         if open {
             self.teardown_project(window, cx);
         }
@@ -2420,6 +2434,9 @@ impl ShelbiWindow {
             machines: None,
             jobs_reminders: None,
             changelog: None,
+            wiki: None,
+            wiki_return: None,
+            wiki_saved: (Vec::new(), None),
             overlay: None,
             palette_inputs: PaletteInputs::default(),
             _palette_poll: None,
@@ -2686,7 +2703,7 @@ impl ShelbiWindow {
             view if is_chat(view) => notify::Showing::Orchestrator,
             View::Session(name) => notify::Showing::Workspace(name.clone()),
             View::Issues => notify::Showing::Board,
-            View::Changelog | View::Activity | View::Machines | View::Jobs | View::Reminders => {
+            View::Changelog | View::Wiki | View::Activity | View::Machines | View::Jobs | View::Reminders => {
                 notify::Showing::Other
             }
         }
@@ -3294,6 +3311,11 @@ impl ShelbiWindow {
         if let Some(changelog) = self.changelog.take() {
             changelog.update(cx, |v, _| v.stop_workers());
         }
+        if let Some(wiki) = self.wiki.take() {
+            wiki.update(cx, |w, _| w.hide());
+        }
+        self.wiki_return = None;
+        self.wiki_saved = (Vec::new(), None);
         self._view_subscriptions.clear();
         self.set_route(Route::View);
         self.workspace_return = None;
@@ -3337,6 +3359,14 @@ impl ShelbiWindow {
                 .map(|i| i.read(cx).workflow_filter())
                 .unwrap_or_else(|| self.pending_workflow_filter.clone()),
             collapsed_sections: self.collapsed_sections.iter().map(|s| s.key().to_string()).collect(),
+            wiki_expanded: match &self.wiki {
+                Some(w) => w.read(cx).expanded(),
+                None => self.wiki_saved.0.clone(),
+            },
+            wiki_doc: match &self.wiki {
+                Some(w) => w.read(cx).open_path().map(str::to_string),
+                None => self.wiki_saved.1.clone(),
+            },
         };
         Some((self.project_handle.key().clone(), state))
     }
@@ -3378,6 +3408,7 @@ impl ShelbiWindow {
             self.client.focus_main();
         }
         self.workspace_return = saved.workspace_return.as_deref().map(View::from_view_id);
+        self.wiki_saved = (saved.wiki_expanded, saved.wiki_doc);
         self.pending_workflow_filter = saved.workflow_filter;
         self.collapsed_sections = saved
             .collapsed_sections
@@ -3719,6 +3750,8 @@ impl ShelbiWindow {
                     }
                     return;
                 }
+                // The Wiki's tree has no numbered rows.
+                Occupant::Wiki => return,
                 Occupant::Sidebar => {}
             }
         }
@@ -3871,6 +3904,15 @@ impl ShelbiWindow {
                 } else if workspace_name(self.client.view()).is_none() {
                     self.workspace_return = Some(self.client.view().clone());
                 }
+                // Likewise the Wiki's ‹; moving off it stops its reads.
+                let on_wiki = matches!(self.client.view(), View::Wiki) && matches!(self.route, Route::View);
+                if matches!(view, View::Wiki) {
+                    if !on_wiki {
+                        self.wiki_return = Some(self.client.view().clone()).filter(|v| !matches!(v, View::Wiki));
+                    }
+                } else if let Some(wiki) = &self.wiki {
+                    wiki.update(cx, |w, _| w.hide());
+                }
                 // The selection is the shown view's row again, even where
                 // the keys had moved it off the view already shown.
                 self.set_route(Route::View);
@@ -3881,6 +3923,10 @@ impl ShelbiWindow {
                     }
                     View::Changelog => {
                         self.ensure_changelog(window, cx);
+                    }
+                    View::Wiki => {
+                        let wiki = self.ensure_wiki(window, cx);
+                        wiki.update(cx, |w, cx| w.show(window, cx));
                     }
                     View::Activity => {
                         self.ensure_activity(window, cx);
@@ -3970,6 +4016,7 @@ impl ShelbiWindow {
             HostCall::OpenAddProject => self.open_add_project(window, cx),
             HostCall::OpenIssue(id) => self.open_task(&id, window, cx),
             HostCall::OpenChangelogEntry(id) => self.open_changelog_entry(id, window, cx),
+            HostCall::OpenWikiDoc(path) => self.open_wiki_doc(path, window, cx),
             HostCall::ConnectRemote => self.open_connect(window, cx),
             // Its own window, after this update (as New Window).
             HostCall::ShowLaunchScreen => cx.defer(|cx| {
@@ -4641,7 +4688,7 @@ impl ShelbiWindow {
                     ws.update(cx, |w, cx| w.release_content(cx));
                 }
             }
-            Occupant::Settings => {}
+            Occupant::Settings | Occupant::Wiki => {}
             Occupant::Sidebar => {
                 // A chat that waited for the pop: one more frame attaches it.
                 let chat_waits = self.chat_wanted() && self.chat.as_ref().is_none_or(|c| !c.read(cx).is_shown());
@@ -4710,6 +4757,24 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// Leave the Wiki for the view it was opened over (its ‹, Esc in the
+    /// tree): the sidebar comes back into its column (the push's reverse)
+    /// and takes the keys again, as leaving a workspace does.
+    fn leave_wiki(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::View) || !matches!(self.client.view(), View::Wiki) {
+            return;
+        }
+        let view = self.wiki_return.take().unwrap_or_else(View::default_for_project);
+        if !self.tapped_return(&view, window, cx) {
+            self.perform(HostCall::ShowView(view), window, cx);
+        }
+        if !self.collapsed {
+            self.client.focus_sidebar();
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
     /// Under the test tap, leaving a review records the view it returns to
     /// instead of building it (building one reads the project's state) and
     /// only leaves the route. Returns whether it did.
@@ -4718,9 +4783,10 @@ impl ShelbiWindow {
         if let Some(tap) = &self.tap {
             tap.borrow_mut().push(HostCall::ShowView(view.clone()));
             self.set_route(Route::View);
-            if workspace_name(self.client.view()).is_some() {
-                // Leaving a workspace: the main area (and so the column)
-                // moves off it, though the view itself is only recorded.
+            if workspace_name(self.client.view()).is_some() || matches!(self.client.view(), View::Wiki) {
+                // Leaving a workspace (or the Wiki): the main area (and so
+                // the column) moves off it, though the view itself is only
+                // recorded.
                 self.client.set_view(view.clone());
             }
             self.sync_chat(window, cx);
@@ -4738,10 +4804,14 @@ impl ShelbiWindow {
         let workspace_shown = matches!(self.route, Route::View)
             && workspace_name(self.client.view()).is_some()
             && self.workspace.as_ref().is_some_and(|w| w.read(cx).has_panel());
+        let wiki_shown =
+            matches!(self.route, Route::View) && matches!(self.client.view(), View::Wiki) && self.wiki.is_some();
         let want = if matches!(self.route, Route::Settings(_)) {
             Occupant::Settings
         } else if matches!(self.route, Route::Review) && self.review.is_some() {
             Occupant::Review
+        } else if wiki_shown {
+            Occupant::Wiki
         } else if workspace_shown {
             Occupant::Workspace
         } else {
@@ -5132,12 +5202,40 @@ impl ShelbiWindow {
         changelog
     }
 
+    /// The Wiki, built the first time it is shown, where the project's was
+    /// left (its open folders and document).
+    fn ensure_wiki(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<WikiView> {
+        if let Some(wiki) = &self.wiki {
+            return wiki.clone();
+        }
+        let project = self.project_handle.clone();
+        let (expanded, open) = std::mem::take(&mut self.wiki_saved);
+        let wiki = cx.new(|cx| WikiView::new(&project, expanded, open, window, cx));
+        let sub = cx.subscribe_in(&wiki, window, |this, _, ev: &WikiEvent, window, cx| match ev {
+            WikiEvent::Back => this.leave_wiki(window, cx),
+            WikiEvent::Collapse => this.toggle_sidebar(cx),
+            WikiEvent::OpenSearch => this.open_palette(window, cx),
+            WikiEvent::Remember => this.remember_view_state(cx),
+        });
+        self._view_subscriptions.push(sub);
+        self.wiki = Some(wiki.clone());
+        wiki
+    }
+
     /// Show the Changelog with entry `id` in view (the palette's Changelog
     /// result).
     fn open_changelog_entry(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.run(CommandKind::ShowView(View::Changelog), window, cx);
         let changelog = self.ensure_changelog(window, cx);
         changelog.update(cx, |v, cx| v.reveal(&id, window, cx));
+    }
+
+    /// Show the Wiki with document `path` open (its row selected, its
+    /// folders opened): the palette's wiki result, a `wiki:` link.
+    fn open_wiki_doc(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let wiki = self.ensure_wiki(window, cx);
+        wiki.update(cx, |w, cx| w.open_at(&path, window, cx));
+        self.perform(HostCall::ShowView(View::Wiki), window, cx);
     }
 
     /// Show task `id`'s detail: route to the board and open it there.
@@ -5250,6 +5348,12 @@ impl ShelbiWindow {
             View::Changelog if self.changelog.is_some() => {
                 if let Some(changelog) = &self.changelog {
                     changelog.update(cx, |v, _| v.request_focus());
+                }
+            }
+            // The document reads; the tree beside it takes the keys.
+            View::Wiki if self.wiki.is_some() => {
+                if let Some(wiki) = &self.wiki {
+                    window.focus(&wiki.read(cx).focus_handle().clone(), cx);
                 }
             }
             view if is_chat(view) && self.onboarding.is_some() => {
@@ -6331,7 +6435,8 @@ impl ShelbiWindow {
         // and the changelog read off the UI thread.
         let (issues, changelog) = self.palette_corpus_held(cx);
         let complete = issues.is_some() && changelog.is_some();
-        let corpus = SearchCorpus::new(issues.unwrap_or_default(), changelog.unwrap_or_default());
+        let corpus = SearchCorpus::new(issues.unwrap_or_default(), changelog.unwrap_or_default())
+            .with_wiki(self.palette_wiki(cx));
         let search = self.palette_search(corpus);
         self.open_overlay(ActiveOverlay::palette(entries, projects, search), window, cx);
         // Re-read the inputs off the UI thread; the open palette picks them up.
@@ -6340,6 +6445,25 @@ impl ShelbiWindow {
             self.read_palette_corpus(cx);
         }
         self.poll_palette_search(cx);
+    }
+
+    /// How the palette searches the project's wiki: its hub, through the
+    /// window's link (the far hub for a remote tab), asked once per query
+    /// on the search's thread. A test's or the visual check's asks their
+    /// fake hub ([`crate::views::wiki::WikiPorts`]), else nothing: a real
+    /// ask would start a daemon.
+    fn palette_wiki(&self, cx: &App) -> Option<shelbi_app::overlay::palette_search::WikiSearch> {
+        use shelbi_app::overlay::palette_search::WikiSearch;
+        #[cfg(any(test, feature = "visual-check"))]
+        if let Some(ports) = cx.try_global::<crate::views::wiki::WikiPorts>() {
+            return Some(WikiSearch::over(ports.ask.clone()));
+        }
+        let _ = cx;
+        if cfg!(test) {
+            return None;
+        }
+        let link = self.project_handle.link.clone();
+        Some(WikiSearch::over(Arc::new(move |req| shelbi_app::wiki::ask(&link, req))))
     }
 
     /// Where the palette's searches run: their own thread (a test window
@@ -6387,7 +6511,8 @@ impl ShelbiWindow {
                 let corpus = SearchCorpus::new(
                     issues.unwrap_or_else(|| read.issues.to_vec()),
                     changelog.unwrap_or_else(|| read.changelog.to_vec()),
-                );
+                )
+                .with_wiki(this.palette_wiki(cx));
                 if let Some(ActiveOverlay::Palette { palette, .. }) = &mut this.overlay {
                     palette.set_corpus(corpus);
                 }
@@ -7027,6 +7152,12 @@ impl ShelbiWindow {
                 self.client.focus_main();
                 ws.update(cx, |w, cx| w.focus_panel(window, cx));
             }
+        } else if self.column.target() == Occupant::Wiki && !self.collapsed {
+            // And the Wiki's tree.
+            if let Some(wiki) = &self.wiki {
+                self.client.focus_main();
+                window.focus(&wiki.read(cx).focus_handle().clone(), cx);
+            }
         } else if !self.collapsed {
             self.client.focus_sidebar();
             // Take keys back from a main view that holds focus.
@@ -7293,6 +7424,7 @@ impl ShelbiWindow {
                 let content = match view {
                     View::Issues => self.issues.clone().map(|v| v.into_any_element()),
                     View::Changelog => self.changelog.clone().map(|v| v.into_any_element()),
+                    View::Wiki => self.wiki.clone().map(|w| w.update(cx, |w, cx| w.render_main(cx))),
                     View::Activity => self.activity.clone().map(|v| v.into_any_element()),
                     View::Machines => self.machines.clone().map(|v| v.into_any_element()),
                     View::Jobs | View::Reminders => self.jobs_reminders.clone().map(|v| v.into_any_element()),
@@ -7798,6 +7930,12 @@ impl ShelbiWindow {
                     cx,
                 ))
             });
+            // The Wiki's tree is a sidebar too: it hides with the app's.
+            let wiki = frame
+                .wiki
+                .filter(|_| reveal.position > 0.0)
+                .zip(self.wiki.clone())
+                .map(|(l, wiki)| layer("column-wiki", l).child(wiki));
             div()
                 .id("leading-column")
                 .debug_selector(|| "leading-column".into())
@@ -7817,7 +7955,8 @@ impl ShelbiWindow {
                         .children(sidebar)
                         .children(review)
                         .children(workspace)
-                        .children(settings),
+                        .children(settings)
+                        .children(wiki),
                 )
         });
         let divider_color = if self.dragging {
@@ -7940,6 +8079,10 @@ impl ShelbiWindow {
             .capture_key_down(cx.listener(Self::on_capture_key_down))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            // A `wiki:` link clicked in a task body (or a wiki document).
+            .on_action(cx.listener(|this, link: &crate::links::OpenWikiLink, window, cx| {
+                this.run(CommandKind::OpenWikiDoc { path: link.path.clone() }, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(None, window, cx)))
             .on_action(cx.listener(|this, _: &CloseWindow, window, cx| this.close_window(window, cx)))
             .on_modifiers_changed(cx.listener(|this, e: &gpui::ModifiersChangedEvent, _, cx| {
@@ -8461,6 +8604,10 @@ mod sidebar_tests;
 mod settings_tests;
 
 #[cfg(test)]
+#[path = "app_wiki_tests.rs"]
+mod wiki_tests;
+
+#[cfg(test)]
 #[path = "app_feedback_tests.rs"]
 mod feedback_tests;
 
@@ -8523,6 +8670,12 @@ mod image_menu_tests;
 /// The Jobs and Reminders screen's pieces, for tests and the visual check.
 #[cfg(any(test, feature = "visual-check"))]
 impl ShelbiWindow {
+    /// The Wiki, once shown.
+    #[cfg(feature = "visual-check")]
+    pub(crate) fn offscreen_wiki(&self) -> Option<Entity<WikiView>> {
+        self.wiki.clone()
+    }
+
     /// The Jobs and Reminders screen, once shown.
     #[cfg(test)]
     pub(crate) fn offscreen_jobs_reminders(&self) -> Option<Entity<JobsRemindersView>> {

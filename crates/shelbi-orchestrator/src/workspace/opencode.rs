@@ -100,6 +100,7 @@ pub(crate) fn compose_and_stage_opencode_context(
         .map_err(|e| Error::Other(format!("{e}")))?;
     let skills_src = shelbi_state::agent_skills_dir(project_name, agent)?;
     clear_owned_claude_skills(host, worktree)?;
+    clear_reserved_agents_skill(host, worktree, crate::wiki_plugin::WIKI_PLUGIN_NAME)?;
     let has_skills = stage_opencode_skills(host, worktree, &skills_src)?;
     let _ = shelbi_state::maybe_emit_claude_md_migration_hint(project_name);
     Ok(StagedOpenCodeContext { instructions, has_skills })
@@ -119,8 +120,23 @@ fn clear_owned_claude_skills(host: &Host, worktree: &Path) -> Result<()> {
     write_owned_skills(host, worktree, &[])
 }
 
+/// Remove Shelbi's copy of the reserved skill `name` from `.agents/skills/`,
+/// left there by an earlier Claude or Codex dispatch on this workspace:
+/// OpenCode reads that directory too, and gets its own copy from
+/// [`OPENCODE_SKILLS_REL`]. A git-tracked entry is the user's and stays.
+fn clear_reserved_agents_skill(host: &Host, worktree: &Path, name: &str) -> Result<()> {
+    let rel = format!(".agents/skills/{name}");
+    let path = worktree.join(&rel);
+    if !worktree_entry_exists(host, &path) || super::git_tracks_path(host, worktree, &rel) {
+        return Ok(());
+    }
+    remove_worktree_entry(host, &path)
+}
+
 /// Re-mount `skills_src`'s entries into [`OPENCODE_SKILLS_REL`], which is
-/// Shelbi's alone and so is emptied first. Returns whether any were mounted.
+/// Shelbi's alone and so is emptied first, then add Shelbi's `shelbi-wiki`
+/// skill, which every agent gets (it wins over an agent skill of the same
+/// name). Always mounts something, so always returns `true`.
 fn stage_opencode_skills(host: &Host, worktree: &Path, skills_src: &Path) -> Result<bool> {
     let dest_dir = worktree.join(OPENCODE_SKILLS_REL);
     remove_worktree_entry(host, &dest_dir)?;
@@ -129,9 +145,12 @@ fn stage_opencode_skills(host: &Host, worktree: &Path, skills_src: &Path) -> Res
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(Error::Io(e)),
     };
-    if entries.is_empty() {
-        return Ok(false);
+    let wiki = crate::wiki_plugin::resolve_wiki_plugin();
+    for warning in &wiki.warnings {
+        eprintln!("shelbi: warning: {warning}");
+        tracing::warn!("{warning}");
     }
+    let wiki_name = crate::wiki_plugin::WIKI_PLUGIN_NAME;
     let dest_str = dest_dir.to_string_lossy().into_owned();
     let mkdir = shelbi_ssh::run(host, ["mkdir", "-p", &dest_str]).map_err(Error::Io)?;
     if !mkdir.status.success() {
@@ -142,8 +161,21 @@ fn stage_opencode_skills(host: &Host, worktree: &Path, skills_src: &Path) -> Res
         });
     }
     for entry in entries {
+        if entry.file_name() == wiki_name {
+            eprintln!(
+                "shelbi: warning: suppressing project skill `{wiki_name}` at {}; the name is reserved for Shelbi's wiki skill",
+                entry.path().display()
+            );
+            continue;
+        }
         mount_skill_entry(host, &entry.path(), &dest_dir.join(entry.file_name()))?;
     }
+    write_worktree_text(
+        host,
+        &dest_dir.join(wiki_name).join("SKILL.md"),
+        wiki.skill(),
+        "wiki-skill",
+    )?;
     Ok(true)
 }
 
@@ -761,11 +793,34 @@ mod tests {
             "hi\n"
         );
         assert!(read_owned_skills(&Host::Local, &wt).unwrap().is_empty());
+        let wiki = crate::wiki_plugin::resolve_wiki_plugin().skill().to_string();
+        assert_eq!(
+            std::fs::read_to_string(wt.join(OPENCODE_SKILLS_REL).join("shelbi-wiki/SKILL.md")).unwrap(),
+            wiki,
+            "every agent gets the wiki skill"
+        );
 
-        // No skills: the directory is gone and the layer won't name it.
+        // No skills of its own: the agent still gets the wiki skill, and the
+        // previous dispatch's are gone.
         let none = tmp_root.join("no-skills");
-        assert!(!stage_opencode_skills(&Host::Local, &wt, &none).unwrap());
-        assert!(!wt.join(OPENCODE_SKILLS_REL).exists());
+        assert!(stage_opencode_skills(&Host::Local, &wt, &none).unwrap());
+        assert!(!wt.join(OPENCODE_SKILLS_REL).join("greet").exists());
+        assert!(wt.join(OPENCODE_SKILLS_REL).join("shelbi-wiki/SKILL.md").is_file());
+
+        // An agent skill of the reserved name is suppressed for Shelbi's.
+        let reserved = tmp_root.join("reserved");
+        std::fs::create_dir_all(reserved.join("shelbi-wiki")).unwrap();
+        std::fs::write(reserved.join("shelbi-wiki/SKILL.md"), "mine\n").unwrap();
+        stage_opencode_skills(&Host::Local, &wt, &reserved).unwrap();
+        let staged = wt.join(OPENCODE_SKILLS_REL).join("shelbi-wiki");
+        assert!(!staged.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(staged.join("SKILL.md")).unwrap(), wiki);
+        assert_eq!(std::fs::read_to_string(reserved.join("shelbi-wiki/SKILL.md")).unwrap(), "mine\n");
+
+        // A Codex dispatch's `.agents/skills/` copy goes (OpenCode reads it).
+        std::fs::create_dir_all(wt.join(".agents/skills/shelbi-wiki")).unwrap();
+        clear_reserved_agents_skill(&Host::Local, &wt, "shelbi-wiki").unwrap();
+        assert!(!wt.join(".agents/skills/shelbi-wiki").exists());
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
 

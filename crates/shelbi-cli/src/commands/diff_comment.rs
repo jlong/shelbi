@@ -158,11 +158,13 @@ fn ask_hub(message: &Value) -> Option<Result<Value>> {
     let answer = if let Some(hostport) = addr.strip_prefix("tcp:") {
         let stream = TcpStream::connect(hostport).ok()?;
         stream.set_read_timeout(Some(HUB_WAIT)).ok()?;
-        converse(&stream, line.as_bytes(), |s| s.shutdown(Shutdown::Write))
+        // Named: with objc2's blanket `Read for &CFRetained<T>` in the
+        // build, inferring `S` from the closure alone overflows.
+        converse::<TcpStream>(&stream, line.as_bytes(), |s: &TcpStream| s.shutdown(Shutdown::Write))
     } else {
         let stream = UnixStream::connect(addr.strip_prefix("unix:").unwrap_or(&addr)).ok()?;
         stream.set_read_timeout(Some(HUB_WAIT)).ok()?;
-        converse(&stream, line.as_bytes(), |s| s.shutdown(Shutdown::Write))
+        converse::<UnixStream>(&stream, line.as_bytes(), |s: &UnixStream| s.shutdown(Shutdown::Write))
     };
     Some(answer)
 }

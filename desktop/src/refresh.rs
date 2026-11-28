@@ -315,8 +315,9 @@ fn feed_loop(
             }
         }
         if let Some(changes) = &changes {
-            while changes.try_recv().is_ok() {
-                wake = true;
+            while let Ok(change) = changes.try_recv() {
+                // A wiki change refreshes the Wiki, not the board.
+                wake |= !change.is_wiki();
             }
         }
         if let Some(layout) = &layout {

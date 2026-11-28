@@ -204,6 +204,12 @@ impl Executor for Scenario {
                 self.client.focus_main();
                 Performed::Host(effect.clone())
             }
+            // The Wiki takes the main area; the host opens the document.
+            Effect::OpenWikiDoc { .. } => {
+                self.client.set_view(View::Wiki);
+                self.client.focus_main();
+                Performed::Host(effect.clone())
+            }
             // Settings stands over the view (it isn't one): the client's view
             // is what its Back returns to, so it is left alone.
             Effect::OpenSettings => {
@@ -305,6 +311,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::OpenEditor { .. } => "edit_targets_open_their_file_in_the_editor",
         CommandKind::OpenIssue { .. } => "a_searched_issue_opens_its_detail_over_the_view",
         CommandKind::OpenChangelogEntry { .. } => "a_searched_changelog_entry_opens_the_changelog_at_it",
+        CommandKind::OpenWikiDoc { .. } => "a_searched_wiki_document_opens_the_wiki_at_it",
         CommandKind::ApproveReview { .. } => "approve_is_sent_at_once",
         CommandKind::RejectReview { .. } => "reject_asks_for_a_reason_then_sends_it",
         CommandKind::MoveIssue { .. }
@@ -682,6 +689,22 @@ fn a_searched_changelog_entry_opens_the_changelog_at_it() {
     assert_eq!(s.client.view(), &View::Changelog);
     assert_eq!(s.client.focus(), Focus::Main);
     assert_eq!(s.last(), &Performed::Host(effect), "the host brings the entry into view");
+}
+
+#[test]
+fn a_searched_wiki_document_opens_the_wiki_at_it() {
+    let mut s = Scenario::new();
+    let effect = s.invoke_search_result("action:open-wiki-doc:Plans/wiki.md");
+    assert_eq!(
+        effect,
+        Effect::OpenWikiDoc {
+            project: PROJECT.into(),
+            path: "Plans/wiki.md".into()
+        }
+    );
+    assert_eq!(s.client.view(), &View::Wiki);
+    assert_eq!(s.client.focus(), Focus::Main);
+    assert_eq!(s.last(), &Performed::Host(effect), "the host opens the document");
 }
 
 #[test]

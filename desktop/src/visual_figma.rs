@@ -1392,6 +1392,219 @@ impl Run {
         self.save(handle, "jobs-empty");
     }
 
+    /// The Wiki (no Figma frame; checked by eye), over a fake hub
+    /// ([`crate::views::wiki::fake::FakeHub`]): `wiki` with the tree pushed
+    /// into the column and a plan open beside it; `wiki-menu` with a row's
+    /// context menu; `wiki-rename` renaming a document in place;
+    /// `wiki-undo` after a delete; `wiki-history` with the open document's
+    /// ⋯ ▸ Show History; `wiki-changed` with the changed-elsewhere bar over
+    /// an edited document; `wiki-conflict-held` with a held document's bar
+    /// and the footer's notice, and `wiki-conflict` with its inspector;
+    /// `wiki-palette` with the palette finding
+    /// documents; `wiki-setup` for a project with no wiki.
+    /// `SHELBI_VISUAL_ONLY=wiki` renders just these.
+    fn wiki(&mut self) {
+        use crate::views::wiki::fake::{ask_of, FakeHub};
+        use crate::views::wiki::{MenuAction, WikiPorts};
+        use std::sync::{Arc, Mutex};
+        let hub = |set_up: bool| {
+            let mut hub = FakeHub::sample();
+            hub.entries.insert("Plans/wiki.md".into(), (false, "Wiki".into(), "# Wiki\n".into()));
+            hub.entries.insert("Research/implicit-state-machines.md".into(), (false, "Implicit state machines".into(), "# Implicit state machines\n".into()));
+            hub.entries.get_mut("Plans/opencode-integration.md").unwrap().2 = "# OpenCode integration\n\n## Context\n\nOpenCode is a terminal coding agent. Shelbi runs it like Claude Code and Codex: in its own session, with the shared preamble and the project's skills.\n\n## Goals\n\n- [x] Launch OpenCode from a workspace\n- [ ] Awareness events from its plugin\n- [ ] Usage-limit detection\n\n## Decisions\n\n1. The config layer lives in `.shelbi/opencode/`.\n2. Models come from the user's own OpenCode config.\n".into();
+            let ago = |mins: i64| (chrono::Utc::now() - chrono::Duration::minutes(mins)).to_rfc3339();
+            let commit = |by, author: &str, mins, subject: &str, sha: &str| shelbi_app::wiki::WikiCommit {
+                sha: sha.into(),
+                author: author.into(),
+                date: ago(mins),
+                subject: subject.into(),
+                paths: vec!["Plans/opencode-integration.md".into()],
+                by,
+            };
+            use shelbi_app::wiki::Author;
+            hub.commits.insert(
+                "Plans/opencode-integration.md".into(),
+                vec![
+                    commit(Some(Author::Agent), "John Long", 2, "Update opencode-integration.md", "3f9c2e1a"),
+                    commit(Some(Author::Person), "John Long", 95, "Update opencode-integration.md; Add wiki.md", "a41b7d09"),
+                    commit(None, "Jane Doe", 60 * 26, "Add opencode-integration.md", "0d2e88c4"),
+                ],
+            );
+            if !set_up {
+                hub.status = Some(shelbi_app::wiki::WikiStatus::not_set_up());
+            }
+            Arc::new(Mutex::new(hub))
+        };
+        let ports = |hub: &Arc<Mutex<FakeHub>>| WikiPorts {
+            ask: ask_of(hub),
+            store: shelbi_app::settings::store::Disk::store(PROJECT),
+        };
+        let open_wiki = |this: &mut Self, hub: &Arc<Mutex<FakeHub>>| {
+            let ports = ports(hub);
+            this.cx.update(|cx| cx.set_global(ports));
+            let handle = this.open();
+            this.click(handle, View::Wiki);
+            let wiki = handle.update(&mut this.cx, |w, _, _| w.offscreen_wiki()).unwrap().expect("the Wiki");
+            let loaded = this.wait(handle, Duration::from_secs(10), |cx| wiki.read_with(cx, |v, _| v.tree().is_loaded()));
+            (handle, wiki, loaded)
+        };
+
+        let h = hub(true);
+        let (handle, wiki, loaded) = open_wiki(self, &h);
+        self.expect("wiki: the tree loads", loaded);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/Archive/old.md", window, cx);
+                    v.reveal("Plans/opencode-integration.md", window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki");
+
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/opencode-integration.md", window, cx);
+                    v.open_menu(Some("Plans/awareness-v2.md".into()), gpui::point(px(150.0), px(170.0)), window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-menu");
+
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/awareness-v2.md", window, cx);
+                    v.open_menu(Some("Plans/awareness-v2.md".into()), gpui::point(px(150.0), px(170.0)), window, cx);
+                    v.menu_action(MenuAction::Rename, window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-rename");
+
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| v.delete("Plans/wiki.md", window, cx));
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-undo");
+
+        // The document's ⋯ ▸ Show History.
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/opencode-integration.md", window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.open_doc_menu(gpui::point(px(1180.0), px(80.0)), cx);
+                    v.doc_action(crate::views::wiki::doc::DocAction::ShowHistory, window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-history");
+
+        // Edited here while an agent rewrote it: the changed-elsewhere bar.
+        let (handle, wiki, _) = open_wiki(self, &h);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| v.reveal("Plans/opencode-integration.md", window, cx))
+            })
+            .unwrap();
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| v.edit_for_visual("\nA note of mine.", window, cx));
+            })
+            .unwrap();
+        self.settle(handle);
+        h.lock().unwrap().entries.get_mut("Plans/opencode-integration.md").unwrap().2 =
+            "# OpenCode integration\n\n## Context\n\nRewritten by an agent.\n".into();
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                let wake = shelbi_app::wiki_sub::WikiWake::Changed {
+                    paths: vec!["Plans/opencode-integration.md".into()],
+                    source: "agent".into(),
+                };
+                wiki.update(cx, |v, cx| v.woke(vec![wake], window, cx));
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-changed");
+
+        // A document the sync couldn't merge: the notice and the bar, then
+        // the inspector with one change chosen.
+        let hc = hub(true);
+        {
+            let base = "# OpenCode integration\n\n## Context\n\nOpenCode is a terminal coding agent. Shelbi runs it like Claude Code and Codex.\n\n## Goals\n\n- [x] Launch OpenCode from a workspace\n- [ ] Awareness events from its plugin\n\n## Decisions\n\n1. The config layer lives in `.shelbi/opencode/`.\n2. Models come from the user's own OpenCode config.\n";
+            let ours = base
+                .replace("Shelbi runs it like Claude Code and Codex.", "Shelbi runs it like Claude Code and Codex, in its own session.")
+                .replace("- [ ] Awareness events from its plugin\n", "- [x] Awareness events from its plugin\n- [ ] Usage-limit detection\n");
+            let theirs = base
+                .replace("Shelbi runs it like Claude Code and Codex.", "Shelbi runs it as it runs every agent: one session, the shared preamble.")
+                .replace("2. Models come from the user's own OpenCode config.", "2. Models are picked per workspace.");
+            hc.lock().unwrap().hold("Plans/opencode-integration.md", &ours, &theirs);
+        }
+        let (handle, wiki, _) = open_wiki(self, &hc);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| v.reveal("Plans/opencode-integration.md", window, cx))
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-conflict-held");
+        let (handle, wiki, _) = open_wiki(self, &hc);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/opencode-integration.md", window, cx);
+                    v.inspect("Plans/opencode-integration.md", window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |_, _, cx| {
+                use shelbi_app::wiki_conflict::Side;
+                wiki.update(cx, |v, cx| v.choose_for_visual(&[(0, Side::Theirs), (2, Side::Ours)], cx))
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-conflict");
+
+        // The palette finds documents by title and text.
+        let (handle, _, _) = open_wiki(self, &h);
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_overlay(None, window, cx))
+            .unwrap();
+        self.settle(handle);
+        self.cx.simulate_keystrokes(handle.into(), "o p e n c o d e");
+        for _ in 0..4 {
+            self.settle(handle);
+        }
+        self.save(handle, "wiki-palette");
+
+        let (handle, _, _) = open_wiki(self, &hub(false));
+        self.settle(handle);
+        self.save(handle, "wiki-setup");
+        self.cx.update(|cx| cx.remove_global::<WikiPorts>());
+    }
+
     /// The Reminders screen (no Figma frame; checked by eye), pinned at 3 PM:
     /// `reminders` with five pending reminders (Next up in 12m, two more
     /// today, one of them repeating, one tomorrow, one later in the week)
@@ -3692,6 +3905,11 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "reminders") {
             self.reminders();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "wiki") {
+            self.wiki();
             return;
         }
 

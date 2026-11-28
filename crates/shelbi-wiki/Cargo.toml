@@ -1,0 +1,36 @@
+[package]
+name = "shelbi-wiki"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Wiki storage for Shelbi: ContextStore's on-disk format (settings, folders, documents, Markdown sections, merge, search)"
+
+# Copied from ContextStore's Rust core (32pixelsCo/ContextStore, branch
+# `rewrite/rust-core`), MIT in Shelbi. Synchronous on purpose: no tokio, no
+# git2: the sync drives the user's git CLI.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# ContextStore used `serde_yaml` 0.9; `yaml_serde` is the maintained fork the
+# rest of the workspace already reads YAML with, same API.
+yaml_serde = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+# `.csignore` matching and the search walker (gitignore semantics).
+ignore = "0.4"
+# CommonMark + GFM parser behind sections, tasks, links and the AST merge.
+comrak = { version = "0.52", default-features = false }
+# Second stage of the three-way Markdown merge.
+diff-match-patch-rs = "0.5"
+# Deletes go to the platform trash, as ContextStore's do.
+trash = "5"
+# Atomic writes go through a same-directory temp file.
+tempfile = "3"
+# The hub's wiki service watches the worktree for edits made outside it.
+notify = "8"
+
+[dev-dependencies]
+static_assertions = "1.1"
