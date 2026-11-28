@@ -4,7 +4,7 @@ Part of the Wiki (`Plans/wiki.md` in the Shelbi ContextStore space).
 
 ```text
 ┌────────────────────────┬──────────────────────────────────────────────┐
-│ ‹  Wiki     ＋ 🗀 ⋮ 🔍 ◧ │  Plans › OpenCode integration                │
+│ ‹  Wiki          ＋ 🗀 ◧ │  Plans › OpenCode integration                │
 │ 🔍 Filter               │ ──────────────────────────────────────────── │
 │ ▾ 🗀 Plans              │  # OpenCode integration                      │
 │ │   📄 Awareness v2     │                                              │
@@ -55,8 +55,8 @@ Part of the Wiki (`Plans/wiki.md` in the Shelbi ContextStore space).
   it came from elsewhere. Documents have no order of their own (pinned, then
   by title, as ContextStore sorts them), so a document dropped beside a row
   only changes folders. The space under the rows is the top level.
-- **Context menu** (right-click a row, or the empty space and the header's
-  ⋮ for the top level): New Document, New Folder, Rename, Duplicate
+- **Context menu** (right-click a row, or the empty space for the top
+  level): New Document, New Folder, Rename, Duplicate
   (`plan copy.md`), Move to… (the folders, minus where it is and what's
   inside it), Reveal in Finder (dimmed for a project on another machine),
   Copy Path (the wiki-relative path, what `shelbi wiki` takes), Delete.
@@ -92,8 +92,11 @@ Part of the Wiki (`Plans/wiki.md` in the Shelbi ContextStore space).
   removals until the hub restarts.
 - **Copy Path copies the wiki-relative path**, which means the same thing on
   every machine and is what `shelbi wiki` and agents take.
-- **The tree's header keeps Search and Toggle sidebar** like every other
-  column header, after the wireframe's New Document, New Folder and ⋮.
+- **The tree's header has only New Document, New Folder and Toggle
+  sidebar** after the title: no ⋮ (its New Document, New Folder and Reveal
+  in Finder are the header's buttons, ⌘N / ⇧⌘N and the context menu) and
+  no Search (the palette, or the sidebar's Search, finds wiki
+  documents).
 
 ## Tests
 
