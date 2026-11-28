@@ -33,7 +33,7 @@
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseDownEvent,
+    div, prelude::*, px, AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseDownEvent,
     ScrollHandle, SharedString, Subscription, Window,
 };
 use shelbi_app::wiki::{Author, WikiCommit, WikiReply, WikiRequest};
@@ -46,8 +46,17 @@ use crate::views::doc_editor::{DocEditor, DocEvent};
 use crate::views::{external_edit, sidebar, tab_bar};
 use crate::assets::{heroicon, icons};
 use crate::elements::placed::placed;
+use crate::elements::terminal::settings::TerminalSettings;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
+
+/// The document's body size: the terminal font size
+/// ([`TerminalSettings::font_size`]), so the Wiki reads at the size of the
+/// panes beside it. Headings and code scale from it
+/// ([`DocEditor::set_body_size`]); the toolbar and bars keep the UI's sizes.
+pub fn body_size(cx: &App) -> f32 {
+    TerminalSettings::current(cx).font_size
+}
 
 /// How many commits Show History lists.
 pub const HISTORY_LIMIT: usize = 30;
@@ -153,6 +162,8 @@ impl WikiView {
         let editor = cx.new(|cx| {
             DocEditor::new(&text, DocField::Body, "Write something…", "Wiki document", Some(scroll.clone()), window, cx)
         });
+        let size = body_size(cx);
+        editor.update(cx, |e, cx| e.set_body_size(size, cx));
         let sub = cx.subscribe_in(&editor, window, |this, _, ev: &DocEvent, window, cx| this.doc_event(ev, window, cx));
         self.pane = Some(DocPane {
             sync: DocSync::new(path.clone(), text),
@@ -163,6 +174,15 @@ impl WikiView {
         });
         self.read_updated(window, cx);
         cx.notify();
+    }
+
+    /// Set the open document's text at [`body_size`] again (the terminal
+    /// font size changed).
+    pub(super) fn apply_body_size(&mut self, cx: &mut Context<Self>) {
+        if let Some(pane) = &self.pane {
+            let size = body_size(cx);
+            pane.editor.update(cx, |e, cx| e.set_body_size(size, cx));
+        }
     }
 
     /// What the editor said.

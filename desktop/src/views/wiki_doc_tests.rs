@@ -12,6 +12,9 @@ use shelbi_app::wiki_doc::SAVE_AFTER;
 use shelbi_app::wiki_sub::WikiWake;
 
 use super::doc::{DocAction, DocMenu};
+use crate::elements::terminal::metrics::DEFAULT_FONT_SIZE;
+use crate::elements::terminal::settings::TerminalSettings;
+use crate::theme::style::Type;
 use super::tests::{FakeHub, T};
 
 const DOC: &str = "Plans/awareness-v2.md";
@@ -283,3 +286,64 @@ fn esc_in_the_document_hands_the_keys_to_the_tree(cx: &mut TestAppContext) {
     assert_eq!(t.writes().len(), 1);
 }
 
+
+impl T {
+    fn scale(&mut self) -> f32 {
+        let editor = self.read(|v| v.doc_editor()).expect("the editor shows");
+        editor.read_with(&self.cx, |e, _| e.scale())
+    }
+
+    fn body_height(&mut self) -> f32 {
+        self.frame();
+        let b = self.cx.debug_bounds("pane-body-editor").expect("the editor is drawn");
+        f32::from(b.size.height)
+    }
+
+    fn set_terminal_size(&mut self, size: f32) {
+        self.cx.update(|_, cx| {
+            TerminalSettings::set(TerminalSettings { font_size: size, ..TerminalSettings::current(cx) }, cx)
+        });
+        self.cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn the_document_reads_at_the_terminal_font_size_and_follows_it(cx: &mut TestAppContext) {
+    let mut t = T::open(cx, FakeHub::sample());
+    t.set_terminal_size(18.0);
+    t.open_doc();
+    // The body is the terminal's size; everything else scales from it.
+    assert_eq!(t.scale(), 18.0 / Type::Base.size());
+    let at_18 = t.body_height();
+
+    // ⌘+ / Settings move the global: the open document follows at once.
+    t.set_terminal_size(28.0);
+    assert_eq!(t.scale(), 2.0);
+    let at_28 = t.body_height();
+    assert!(at_28 > at_18 * 1.4, "headings and body grow with it: {at_18} -> {at_28}");
+
+    // ⌘0: back to the default, the UI's own base size.
+    t.set_terminal_size(DEFAULT_FONT_SIZE);
+    assert_eq!(t.scale(), DEFAULT_FONT_SIZE / Type::Base.size());
+    assert!(t.body_height() < at_18);
+}
+
+#[gpui::test]
+fn the_main_area_is_the_terminals_surface_in_every_theme(cx: &mut TestAppContext) {
+    use crate::theme::Theme;
+    use gpui::WindowAppearance;
+    use shelbi_app::theme::ThemePreference;
+    for pref in [ThemePreference::Light, ThemePreference::Dark] {
+        let theme = Theme::resolve(pref, WindowAppearance::Light);
+        assert_eq!(super::surface(&theme), theme.terminal_canvas(), "{pref:?}");
+        // At a contrast that moves the canvas, still the terminals' own.
+        let contrasted = theme.with_contrast(40);
+        assert_eq!(super::surface(&contrasted), contrasted.terminal_canvas(), "{pref:?} at contrast");
+        // Translucent: the glass, as under a terminal pane.
+        let glass = theme.with_opacity(0.8);
+        assert_eq!(super::surface(&glass).a, 0.0, "{pref:?} on glass");
+    }
+    let mut t = T::open(cx, FakeHub::sample());
+    t.open_doc();
+    assert!(t.drawn("wiki-main"));
+}

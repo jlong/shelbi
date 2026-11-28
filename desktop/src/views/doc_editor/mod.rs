@@ -100,6 +100,10 @@ pub struct DocEditor {
     code: CodeHighlights,
     /// Each row's spans, for the text revision they were read at.
     code_spans: Option<(u64, Rc<Vec<Vec<SyntaxSpan>>>)>,
+    /// Every text size, line height, gap and inset over the UI's own:
+    /// 1 (the task pane), or the Wiki's body size over [`Type::Base`]'s
+    /// ([`Self::set_body_size`]).
+    scale: f32,
     _subs: Vec<Subscription>,
     _blink: Task<()>,
 }
@@ -181,6 +185,7 @@ impl DocEditor {
             link: None,
             code: CodeHighlights::default(),
             code_spans: None,
+            scale: 1.0,
             _subs: subs,
             _blink: blink,
         }
@@ -188,6 +193,24 @@ impl DocEditor {
 
     pub fn text(&self) -> &str {
         self.model.text()
+    }
+
+    /// Set the body text at `size` points (the UI's is [`Type::Base`]'s):
+    /// headings, code, list gutters and the room between blocks scale with
+    /// it. The toolbar keeps its own sizes.
+    pub fn set_body_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        let scale = (size / Type::Base.size()).max(0.1);
+        if scale != self.scale {
+            self.scale = scale;
+            self.goal_x = None;
+            cx.notify();
+        }
+    }
+
+    /// What [`Self::set_body_size`] set: the sizes over the UI's.
+    #[cfg(test)]
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     /// How the doc's code shows: the rows left out (each fenced block's

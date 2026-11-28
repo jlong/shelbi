@@ -44,6 +44,12 @@
 //! saves going through the hub ([`doc`]). A document the sync couldn't merge
 //! is resolved in the conflict inspector ([`conflict`]), from the notice over
 //! the footer or the bar over the document.
+//!
+//! The main area looks like the terminals beside it: it paints their
+//! surface ([`surface`]), and the document's body is the terminal font size
+//! ([`doc::body_size`], `TerminalSettings::font_size`) with headings and code
+//! scaled from it, following ⌘+ ⌘− ⌘0 and Settings live. It keeps the prose
+//! font; the tree column and the toolbar keep the UI's sizes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,6 +72,7 @@ use shelbi_core::WikiSource;
 use super::{sidebar, task_panel};
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::placed::placed;
+use crate::elements::terminal::settings::TerminalSettings;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
 
@@ -75,6 +82,13 @@ pub mod doc;
 pub mod conflict;
 
 use doc::DocMenu;
+
+/// The main area's background: the surface a terminal pane paints
+/// (`TerminalPane`, `SessionView`), the terminals' own default background
+/// whatever the contrast, and the window's glass while it is translucent.
+pub fn surface(theme: &Theme) -> Hsla {
+    theme.nested(theme.terminal_canvas())
+}
 
 /// A tree row's height.
 pub const ROW_H: f32 = 26.0;
@@ -263,7 +277,7 @@ impl WikiView {
     /// A Wiki that asks `ask` (a test's fake hub) and follows nothing.
     pub fn with_ask(ask: Ask, store: Store, local: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
-        let subs = vec![cx.subscribe_in(&filter, window, |this, input, event: &InputEvent, window, cx| {
+        let mut subs = vec![cx.subscribe_in(&filter, window, |this, input, event: &InputEvent, window, cx| {
             match event {
                 InputEvent::Change => {
                     let text = input.read(cx).value().to_string();
@@ -278,6 +292,9 @@ impl WikiView {
                 _ => {}
             }
         })];
+        // ⌘+ ⌘− ⌘0 and Settings' terminal font size resize the open
+        // document as they do the terminals.
+        subs.push(cx.observe_global::<TerminalSettings>(|this, cx| this.apply_body_size(cx)));
         WikiView {
             focus: cx.focus_handle(),
             ask,
@@ -1285,7 +1302,7 @@ impl WikiView {
             .flex_col()
             .size_full()
             .min_w_0()
-            .bg(theme.background)
+            .bg(surface(&theme))
             .child(body)
             .into_any_element()
     }

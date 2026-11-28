@@ -102,7 +102,19 @@ struct Face {
     color: Hsla,
 }
 
-fn face(field: Field, row: &Row, theme: &Theme) -> Face {
+/// `row`'s face at `scale` (the body's size over [`Type::Base`]'s): every
+/// size and line height in proportion, the line heights on whole points.
+fn face(field: Field, row: &Row, theme: &Theme, scale: f32) -> Face {
+    let f = face_at_base(field, row, theme);
+    Face {
+        size: f.size * scale,
+        line_height: (f.line_height * scale).round(),
+        ..f
+    }
+}
+
+/// `row`'s face at the UI's base size.
+fn face_at_base(field: Field, row: &Row, theme: &Theme) -> Face {
     let ui = |ty: Type, color| Face {
         family: UI_FAMILY,
         size: ty.size(),
@@ -258,7 +270,7 @@ fn runs(
 #[cfg(test)]
 pub fn run_colors(row: &Row, field: Field, syntax: &[SyntaxSpan], theme: &Theme) -> Vec<Hsla> {
     let mut out: Vec<Hsla> = Vec::new();
-    for run in runs(row, &face(field, row, theme), None, syntax, theme) {
+    for run in runs(row, &face(field, row, theme, 1.0), None, syntax, theme) {
         if !out.contains(&run.color) {
             out.push(run.color);
         }
@@ -267,7 +279,9 @@ pub fn run_colors(row: &Row, field: Field, syntax: &[SyntaxSpan], theme: &Theme)
 }
 
 /// Lay `doc` out at `width`. `marked` is the composition, in source
-/// offsets; `code` the rows left out and the code lines' highlights.
+/// offsets; `code` the rows left out and the code lines' highlights;
+/// `scale` the editor's [`super::DocEditor::scale`], which sets every text
+/// size, line height, gap and inset in proportion (1 for the UI's sizes).
 #[allow(clippy::too_many_arguments)]
 pub fn layout(
     doc: &Doc,
@@ -275,6 +289,7 @@ pub fn layout(
     width: Pixels,
     marked: Option<std::ops::Range<usize>>,
     code: Code<'_>,
+    scale: f32,
     theme: &Theme,
     window: &mut Window,
     _cx: &mut App,
@@ -290,19 +305,20 @@ pub fn layout(
     // shown (an opening fence's gap above its block).
     let mut carried = 0.0f32;
     let mut shown_any = false;
+    let room = |g: Gap| gap(g) * scale;
     // The block of the row shown before or after `ri`, past left-out rows.
     let prev_block = |ri: usize| (0..ri).rev().find(|&i| !code.hidden(i)).and_then(|i| doc.rows[i].block);
     let next_block = |ri: usize| (ri + 1..doc.rows.len()).find(|&i| !code.hidden(i)).and_then(|i| doc.rows[i].block);
     for (ri, row) in doc.rows.iter().enumerate() {
-        let f = face(field, row, theme);
+        let f = face(field, row, theme, scale);
         let lh = px(f.line_height);
         if code.hidden(ri) {
             if shown_any {
-                carried = carried.max(gap(row.gap));
+                carried = carried.max(room(row.gap));
             }
             rows.push(RowLayout {
                 top: y,
-                left: px(CODE_INSET),
+                left: px(CODE_INSET * scale),
                 line_height: lh,
                 lines: Vec::new(),
                 gutter: None,
@@ -311,16 +327,16 @@ pub fn layout(
             continue;
         }
         if shown_any {
-            y += px(gap(row.gap).max(carried));
+            y += px(room(row.gap).max(carried));
         }
         carried = 0.0;
         shown_any = true;
         let new_block = row.block.is_some() && prev_block(ri) != row.block;
         let ends_block = row.block.is_some() && next_block(ri) != row.block;
         if new_block {
-            y += px(CODE_PAD);
+            y += px(CODE_PAD * scale);
         }
-        let level = px(row.level as f32 * INDENT);
+        let level = px(row.level as f32 * INDENT * scale);
         let (left, gutter) = match &row.kind {
             RowKind::Item(item) => {
                 numbers.truncate(row.level + 1);
@@ -344,12 +360,12 @@ pub fn layout(
                 };
                 let gb = Bounds {
                     origin: point(level, y),
-                    size: size(px(INDENT), lh),
+                    size: size(px(INDENT * scale), lh),
                 };
-                (level + px(INDENT), Some((g, gb)))
+                (level + px(INDENT * scale), Some((g, gb)))
             }
-            RowKind::Quote => (px(QUOTE_INSET), None),
-            _ if row.block.is_some() => (px(CODE_INSET), None),
+            RowKind::Quote => (px(QUOTE_INSET * scale), None),
+            _ if row.block.is_some() => (px(CODE_INSET * scale), None),
             _ => {
                 if row.level == 0 && !matches!(row.kind, RowKind::Empty) {
                     numbers.clear();
@@ -359,7 +375,7 @@ pub fn layout(
                 (level, None)
             }
         };
-        let text_w = (width - left - if row.block.is_some() { px(CODE_INSET) } else { px(0.0) }).max(px(20.0));
+        let text_w = (width - left - if row.block.is_some() { px(CODE_INSET * scale) } else { px(0.0) }).max(px(20.0));
         let marked_here = marked
             .as_ref()
             .filter(|m| row.lines.start <= m.start && m.start <= row.lines.end)
@@ -401,8 +417,8 @@ pub fn layout(
             });
         }
         if row.block.is_some() {
-            let top = if new_block { y - px(CODE_PAD) } else { y };
-            let bottom = y + height + if ends_block { px(CODE_PAD) } else { px(0.0) };
+            let top = if new_block { y - px(CODE_PAD * scale) } else { y };
+            let bottom = y + height + if ends_block { px(CODE_PAD * scale) } else { px(0.0) };
             match blocks.last_mut().filter(|_| !new_block) {
                 Some(b) => b.size.height = bottom - b.origin.y,
                 None => blocks.push(Bounds {
@@ -421,7 +437,7 @@ pub fn layout(
         });
         y += height;
         if ends_block {
-            y += px(CODE_PAD);
+            y += px(CODE_PAD * scale);
         }
     }
     DocLayout {
