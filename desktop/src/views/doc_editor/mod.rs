@@ -1085,3 +1085,22 @@ impl EntityInputHandler for DocEditor {
         Some(self.model.to_utf16(src))
     }
 }
+
+#[cfg(test)]
+mod mods_tests {
+    use super::editing_mods_in;
+
+    fn mods(control: bool, platform: bool) -> gpui::Modifiers {
+        gpui::Modifiers { control, platform, ..Default::default() }
+    }
+
+    #[test]
+    fn save_is_cmd_s_on_macos_and_ctrl_s_on_linux() {
+        // (cmd, alt, ctrl, shift): `cmd` is what the `"s" if cmd` Save arm reads.
+        assert!(editing_mods_in("s", &mods(false, true), true).0);
+        assert!(!editing_mods_in("s", &mods(true, false), true).0);
+        assert!(editing_mods_in("s", &mods(true, false), false).0);
+        // Ctrl still moves by word on Linux rather than commanding.
+        assert_eq!(editing_mods_in("left", &mods(true, false), false), (false, true, false, false));
+    }
+}

@@ -105,9 +105,9 @@ fn a_document_opens_in_the_editor_and_typing_saves_through_the_hub(cx: &mut Test
     let now = chrono::Utc::now();
     assert_eq!(t.read(|v| v.updated_line(now)).as_deref(), Some("Updated by you · just now"));
 
-    // ⌘S saves at once.
+    // ⌘S (Ctrl+S on Linux) saves at once.
     t.type_at_end("!");
-    t.keys("cmd-s");
+    t.keys(&crate::keys::test_keys::text_spec("cmd-s"));
     assert_eq!(t.writes(), [(DOC.to_string(), want.replace(".\n", ".!\n"))]);
     t.pause();
     assert!(t.writes().is_empty(), "nothing new to save");
