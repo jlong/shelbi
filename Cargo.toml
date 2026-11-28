@@ -76,6 +76,10 @@ portable-pty = "0.9"
 # prose preview of a task body. Only the event stream is used: default
 # features (the `html` renderer and the CLI's `getopts`) are off.
 pulldown-cmark = { version = "0.13", default-features = false }
+# The TUI's inline Markdown images (`shelbi_tui::kitty`, drawn with the kitty
+# graphics protocol): decode PNG, JPEG and GIF (first frame), scale, and
+# re-encode as PNG for the terminal. Only those three codecs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 
 # Client-side terminal emulator, vendored under `vendor/` (Apache-2.0). Chosen
 # in the `rt-spike-emulator-replay` Phase 0 spike as a fork because attach

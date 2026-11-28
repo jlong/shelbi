@@ -34,6 +34,9 @@ tracing = { workspace = true }
 # (`shell::caps`), so a headless terminal that never answers the query can't
 # stall the first draw (`rt-tui-headless-startup-block`).
 libc = { workspace = true }
+# Changelog and Documentation images, drawn inline where the terminal speaks
+# the kitty graphics protocol (`kitty`).
+image = { workspace = true }
 
 [build-dependencies]
 # `build.rs` (`crates/shelbi-app/build_support/licenses.rs`) reads `cargo

@@ -22,6 +22,7 @@ use ratatui::text::{Line, Span};
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::kitty::{Figure, Figures};
 use crate::theme::palette;
 
 /// Inline `code` spans: the theme's `code_fg` on `code_bg`, a tint just off
@@ -47,6 +48,51 @@ pub fn render_note(body: &str, width: usize) -> Vec<Line<'static>> {
         wrap_runs(runs, width, &mut out);
     }
     out
+}
+
+/// [`render_note`] over a changelog-style description, its images as
+/// `[image: alt]` placeholders; with `figures` (a terminal that draws kitty
+/// graphics), a line holding only images draws each one that can be drawn as
+/// a figure instead ([`crate::kitty::figure`]), returned beside the lines.
+/// Without `figures` the lines are exactly the placeholders'.
+pub(crate) fn render_note_figures(
+    body: &str,
+    width: usize,
+    figures: Option<&Figures<'_>>,
+) -> (Vec<Line<'static>>, Vec<Figure>) {
+    use shelbi_app::changelog::{image_label, image_line, image_placeholders};
+    let Some(f) = figures else {
+        return (render_note(&image_placeholders(body), width), Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut figs = Vec::new();
+    let mut in_fence = false;
+    for src in body.split('\n') {
+        let trimmed = src.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.extend(render_note(src, width));
+            continue;
+        }
+        if in_fence {
+            out.extend(render_note(src, width));
+            continue;
+        }
+        let Some(images) = image_line(src) else {
+            out.extend(render_note(&image_placeholders(src), width));
+            continue;
+        };
+        for (alt, url) in images {
+            match crate::kitty::figure(&alt, &(f.resolve)(&url), width, f.gfx) {
+                Some((lines, fig)) => {
+                    figs.push(Figure { line: out.len(), ..fig });
+                    out.extend(lines);
+                }
+                None => out.extend(render_note(&format!("[image: {}]", image_label(&alt, &url)), width)),
+            }
+        }
+    }
+    (out, figs)
 }
 
 /// How a slice of text is marked up: inline code, bold, or both.
@@ -339,8 +385,22 @@ fn toks_to_line(toks: &[Tok]) -> Line<'static> {
 /// the same way. A table draws as a box-drawn grid, its cells wrapping in
 /// their columns ([`draw_table`]); what the model doesn't render (HTML) shows
 /// as written, muted. A leading frontmatter block is left out.
+#[cfg(test)]
 pub fn render_document(src: &str, width: usize) -> Vec<Line<'static>> {
+    render_document_figures(src, width, None).0
+}
+
+/// A document's lines (`render_document` in the tests), and with `figures` (a terminal that draws kitty
+/// graphics) a paragraph holding only images draws them as figures
+/// ([`crate::kitty::figure`]), returned beside the lines. A paragraph none of
+/// whose images can be drawn shows as before, its source muted.
+pub(crate) fn render_document_figures(
+    src: &str,
+    width: usize,
+    figures: Option<&Figures<'_>>,
+) -> (Vec<Line<'static>>, Vec<Figure>) {
     use shelbi_app::markdown_edit::{Doc, Gap, Marker, RowKind, TablePart};
+    let mut figs = Vec::new();
     let width = width.max(8);
     let body = strip_frontmatter(src);
     let doc = Doc::parse(body);
@@ -354,7 +414,14 @@ pub fn render_document(src: &str, width: usize) -> Vec<Line<'static>> {
         let segs = || styled_segments(&row.display, &row.styles);
         match &row.kind {
             RowKind::Empty => out.push(Line::default()),
-            RowKind::Paragraph => wrap_segments(segs(), width, "", "", Style::default(), &mut out),
+            RowKind::Paragraph => {
+                if let Some(f) = figures {
+                    if paragraph_figures(&body[row.lines.clone()], width, f, &mut out, &mut figs) {
+                        continue;
+                    }
+                }
+                wrap_segments(segs(), width, "", "", Style::default(), &mut out)
+            }
             RowKind::Heading(level) => {
                 let mut base = Style::default().add_modifier(Modifier::BOLD);
                 if *level <= 2 {
@@ -418,7 +485,35 @@ pub fn render_document(src: &str, width: usize) -> Vec<Line<'static>> {
             }
         }
     }
-    out
+    (out, figs)
+}
+
+/// A paragraph's images as figures, when it holds only images and at least
+/// one can be drawn: each drawable one as its figure, any other as its
+/// source, muted (how the paragraph showed before). `false` (nothing pushed)
+/// otherwise.
+fn paragraph_figures(source: &str, width: usize, f: &Figures<'_>, out: &mut Vec<Line<'static>>, figs: &mut Vec<Figure>) -> bool {
+    let Some(images) = shelbi_app::changelog::image_line(source) else {
+        return false;
+    };
+    let drawn: Vec<_> = images
+        .iter()
+        .map(|(alt, url)| crate::kitty::figure(alt, &(f.resolve)(url), width, f.gfx))
+        .collect();
+    if drawn.iter().all(Option::is_none) {
+        return false;
+    }
+    let muted = Style::default().fg(palette().ansi_gray);
+    for ((alt, url), d) in images.iter().zip(drawn) {
+        match d {
+            Some((lines, fig)) => {
+                figs.push(Figure { line: out.len(), ..fig });
+                out.extend(lines);
+            }
+            None => wrap_segments(vec![(format!("![{alt}]({url})"), muted)], width, "", "", Style::default(), out),
+        }
+    }
+    true
 }
 
 /// The widest a word holds a table column open in the TUI (a longer one

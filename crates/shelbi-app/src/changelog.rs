@@ -619,6 +619,34 @@ pub fn image_placeholders(markdown: &str) -> String {
     out
 }
 
+/// The images of `text` when it holds nothing else (whitespace aside), as
+/// `(alt, url)` in order: a Markdown line (or paragraph) that's only images,
+/// which a client that draws images inline (the TUI, on a kitty-graphics
+/// terminal) shows as figures. The alt text reads as [`image_placeholders`]
+/// shows it, escaped brackets plain. `None` for anything else, and for no
+/// images at all.
+pub fn image_line(text: &str) -> Option<Vec<(String, String)>> {
+    let mut images = Vec::new();
+    let mut rest = text.trim_start();
+    while !rest.is_empty() {
+        let (alt, url, len) = parse_image(rest)?;
+        images.push((alt.replace("\\[", "[").replace("\\]", "]"), url.to_string()));
+        rest = rest[len..].trim_start();
+    }
+    (!images.is_empty()).then_some(images)
+}
+
+/// What an image's placeholder names it by: its alt text (escaped brackets
+/// plain), or its file name when the alt text is empty.
+pub fn image_label(alt: &str, url: &str) -> String {
+    let label = if alt.trim().is_empty() {
+        url.rsplit('/').next().unwrap_or(url).to_string()
+    } else {
+        alt.replace("\\[", "[").replace("\\]", "]")
+    };
+    label.trim().to_string()
+}
+
 fn replace_images(text: &str, out: &mut String) {
     let mut rest = text;
     while let Some(start) = rest.find("![") {
@@ -628,12 +656,7 @@ fn replace_images(text: &str, out: &mut String) {
             continue;
         };
         out.push_str(&rest[..start]);
-        let label = if alt.trim().is_empty() {
-            url.rsplit('/').next().unwrap_or(url).to_string()
-        } else {
-            alt.replace("\\[", "[").replace("\\]", "]")
-        };
-        out.push_str(&format!("[image: {}]", label.trim()));
+        out.push_str(&format!("[image: {}]", image_label(alt, url)));
         rest = &rest[start + len..];
     }
     out.push_str(rest);
@@ -1040,6 +1063,23 @@ mod tests {
         assert_eq!(m.query(), "nothing matches");
         assert_eq!(m.visible().count(), 0);
         assert!(m.entry("a").is_some());
+    }
+
+    #[test]
+    fn a_line_of_only_images_is_read_as_figures() {
+        assert_eq!(
+            image_line("  ![Board after](assets/e/b.png)\n"),
+            Some(vec![("Board after".into(), "assets/e/b.png".into())])
+        );
+        assert_eq!(
+            image_line("![a \\[1\\]](<a b.png> \"t\") ![](c.png)"),
+            Some(vec![("a [1]".into(), "a b.png".into()), (String::new(), "c.png".into())])
+        );
+        // Text beside an image, a broken image, and nothing at all aren't.
+        assert_eq!(image_line("See ![a](a.png)"), None);
+        assert_eq!(image_line("![a](a.png) here"), None);
+        assert_eq!(image_line("![not an image"), None);
+        assert_eq!(image_line("   "), None);
     }
 
     #[test]

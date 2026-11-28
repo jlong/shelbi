@@ -187,6 +187,10 @@ pub(crate) struct DocsPage {
     /// Where each visible tree row was drawn, for clicks: `(y, row index)`.
     row_hits: Vec<(u16, usize)>,
     back_hit: Option<Rect>,
+    /// The terminal's kitty graphics, when it draws images.
+    graphics: Option<crate::kitty::Graphics>,
+    /// Where the last frame drew the document's pictures.
+    placements: Vec<crate::kitty::Placement>,
 }
 
 impl DocsPage {
@@ -218,7 +222,28 @@ impl DocsPage {
             in_flight: 0,
             row_hits: Vec::new(),
             back_hit: None,
+            graphics: None,
+            placements: Vec::new(),
         }
+    }
+
+    /// Draw the document's images (with the terminal's `graphics`) or show
+    /// their source (`None`).
+    pub(crate) fn set_graphics(&mut self, graphics: Option<crate::kitty::Graphics>) {
+        self.graphics = graphics;
+    }
+
+    /// Where the last frame drew pictures.
+    pub(crate) fn take_placements(&mut self) -> Vec<crate::kitty::Placement> {
+        std::mem::take(&mut self.placements)
+    }
+
+    /// The folder the open document's relative images resolve against: its
+    /// own folder in the docs' root, when the root is on this machine.
+    fn image_dir(&self, path: &str) -> Option<std::path::PathBuf> {
+        let root = self.status.as_ref().filter(|s| s.set_up && !s.root.is_empty())?;
+        let file = std::path::Path::new(&root.root).join(path);
+        file.parent().map(std::path::Path::to_path_buf)
     }
 
     pub(crate) fn project(&self) -> &str {
@@ -987,6 +1012,7 @@ impl DocsPage {
 
     /// Draw the open document into the main area.
     pub(crate) fn render_doc(&mut self, buf: &mut Buffer, area: Rect) {
+        self.placements.clear();
         if area.width < 4 || area.height < 3 {
             return;
         }
@@ -998,6 +1024,8 @@ impl DocsPage {
         let x = area.x + 2;
         let w = area.width.saturating_sub(4) as usize;
         let held = self.doc_path().is_some_and(|path| self.is_held(path));
+        let image_dir = self.doc_path().and_then(|path| self.image_dir(path));
+        let graphics = self.graphics;
         let Some(doc) = self.doc.as_mut() else {
             let text = if self.status.as_ref().is_some_and(|s| !s.set_up) {
                 "No docs yet: press i in the tree to set them up."
@@ -1033,15 +1061,22 @@ impl DocsPage {
         let top = top + 1;
         let height = area.bottom().saturating_sub(top) as usize;
         self.doc_height = height;
-        let lines = match (&doc.content, &doc.error) {
-            (_, Some(e)) => vec![Line::from(Span::styled(e.clone(), Style::default().fg(p.ansi_red)))],
-            (None, None) => vec![Line::from(Span::styled("Loading…", Style::default().fg(p.ansi_dark_gray)))],
-            (Some(text), None) => crate::markdown::render_document(text, w),
+        let resolve = |url: &str| shelbi_app::changelog::resolve_image(image_dir.as_deref(), url);
+        let figures = graphics.map(|gfx| crate::kitty::Figures { gfx, resolve: &resolve });
+        let (lines, figs) = match (&doc.content, &doc.error) {
+            (_, Some(e)) => (vec![Line::from(Span::styled(e.clone(), Style::default().fg(p.ansi_red)))], Vec::new()),
+            (None, None) => (vec![Line::from(Span::styled("Loading…", Style::default().fg(p.ansi_dark_gray)))], Vec::new()),
+            (Some(text), None) => crate::markdown::render_document_figures(text, w, figures.as_ref()),
         };
         doc.scroll = doc.scroll.min(lines.len().saturating_sub(height));
         for (i, line) in lines.iter().skip(doc.scroll).take(height).enumerate() {
             buf.set_line(x, top + i as u16, line, w as u16);
         }
+        let vp = Rect::new(x, top, w as u16, height as u16);
+        self.placements = figs
+            .iter()
+            .filter_map(|fig| crate::kitty::place(buf, fig, 0, doc.scroll, vp, x))
+            .collect();
         // A scroll position at the right when there's more than fits.
         if lines.len() > height && height > 0 {
             let pct = (doc.scroll * 100) / lines.len().saturating_sub(height).max(1);

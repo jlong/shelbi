@@ -14,6 +14,7 @@ mod error_report;
 mod handlers;
 mod jobs;
 mod kanban;
+mod kitty;
 mod licenses;
 mod linear_rows;
 mod list_screen;

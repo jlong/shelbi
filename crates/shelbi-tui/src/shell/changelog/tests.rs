@@ -533,6 +533,72 @@ fn images_are_placeholders_and_files_are_listed_and_open() {
     assert!(matches!(step, Step::OpenFile(_)), "{step:?}");
 }
 
+/// [`with_files`] stored under `dir`, its image a real 400×100 PNG there.
+fn with_a_picture(dir: &std::path::Path) -> ChangelogEntryView {
+    let mut e = with_files();
+    let assets = dir.join("assets").join(&e.id);
+    std::fs::create_dir_all(&assets).unwrap();
+    image::RgbaImage::from_pixel(400, 100, image::Rgba([10, 200, 90, 255]))
+        .save(assets.join("jobs.png"))
+        .unwrap();
+    e.dir = Some(dir.to_path_buf());
+    e
+}
+
+#[test]
+fn a_kitty_terminal_draws_the_picture_under_its_caption() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut page = page_with(vec![with_a_picture(dir.path())]);
+    page.set_graphics(Some(crate::kitty::Graphics { cell: (10, 20) }));
+    let buf = render(&mut page, 100, 40);
+    let text = rows(&buf).join("\n");
+    assert!(!text.contains("[image:"), "the picture, not its placeholder\n{text}");
+    // 400×100 px in 10×20 cells: 40 columns, 5 rows, then the caption.
+    let placements = page.take_placements();
+    assert_eq!(placements.len(), 1, "{placements:?}");
+    let p = &placements[0];
+    assert_eq!((p.cols, p.rows, p.skip, p.shown), (40, 5, 0, 5));
+    assert!(p.path.ends_with("jobs.png"));
+    let (cx, cy) = find(&buf, "Jobs sheet after the change").unwrap();
+    assert_eq!((cx, cy), (p.x, p.y + 5), "the caption sits right under the picture");
+    let (_, prose) = find(&buf, "Opening a job floats a pane.").unwrap();
+    assert!(prose < p.y, "{text}");
+
+    // Scrolled so the picture's top rows pass under the header: it's cut
+    // (its rows start at document line 5: bleed, title, rule, prose, blank).
+    page.scroll = 7;
+    render(&mut page, 100, 12);
+    assert_eq!(page.scroll, 7);
+    let p = page.take_placements().pop().expect("still partly shown");
+    assert_eq!((p.skip, p.shown), (2, 3), "{p:?}");
+
+    // Back to placeholders (a terminal without graphics): the old text.
+    page.set_graphics(None);
+    page.scroll = 0;
+    let text = rows(&render(&mut page, 100, 40)).join("\n");
+    assert!(text.contains("[image: Jobs sheet after the change]"), "{text}");
+    assert!(page.take_placements().is_empty());
+}
+
+#[test]
+fn a_kitty_terminal_keeps_placeholders_for_images_it_cant_draw() {
+    // The file isn't there.
+    let mut page = page_with(vec![with_files()]);
+    page.set_graphics(Some(crate::kitty::Graphics { cell: (10, 20) }));
+    let text = rows(&render(&mut page, 100, 30)).join("\n");
+    assert!(text.contains("[image: Jobs sheet after the change]"), "{text}");
+    assert!(page.take_placements().is_empty());
+    // A remote window's entry.
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = with_a_picture(dir.path());
+    e.dir = None;
+    let mut page = page_with(vec![e]);
+    page.set_graphics(Some(crate::kitty::Graphics { cell: (10, 20) }));
+    let text = rows(&render(&mut page, 100, 30)).join("\n");
+    assert!(text.contains("[image: Jobs sheet after the change]"), "{text}");
+    assert!(page.take_placements().is_empty());
+}
+
 #[test]
 fn a_remote_windows_files_are_listed_but_not_openable() {
     let mut e = with_files();

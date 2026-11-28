@@ -582,12 +582,23 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     // first frame without touching disk on the UI thread.
     state.spawn_skeleton_prefetch();
 
-    // Now probe the kitty keyboard protocol with a short timeout (the terminal
-    // is in raw mode and nothing else is draining stdin yet). A headless PTY
-    // that never answers falls back to `kitty: false` within the budget rather
-    // than blocking; the result arms the one-time keyboard notice.
-    let kitty = caps::probe_keyboard_enhancement(caps::KITTY_PROBE_TIMEOUT);
-    state.set_caps(Caps { kitty, ..caps });
+    // Now probe the kitty keyboard and graphics protocols with a short timeout
+    // (the terminal is in raw mode and nothing else is draining stdin yet). A
+    // headless PTY that never answers falls back to `kitty: false` and image
+    // placeholders within the budget rather than blocking; the keyboard result
+    // arms the one-time keyboard notice. Graphics aren't asked about inside
+    // tmux or Screen (placeholders there; see `caps`).
+    let ask_graphics = caps::graphics_wanted(
+        caps.nested,
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    );
+    let probe = caps::probe_terminal(caps::KITTY_PROBE_TIMEOUT, ask_graphics);
+    state.set_caps(Caps { kitty: probe.keyboard, ..caps });
+    if probe.graphics {
+        state.images.enable(crate::kitty::Graphics::query());
+        state.dirty = true;
+    }
 
     loop {
         if state.should_quit {
@@ -690,6 +701,15 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         }
         if state.poll_docs() {
             state.dirty = true;
+        }
+        // An image finished decoding: draw it. One that couldn't be decoded
+        // falls back to its placeholder, so the Changelog lays out again.
+        let (landed, failed) = state.images.poll();
+        if landed {
+            state.dirty = true;
+        }
+        if failed {
+            state.changelog.relayout_images();
         }
         // A Documentation `e`: hand the terminal to $EDITOR on the document's copy, and
         // save it through the hub when the editor exits.
@@ -1683,6 +1703,12 @@ struct ShellState {
     /// resize, focus regained. Recovers the screen from anything written over
     /// it outside ratatui.
     full_redraw: bool,
+    /// The Changelog's and the Documentation's images, where the terminal
+    /// draws kitty graphics: what's decoded, sent, and on screen.
+    images: crate::kitty::Images,
+    /// The image escapes the last frame produced, written after ratatui's
+    /// flush inside the same synchronized update ([`draw`]).
+    kitty_out: Vec<u8>,
     /// A pending off-UI-thread job; its `Some` is the status to show when it
     /// finishes (`None`: show nothing). Blocking commands (e.g. the Zen toggle)
     /// run here so they never freeze the one event loop.
@@ -2010,6 +2036,8 @@ impl ShellState {
             toast_tx,
             toast_rx,
             full_redraw: false,
+            images: crate::kitty::Images::new(),
+            kitty_out: Vec::new(),
             job: None,
             pending_editor: None,
             docs: None,
@@ -2903,6 +2931,11 @@ impl ShellState {
         if repaint {
             self.full_redraw = true;
             self.dirty = true;
+        }
+        // A resize can come with a font-size change: images size from the
+        // cell's pixels.
+        if matches!(ev, Event::Resize(_, _)) {
+            self.images.refresh_cell_size();
         }
         // The pointer, wherever input goes next (an overlay included), so the
         // footer's hover is right the moment the sidebar shows again.
@@ -6865,6 +6898,14 @@ fn draw(
     // it half-painted.
     let begin = execute!(io::stdout(), BeginSynchronizedUpdate);
     let res = draw_frame(term, state);
+    // The images go up (and old ones come down) after ratatui's cells, in the
+    // same update, so a moved picture never shows in two places.
+    let images = std::mem::take(&mut state.kitty_out);
+    if !images.is_empty() {
+        let mut out = io::stdout();
+        let _ = out.write_all(&images);
+        let _ = out.flush();
+    }
     if begin.is_ok() {
         let _ = execute!(io::stdout(), EndSynchronizedUpdate);
     }
@@ -6887,6 +6928,8 @@ where
     // wiped, not just the cells ratatui thinks changed).
     if std::mem::take(&mut state.full_redraw) {
         term.clear()?;
+        // The clear may have taken the pictures with it: put them up again.
+        state.images.forget_placements();
     }
     // Compute layout up front so we can report the main-area size to the live
     // session before painting.
@@ -7024,6 +7067,14 @@ where
     let docs = &mut state.docs;
     let onboarding = &mut state.onboarding;
     let sessions = &state.sessions;
+    // Images draw inline where the terminal speaks kitty graphics; the pages
+    // hand back where their pictures went.
+    let graphics = state.images.graphics();
+    changelog.set_graphics(graphics);
+    if let Some(page) = docs.as_mut() {
+        page.set_graphics(graphics);
+    }
+    let mut placements: Vec<crate::kitty::Placement> = Vec::new();
 
     let mut cursor: Option<(u16, u16)> = None;
     let res = term.draw(|frame| {
@@ -7117,6 +7168,7 @@ where
                 },
                 MainView::Native(View::Changelog) => {
                     let cur = changelog.render(buf, main_rect);
+                    placements = changelog.take_placements();
                     if focus_main {
                         cursor = cur;
                     }
@@ -7124,6 +7176,7 @@ where
                 MainView::Native(View::Docs) => {
                     if let Some(page) = docs.as_mut() {
                         page.render_doc(buf, main_rect);
+                        placements = page.take_placements();
                     }
                 }
                 MainView::Native(_) => {} // drawn above
@@ -7241,6 +7294,11 @@ where
         } else if let Some((x, y)) = cursor {
             frame.set_cursor_position(Position::new(x, y));
         }
+
+        // Whatever was drawn over a picture's rows (the status band, a toast,
+        // an overlay's dimmed backdrop) stays on top: the picture keeps only
+        // the rows left clear.
+        placements = crate::kitty::clip_to_intact(frame.buffer_mut(), std::mem::take(&mut placements));
     });
     state.overlay = overlay;
     state.overlay_buttons = overlay_buttons;
@@ -7249,6 +7307,8 @@ where
     state.workspace = workspace;
     state.acknowledgements = acknowledgements;
     res.context("drawing the shell")?;
+    let out = state.images.frame(&placements);
+    state.kitty_out.extend(out);
     Ok(())
 }
 
@@ -7679,6 +7739,8 @@ fn native_clipboard(_text: &str) {
 /// an explicit call.
 fn restore_terminal() {
     let mut out = io::stdout();
+    // No picture stays over whatever has the terminal next.
+    crate::kitty::wipe(&mut out);
     let _ = execute!(
         out,
         PopKeyboardEnhancementFlags,

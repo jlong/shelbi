@@ -10,7 +10,8 @@
 //! the title in bold with the date at the right, a rule, the
 //! description through the TUI's markdown renderer
 //! ([`crate::markdown::render_note`], each image as an `[image: alt]`
-//! placeholder), the entry's files under an "Attachments" label (`⎘` a file,
+//! placeholder, or, where the terminal speaks the kitty graphics protocol,
+//! the picture itself under its caption: [`crate::kitty`]), the entry's files under an "Attachments" label (`⎘` a file,
 //! its name and size, opened with the system opener), and the entry's links
 //! as a row of chips (`⧉` an issue, opened in Shelbi; `↗` a PR or URL, opened
 //! in the browser). Over them, the title row: "Changelog", the match count, and
@@ -48,6 +49,7 @@ use shelbi_app::changelog::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use crate::kitty::{Figure, Figures, Graphics, Placement};
 use crate::panel::{padded_label, truncate_right};
 use crate::sidebar::{BLEED_ABOVE, BLEED_BELOW};
 use crate::theme::palette;
@@ -182,6 +184,8 @@ struct EntryRows {
     top: usize,
     /// The description, wrapped to the measure; empty when folded.
     body: Vec<Line<'static>>,
+    /// The description's images drawn as pictures, by their line in `body`.
+    figures: Vec<Figure>,
     /// The "Attachments" label's document line, when the entry lists files.
     attachments: Option<usize>,
     /// Each chip row's document line and its chips.
@@ -223,6 +227,7 @@ impl Doc {
         has_more: bool,
         width: u16,
         generation: u64,
+        graphics: Option<Graphics>,
     ) -> Doc {
         // The releases' error, and a blank under it.
         let mut y = if releases_error.is_some() { 2 } else { 0 };
@@ -246,11 +251,12 @@ impl Doc {
             let top = y;
             let folded = collapsed.contains(&e.id);
             let mut body = Vec::new();
+            let mut figures = Vec::new();
             let mut chips = Vec::new();
             let mut attachments = None;
             y = top + 3;
             if !folded {
-                body = description_lines(&e.description, width as usize);
+                (body, figures) = description_lines(e, width as usize, graphics);
                 y += body.len();
                 // The files, one chip a row under their label.
                 let files: Vec<(usize, &ChangelogAttachment)> = e
@@ -289,6 +295,7 @@ impl Doc {
                 releases,
                 top,
                 body,
+                figures,
                 attachments,
                 chips,
                 end: y,
@@ -322,14 +329,17 @@ impl Doc {
 
 /// An entry's description as lines for the measure: the markdown
 /// renderer's, blank lines at either end dropped, unstyled text in the
-/// body color.
-fn description_lines(description: &str, width: usize) -> Vec<Line<'static>> {
-    let trimmed = description.trim_matches('\n').trim_end();
+/// body color. With `graphics`, its drawable images are figures (the
+/// pictures' rows, and where they go); else placeholders.
+fn description_lines(entry: &ChangelogEntryView, width: usize, graphics: Option<Graphics>) -> (Vec<Line<'static>>, Vec<Figure>) {
+    let trimmed = entry.description.trim_matches('\n').trim_end();
     if trimmed.trim().is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let text = shelbi_app::changelog::image_placeholders(trimmed);
-    crate::markdown::render_note(&text, width)
+    let resolve = |url: &str| entry.image_source(url);
+    let figures = graphics.map(|gfx| Figures { gfx, resolve: &resolve });
+    let (lines, figures) = crate::markdown::render_note_figures(trimmed, width, figures.as_ref());
+    let lines = lines
         .into_iter()
         .map(|mut line| {
             for span in &mut line.spans {
@@ -339,7 +349,8 @@ fn description_lines(description: &str, width: usize) -> Vec<Line<'static>> {
             }
             line
         })
-        .collect()
+        .collect();
+    (lines, figures)
 }
 
 /// An attachment's chip, on a row of its own: its name and size, the name
@@ -470,6 +481,10 @@ pub struct ChangelogPage {
     /// An entry to bring into view (the palette's Changelog result) once
     /// it's read and the page has been laid out.
     reveal: Option<String>,
+    /// The terminal's kitty graphics, when it draws images.
+    graphics: Option<Graphics>,
+    /// Where the last frame drew pictures, for the shell to put them up.
+    placements: Vec<Placement>,
 }
 
 impl Default for ChangelogPage {
@@ -492,7 +507,29 @@ impl ChangelogPage {
             doc: Doc::default(),
             last_area: Rect::default(),
             reveal: None,
+            graphics: None,
+            placements: Vec::new(),
         }
+    }
+
+    /// Draw images (with the terminal's `graphics`) or their placeholders
+    /// (`None`). Lays out again when it changes.
+    pub fn set_graphics(&mut self, graphics: Option<Graphics>) {
+        if self.graphics != graphics {
+            self.graphics = graphics;
+            self.generation += 1;
+        }
+    }
+
+    /// Lay out again: an image couldn't be decoded, so it falls back to
+    /// its placeholder.
+    pub fn relayout_images(&mut self) {
+        self.generation += 1;
+    }
+
+    /// Where the last frame drew pictures.
+    pub fn take_placements(&mut self) -> Vec<Placement> {
+        std::mem::take(&mut self.placements)
     }
 
     #[cfg(test)]
@@ -653,6 +690,7 @@ impl ChangelogPage {
             self.model.has_more(),
             width,
             self.generation,
+            self.graphics,
         );
     }
 
@@ -999,6 +1037,7 @@ impl ChangelogPage {
     /// goes: the search's caret while it has the keys.
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
         self.last_area = area;
+        self.placements.clear();
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
                 buf[(x, y)].reset();
@@ -1029,7 +1068,7 @@ impl ChangelogPage {
             render_notice(buf, vp, &notice);
             return cursor;
         }
-        self.render_doc(buf, vp);
+        self.placements = self.render_doc(buf, vp);
         cursor
     }
 
@@ -1126,7 +1165,9 @@ impl ChangelogPage {
         Some(caret).filter(|(x, _)| self.searching && *x < rect.right())
     }
 
-    fn render_doc(&self, buf: &mut Buffer, vp: Rect) {
+    /// The entries in the viewport; returns where their pictures go.
+    fn render_doc(&self, buf: &mut Buffer, vp: Rect) -> Vec<Placement> {
+        let mut placements = Vec::new();
         let shown = self.shown();
         let selected = self.selected_ix();
         let top = self.scroll;
@@ -1170,6 +1211,9 @@ impl ChangelogPage {
                     buf.set_line(vp.x, y, line, vp.width);
                 }
             }
+            for fig in &rows.figures {
+                placements.extend(crate::kitty::place(buf, fig, rows.body_top(), top, vp, vp.x));
+            }
             if let Some(y) = rows.attachments.and_then(screen) {
                 let style = Style::default().fg(palette().muted).add_modifier(Modifier::BOLD);
                 buf.set_stringn(vp.x, y, ATTACHMENTS, vp.width as usize, style);
@@ -1184,6 +1228,7 @@ impl ChangelogPage {
             let style = Style::default().fg(palette().muted);
             buf.set_stringn(vp.x, y, "Loading older entries…", vp.width as usize, style);
         }
+        placements
     }
 
     /// The timeline down the reading column's left: the rule the length of
