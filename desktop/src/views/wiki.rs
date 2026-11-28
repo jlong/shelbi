@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! ┌────────────────────────┬──────────────────────────────────────────────┐
-//! │ ‹  Wiki        ＋ 🗀 ⋮ ◧ │  Plans › OpenCode integration                │
+//! │ ‹  Wiki          ＋ 🗀 ◧ │  Plans › OpenCode integration                │
 //! │ 🔍 Filter               │ ──────────────────────────────────────────── │
 //! │ ▾ 🗀 Plans              │  # OpenCode integration                      │
 //! │ │   📄 Awareness v2     │                                              │
@@ -111,8 +111,6 @@ pub enum WikiEvent {
     Back,
     /// The header's Toggle sidebar.
     Collapse,
-    /// The header's Search.
-    OpenSearch,
     /// The open folders or the open document changed: worth remembering.
     Remember,
 }
@@ -1382,7 +1380,7 @@ impl WikiView {
             .into_any_element()
     }
 
-    fn render_header(&self, palette_chord: SharedString, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let back = task_panel::back_button("wiki-back", false, theme)
             .tooltip(style::tooltip("Back (Esc)"))
             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(WikiEvent::Back)));
@@ -1401,15 +1399,6 @@ impl WikiView {
         let new_folder = sidebar::toolbar_button("wiki-new-folder", heroicon(icons::FOLDER_PLUS), theme)
             .tooltip(style::tooltip(format!("New Folder ({})", MenuAction::NewFolder.hint())))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.create(NodeKind::Folder, window, cx)));
-        let anchor = self.menu_anchor.clone();
-        let more = sidebar::toolbar_button("wiki-more", heroicon(icons::ELLIPSIS_VERTICAL), theme)
-            .tooltip(style::tooltip("More"))
-            .child(style::anchor_probe(&Default::default()))
-            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-                let at = e.position();
-                let _ = &anchor;
-                this.open_menu(None, at, window, cx);
-            }));
         let lead = div()
             .flex()
             .flex_row()
@@ -1419,13 +1408,11 @@ impl WikiView {
             .gap(px(12.0))
             .child(back)
             .child(title)
-            .when(set_up, |d| d.child(div().flex().flex_row().gap(px(2.0)).child(new_doc).child(new_folder).child(more)));
+            .when(set_up, |d| d.child(div().flex().flex_row().gap(px(2.0)).child(new_doc).child(new_folder)));
         sidebar::header_row(
             lead,
             sidebar::HEADER_PAD_LEFT,
-            Some(sidebar::search_button("wiki-search", &palette_chord, theme).on_click(
-                cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(WikiEvent::OpenSearch)),
-            )),
+            None,
             sidebar::toggle_button("wiki-toggle", Some(true), theme)
                 .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(WikiEvent::Collapse))),
         )
@@ -1840,8 +1827,7 @@ impl Render for WikiView {
     /// The leading column's Wiki sidebar.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        let palette = sidebar::PaletteChord::of(cx);
-        let header = self.render_header(palette, &theme, cx);
+        let header = self.render_header(&theme, cx);
         let set_up = matches!(&self.status, Some(Ok(s)) if s.set_up);
         let rows = self.tree.rows();
         let body: AnyElement = if !set_up {
@@ -2435,6 +2421,20 @@ pub(crate) mod tests {
         assert!(t.drawn("wiki-menu-new-document"));
         assert!(!t.drawn("wiki-menu-delete"));
         t.keys("escape");
+        assert!(t.read(|v| v.menu().is_none()));
+    }
+
+    #[gpui::test]
+    fn the_header_has_back_new_document_new_folder_and_the_toggle_only(cx: &mut TestAppContext) {
+        let mut t = T::open(cx, FakeHub::sample());
+        for shown in ["wiki-back", "wiki-title", "wiki-new-document", "wiki-new-folder", "wiki-toggle"] {
+            assert!(t.drawn(shown), "{shown}");
+        }
+        assert!(!t.drawn("wiki-more"));
+        assert!(!t.drawn("wiki-search"));
+        t.asked();
+        t.click("wiki-new-document");
+        assert!(t.asked().iter().any(|r| matches!(r, WikiRequest::New { .. })), "New Document makes one");
         assert!(t.read(|v| v.menu().is_none()));
     }
 

@@ -5214,7 +5214,6 @@ impl ShelbiWindow {
         let sub = cx.subscribe_in(&wiki, window, |this, _, ev: &WikiEvent, window, cx| match ev {
             WikiEvent::Back => this.leave_wiki(window, cx),
             WikiEvent::Collapse => this.toggle_sidebar(cx),
-            WikiEvent::OpenSearch => this.open_palette(window, cx),
             WikiEvent::Remember => this.remember_view_state(cx),
         });
         self._view_subscriptions.push(sub);
