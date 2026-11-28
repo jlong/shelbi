@@ -22,10 +22,18 @@
 //! the keys and the selection is in the block
 //! (`shelbi_app::markdown_edit::code`). Moving the caret in (an arrow, a
 //! click on a code line) shows them to be edited; moving out hides them.
+//!
+//! A GFM table reads as a grid the same way: its cells' Markdown formatted,
+//! its columns aligned and sized to their content, long cells wrapping in
+//! their column and a table too wide for the editor scrolling sideways in its
+//! own box (`shelbi_app::markdown_edit::table`). Clicking a cell (or moving
+//! the caret in) shows the table's source lines to be edited, the caret in
+//! that cell's text; moving out draws the grid again.
 
 mod element;
 pub mod layout;
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -108,6 +116,9 @@ pub struct DocEditor {
     /// [`Type::Base`]'s (scaled): Documentation's 1.4
     /// ([`Self::set_body_line_height`]).
     body_line_height: Option<f32>,
+    /// Each table's sideways scroll, by its block (a grid wider than the
+    /// editor).
+    table_scroll: HashMap<usize, Pixels>,
     _subs: Vec<Subscription>,
     _blink: Task<()>,
 }
@@ -191,6 +202,7 @@ impl DocEditor {
             code_spans: None,
             scale: 1.0,
             body_line_height: None,
+            table_scroll: HashMap::new(),
             _subs: subs,
             _blink: blink,
         }
@@ -234,13 +246,18 @@ impl DocEditor {
         self.scale
     }
 
-    /// How the doc's code shows: the rows left out (each fenced block's
-    /// fences, unless the editor has the keys, `focused`, and the selection
-    /// is in the block) and each row's syntax spans (read again only when the
-    /// text changes, and then only the blocks that changed).
-    fn code_view(&mut self, focused: bool) -> (Rc<Vec<bool>>, Rc<Vec<Vec<SyntaxSpan>>>) {
+    /// How the doc's code and tables show: the rows left out (each fenced
+    /// block's fences, unless the editor has the keys, `focused`, and the
+    /// selection is in the block; a grid's delimiter line), each row's syntax
+    /// spans (read again only when the text changes, and then only the blocks
+    /// that changed), and the rows drawn as a table's grid (every table's,
+    /// but the one the selection is in while the editor has the keys).
+    #[allow(clippy::type_complexity)]
+    fn code_view(&mut self, focused: bool) -> (Rc<Vec<bool>>, Rc<Vec<Vec<SyntaxSpan>>>, Rc<Vec<bool>>) {
         let doc = self.model.doc();
-        let hidden = Rc::new(doc.hidden_rows(focused.then(|| self.model.selection())));
+        let selection = focused.then(|| self.model.selection());
+        let hidden = Rc::new(doc.hidden_rows(selection.clone()));
+        let grid = Rc::new(if self.model.is_plain() { Vec::new() } else { doc.grid_rows(selection) });
         let rev = self.model.revision();
         let spans = match &self.code_spans {
             Some((at, spans)) if *at == rev => spans.clone(),
@@ -254,7 +271,18 @@ impl DocEditor {
                 spans
             }
         };
-        (hidden, spans)
+        (hidden, spans, grid)
+    }
+
+    /// Scroll table `block` sideways by `dx` (a scroll's delta), within
+    /// `0..=max`.
+    fn scroll_table(&mut self, block: usize, dx: Pixels, max: Pixels, cx: &mut Context<Self>) {
+        let at = self.table_scroll.entry(block).or_insert(px(0.0));
+        let to = (*at - dx).max(px(0.0)).min(max);
+        if to != *at {
+            *at = to;
+            cx.notify();
+        }
     }
 
     pub fn is_focused(&self) -> bool {
@@ -550,11 +578,8 @@ impl DocEditor {
         let target = at + lines;
         let to = if target < 0 {
             None
-        } else if let Some(t) = visuals.get(target as usize) {
-            let r = &doc.rows[t.row];
-            Some(r.source_of(p.layout.offset_at_x(t, x, &r.display)))
         } else {
-            None
+            visuals.get(target as usize).map(|t| p.layout.source_at(doc, t, point(x, t.top)))
         };
         let goal = Some(x);
         self.edit(cx, |e| match to {
@@ -977,6 +1002,61 @@ impl DocEditor {
         };
         let spans = self.code_spans.as_ref().and_then(|(_, s)| s.get(i).cloned()).unwrap_or_default();
         layout::run_colors(&doc.rows[i], self.field, &spans, &self.theme(cx))
+    }
+
+    /// Each table row painted as a grid: its cells' text.
+    pub fn grid_cells(&self) -> Vec<Vec<String>> {
+        let Some(p) = self.painted.as_ref() else {
+            return Vec::new();
+        };
+        self.model
+            .doc()
+            .rows
+            .iter()
+            .zip(&p.layout.rows)
+            .filter(|(_, l)| !l.cells.is_empty())
+            .filter_map(|(r, _)| r.table())
+            .map(|t| t.cells.iter().map(|c| c.display.clone()).collect())
+            .collect()
+    }
+
+    /// Each table painted as a grid: its box (window coordinates), its
+    /// grid's full width, and how far it's scrolled.
+    pub fn table_boxes(&self) -> Vec<(Bounds<Pixels>, Pixels, Pixels)> {
+        let Some(p) = self.painted.as_ref() else {
+            return Vec::new();
+        };
+        p.layout
+            .tables
+            .iter()
+            .map(|t| {
+                let b = Bounds {
+                    origin: p.bounds.origin + t.bounds.origin,
+                    size: t.bounds.size,
+                };
+                (b, t.grid.size.width, -t.grid.origin.x)
+            })
+            .collect()
+    }
+
+    /// Grid row `row`'s cell `col`: its box (window coordinates), and how
+    /// many visual lines its text takes.
+    pub fn cell_box(&self, row: usize, col: usize) -> Option<(Bounds<Pixels>, usize)> {
+        let p = self.painted.as_ref()?;
+        let c = p.layout.rows.get(row)?.cells.get(col)?;
+        let lines = c.lines.iter().map(|(_, l)| l.wrap_boundaries().len() + 1).sum();
+        Some((
+            Bounds {
+                origin: p.bounds.origin + c.cell.origin,
+                size: c.cell.size,
+            },
+            lines,
+        ))
+    }
+
+    /// The editor's box, in window coordinates.
+    pub fn painted_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.painted.as_ref().map(|p| p.bounds)
     }
 
     /// The height painted.

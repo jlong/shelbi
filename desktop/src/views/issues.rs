@@ -4334,6 +4334,170 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_table_reads_as_a_grid_and_shows_its_source_only_to_edit(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let src = "Intro.\n\n| Element | Shelbi |\n| --- | :---: |\n| **Use case** | Shipping `code` with [agents](https://x.dev) |\n| Tool | Tabs<br>one each |\n\nAfter.";
+        let mut a = issue("A", "todo");
+        a.body = src.into();
+        let (view, mut cx) = open_board_sized(cx, vec![a], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let (_, body) = editors(&view, &mut cx);
+        let grid = |cx: &mut gpui::VisualTestContext| {
+            assert!(drawn(cx, "pane-body-editor"));
+            body.read_with(cx, |b, _| b.grid_cells())
+        };
+        let cells = vec![
+            vec!["Element".to_string(), "Shelbi".into()],
+            vec!["Use case".into(), "Shipping code with agents".into()],
+            vec!["Tool".into(), "Tabs\none each".into()],
+        ];
+        let delimiter = "| --- | :---: |".to_string();
+
+        // Read: a grid (its delimiter line left out), a `<br>` two lines in
+        // its cell, a small table only as wide as its content.
+        assert_eq!(grid(&mut cx), cells);
+        assert!(!body.read_with(&cx, |b, _| b.shown_rows()).contains(&delimiter));
+        let (tool, _) = body.read_with(&cx, |b, _| b.cell_box(4, 0)).expect("the Tool cell");
+        let (_, br_lines) = body.read_with(&cx, |b, _| b.cell_box(4, 1)).unwrap();
+        assert_eq!(br_lines, 2);
+        let editor = body.read_with(&cx, |b, _| b.painted_bounds()).unwrap();
+        let tables = body.read_with(&cx, |b, _| b.table_boxes());
+        assert_eq!(tables.len(), 1);
+        assert!(tables[0].0.size.width < editor.size.width, "{tables:?} in {editor:?}");
+        // The columns line up: a cell's column is its header's.
+        let (head, _) = body.read_with(&cx, |b, _| b.cell_box(1, 1)).unwrap();
+        let (shelbi, _) = body.read_with(&cx, |b, _| b.cell_box(3, 1)).unwrap();
+        assert_eq!(head.origin.x, shelbi.origin.x);
+        assert_eq!(head.size.width, shelbi.size.width);
+
+        // A click in a cell puts the caret in that cell's source, and the
+        // table shows as its lines.
+        cx.simulate_click(tool.center(), gpui::Modifiers::none());
+        assert!(body.read_with(&cx, |b, _| b.is_focused()));
+        let head = body.read_with(&cx, |b, _| b.model.head());
+        let at = src.find("Tool").unwrap();
+        assert!((at..=at + 4).contains(&head), "{head} in {src:?}");
+        assert!(grid(&mut cx).is_empty());
+        assert!(body.read_with(&cx, |b, _| b.shown_rows()).contains(&delimiter));
+
+        // The source is edited as text.
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("x");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), src.replace("one each |", "one each |x"));
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), src);
+
+        // Down and out: the grid again.
+        cx.simulate_keystrokes("down down");
+        assert!(body.read_with(&cx, |b, _| b.model.head()) >= src.find("After").unwrap());
+        assert_eq!(grid(&mut cx), cells);
+        // Without the keys it's always the grid, the source untouched.
+        cx.simulate_keystrokes("up up");
+        cx.simulate_keystrokes("escape");
+        assert!(!body.read_with(&cx, |b, _| b.is_focused()));
+        assert_eq!(grid(&mut cx), cells);
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), src);
+        let draft = view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body));
+        assert!(draft.as_deref().is_none_or(|d| d == src), "{draft:?}");
+    }
+
+    #[gpui::test]
+    fn long_cells_wrap_in_their_column_and_a_wide_table_scrolls_in_its_box(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let long = "Shipping code changes, large and small, with multiple coding agents working concurrently on one board and one repository at a time";
+        let wide_header = (0..14).map(|i| format!("Column{i}")).collect::<Vec<_>>().join(" | ");
+        let wide_rule = vec!["---"; 14].join(" | ");
+        let wide_row = (0..14).map(|i| format!("Supercalifragilistic{i}")).collect::<Vec<_>>().join(" | ");
+        let src = format!("| Element | Shelbi |\n|---|---|\n| Use case | {long} |\n\n{wide_header}\n{wide_rule}\n{wide_row}\n\nAfter.");
+        let mut a = issue("A", "todo");
+        a.body = src.clone();
+        let (view, mut cx) = open_board_sized(cx, vec![a], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let (_, body) = editors(&view, &mut cx);
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        let editor = body.read_with(&cx, |b, _| b.painted_bounds()).unwrap();
+        let tables = body.read_with(&cx, |b, _| b.table_boxes());
+        assert_eq!(tables.len(), 2);
+
+        // The long cell wraps inside its column: the table fills the editor,
+        // no wider.
+        let (cell, lines) = body.read_with(&cx, |b, _| b.cell_box(2, 1)).unwrap();
+        assert!(lines >= 2, "{lines}");
+        assert!(cell.right() <= editor.right() + px(1.0), "{cell:?} in {editor:?}");
+        assert!(tables[0].1 <= editor.size.width + px(0.5), "{tables:?}");
+        let (short, short_lines) = body.read_with(&cx, |b, _| b.cell_box(2, 0)).unwrap();
+        assert_eq!(short_lines, 1);
+        assert!(short.size.width < cell.size.width);
+
+        // The wide one keeps its columns and scrolls in a box the editor's
+        // width.
+        let (wide, grid_w, scroll) = tables[1];
+        assert!(grid_w > editor.size.width, "{grid_w:?}");
+        assert_eq!(wide.size.width, editor.size.width);
+        assert_eq!(scroll, px(0.0));
+        let row = body.read_with(&cx, |b, _| b.model.doc().rows.iter().position(|r| r.display.starts_with("Super"))).unwrap();
+        let (first, _) = body.read_with(&cx, |b, _| b.cell_box(row, 0)).unwrap();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: wide.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-120.0), px(0.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        let (_, _, scrolled) = body.read_with(&cx, |b, _| b.table_boxes())[1];
+        assert_eq!(scrolled, px(120.0));
+        let (moved, _) = body.read_with(&cx, |b, _| b.cell_box(row, 0)).unwrap();
+        assert_eq!(moved.origin.x, first.origin.x - px(120.0));
+        // An up-and-down scroll over it isn't the table's.
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: wide.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-40.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        assert_eq!(body.read_with(&cx, |b, _| b.table_boxes())[1].2, px(120.0));
+        // It never scrolls past its end.
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: wide.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-100_000.0), px(0.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        let (_, grid_w, end) = body.read_with(&cx, |b, _| b.table_boxes())[1];
+        assert_eq!(end, grid_w - editor.size.width);
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), src);
+
+        // A click in a scrolled cell lands in that cell's source.
+        let (cell, _) = body.read_with(&cx, |b, _| b.cell_box(row, 13)).unwrap();
+        cx.simulate_click(gpui::point(cell.left() + px(14.0), cell.center().y), gpui::Modifiers::none());
+        let head = body.read_with(&cx, |b, _| b.model.head());
+        let at = src.find("Supercalifragilistic13").unwrap();
+        assert!((at..=at + "Supercalifragilistic13".len()).contains(&head), "{head}");
+    }
+
+    #[gpui::test]
+    fn a_table_scales_with_the_body_size(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut a = issue("A", "todo");
+        a.body = "| a | b |\n|---|---|\n| one | two |".into();
+        let (view, mut cx) = open_board_sized(cx, vec![a], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let (_, body) = editors(&view, &mut cx);
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        let (small, _) = body.read_with(&cx, |b, _| b.cell_box(2, 0)).unwrap();
+        body.update(&mut cx, |b, cx| b.set_body_size(crate::theme::style::Type::Base.size() * 2.0, cx));
+        assert!(drawn(&mut cx, "pane-body-editor"));
+        let (big, _) = body.read_with(&cx, |b, _| b.cell_box(2, 0)).unwrap();
+        assert!(big.size.height > small.size.height * 1.6, "{small:?} -> {big:?}");
+        assert!(big.size.width > small.size.width, "{small:?} -> {big:?}");
+    }
+
+    #[gpui::test]
     fn a_checkbox_is_clicked_checked_without_editing(cx: &mut gpui::TestAppContext) {
         use crate::views::board_state::tests::issue;
         cx.update(|cx| cx.set_reduce_motion(true));
