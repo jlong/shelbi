@@ -104,13 +104,30 @@ struct Face {
 
 /// `row`'s face at `scale` (the body's size over [`Type::Base`]'s): every
 /// size and line height in proportion, the line heights on whole points.
-fn face(field: Field, row: &Row, theme: &Theme, scale: f32) -> Face {
+/// With `body_line_height`, a body row's line height is instead its size
+/// times that ratio ([`super::DocEditor::set_body_line_height`]).
+fn face(field: Field, row: &Row, theme: &Theme, scale: f32, body_line_height: Option<f32>) -> Face {
     let f = face_at_base(field, row, theme);
+    let size = f.size * scale;
+    let line_height = match body_line_height.filter(|_| is_body(field, row)) {
+        Some(ratio) => size * ratio,
+        None => f.line_height * scale,
+    };
     Face {
-        size: f.size * scale,
-        line_height: (f.line_height * scale).round(),
+        size,
+        line_height: line_height.round(),
         ..f
     }
+}
+
+/// Whether `row` is body text: a paragraph, list item or quote (and the
+/// blank lines and rules between them), not a heading, code or the title.
+fn is_body(field: Field, row: &Row) -> bool {
+    field == Field::Body
+        && matches!(
+            row.kind,
+            RowKind::Empty | RowKind::Paragraph | RowKind::Item(_) | RowKind::Quote | RowKind::Rule
+        )
 }
 
 /// `row`'s face at the UI's base size.
@@ -270,7 +287,7 @@ fn runs(
 #[cfg(test)]
 pub fn run_colors(row: &Row, field: Field, syntax: &[SyntaxSpan], theme: &Theme) -> Vec<Hsla> {
     let mut out: Vec<Hsla> = Vec::new();
-    for run in runs(row, &face(field, row, theme, 1.0), None, syntax, theme) {
+    for run in runs(row, &face(field, row, theme, 1.0, None), None, syntax, theme) {
         if !out.contains(&run.color) {
             out.push(run.color);
         }
@@ -281,7 +298,8 @@ pub fn run_colors(row: &Row, field: Field, syntax: &[SyntaxSpan], theme: &Theme)
 /// Lay `doc` out at `width`. `marked` is the composition, in source
 /// offsets; `code` the rows left out and the code lines' highlights;
 /// `scale` the editor's [`super::DocEditor::scale`], which sets every text
-/// size, line height, gap and inset in proportion (1 for the UI's sizes).
+/// size, line height, gap and inset in proportion (1 for the UI's sizes);
+/// `body_line_height` the editor's body line height over its size, if set.
 #[allow(clippy::too_many_arguments)]
 pub fn layout(
     doc: &Doc,
@@ -290,6 +308,7 @@ pub fn layout(
     marked: Option<std::ops::Range<usize>>,
     code: Code<'_>,
     scale: f32,
+    body_line_height: Option<f32>,
     theme: &Theme,
     window: &mut Window,
     _cx: &mut App,
@@ -310,7 +329,7 @@ pub fn layout(
     let prev_block = |ri: usize| (0..ri).rev().find(|&i| !code.hidden(i)).and_then(|i| doc.rows[i].block);
     let next_block = |ri: usize| (ri + 1..doc.rows.len()).find(|&i| !code.hidden(i)).and_then(|i| doc.rows[i].block);
     for (ri, row) in doc.rows.iter().enumerate() {
-        let f = face(field, row, theme, scale);
+        let f = face(field, row, theme, scale, body_line_height);
         let lh = px(f.line_height);
         if code.hidden(ri) {
             if shown_any {
@@ -672,9 +691,51 @@ mod tests {
     use shelbi_app::diff::highlight::SyntaxClass;
     use shelbi_app::theme::ThemePreference;
 
-    use super::code_color;
+    use shelbi_app::markdown_edit::{Doc, RowKind};
+
+    use super::{code_color, face, Field};
     use crate::theme::diff::contrast;
+    use crate::theme::style::Type;
     use crate::theme::Theme;
+
+    /// The Wiki's body rows (paragraphs, items, quotes) sit on lines 1.4
+    /// times their size at any body size; headings and code keep their
+    /// scaled line heights, and the task body (no ratio) is unchanged.
+    #[test]
+    fn body_rows_take_the_body_line_height_and_the_rest_keep_theirs() {
+        let theme = Theme::resolve_with(ThemePreference::Auto, 50, WindowAppearance::Dark);
+        let doc = Doc::parse("A paragraph.\n\n- an item\n\n> a quote\n\n# Heading\n\n## Sub\n\n```\ncode\n```\n");
+        let kinds = |pick: fn(&RowKind) -> bool| doc.rows.iter().filter(move |r| pick(&r.kind));
+        let body = || kinds(|k| matches!(k, RowKind::Paragraph | RowKind::Item(_) | RowKind::Quote));
+        let other = || kinds(|k| matches!(k, RowKind::Heading(_) | RowKind::Code | RowKind::Fence { .. }));
+        assert_eq!(body().count(), 3);
+        assert_eq!(other().count(), 5);
+        for size in [14.0, 16.0] {
+            let scale = size / Type::Base.size();
+            for row in body() {
+                let wiki = face(Field::Body, row, &theme, scale, Some(1.4));
+                assert_eq!(wiki.size, size);
+                assert_eq!(wiki.line_height, (size * 1.4).round(), "{:?} at {size}", row.kind);
+                let task = face(Field::Body, row, &theme, scale, None);
+                assert_eq!(task.line_height, (Type::Base.line_height() * scale).round(), "{:?}", row.kind);
+            }
+            for row in other() {
+                let wiki = face(Field::Body, row, &theme, scale, Some(1.4));
+                let task = face(Field::Body, row, &theme, scale, None);
+                assert_eq!(wiki.line_height, task.line_height, "{:?} at {size}", row.kind);
+            }
+            // The title keeps its own.
+            let title = Doc::plain("Title");
+            let t = |ratio| face(Field::Title, &title.rows[0], &theme, scale, ratio).line_height;
+            assert_eq!(t(Some(1.4)), t(None));
+        }
+        // 14pt on 20 (19.6 to whole points), 16pt on 22 (22.4).
+        let row = body().next().unwrap();
+        assert_eq!(face(Field::Body, row, &theme, 1.0, Some(1.4)).line_height, 20.0);
+        assert_eq!(face(Field::Body, row, &theme, 16.0 / 14.0, Some(1.4)).line_height, 22.0);
+        // The task body is still 14 on 18.
+        assert_eq!(face(Field::Body, row, &theme, 1.0, None).line_height, 18.0);
+    }
 
     /// A code block's highlights read on its background in light and dark,
     /// at every contrast and window opacity (the editor paints from the

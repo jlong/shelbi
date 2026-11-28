@@ -58,6 +58,10 @@ pub fn body_size(cx: &App) -> f32 {
     TerminalSettings::current(cx).font_size
 }
 
+/// The document's body text's line height over its size (Type::Base's
+/// 14 on 18 reads cramped at length).
+pub const BODY_LINE_HEIGHT: f32 = 1.4;
+
 /// How many commits Show History lists.
 pub const HISTORY_LIMIT: usize = 30;
 /// The document menu's width.
@@ -173,7 +177,10 @@ impl WikiView {
             DocEditor::new(&text, DocField::Body, "Write something…", "Wiki document", Some(scroll.clone()), window, cx)
         });
         let size = body_size(cx);
-        editor.update(cx, |e, cx| e.set_body_size(size, cx));
+        editor.update(cx, |e, cx| {
+            e.set_body_size(size, cx);
+            e.set_body_line_height(BODY_LINE_HEIGHT, cx);
+        });
         let sub = cx.subscribe_in(&editor, window, |this, _, ev: &DocEvent, window, cx| this.doc_event(ev, window, cx));
         self.pane = Some(DocPane {
             sync: DocSync::new(path.clone(), text),
