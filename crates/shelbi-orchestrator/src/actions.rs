@@ -3992,8 +3992,20 @@ mod tests {
         t
     }
 
+    /// `restack()` probes for an open PR with `gh pr list` (and retargets one
+    /// with `gh pr edit`) through the login-shell runner, which resolves `gh`
+    /// from `$SHELL`, `$HOME/.profile` and `PATH`. The merge tests further down
+    /// and sibling modules (`zen`, `poller`, `git`) point those process-wide
+    /// vars at a stub `gh` while holding `crate::test_lock`, so a restack test
+    /// running beside them without the lock picks up the stub (a fake PR
+    /// number) or a `HOME` with no gh setup. Every restack test takes it.
+    fn restack_gh_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_lock::acquire()
+    }
+
     #[test]
     fn restack_rebases_child_onto_new_base_and_force_pushes() {
+        let _g = restack_gh_lock();
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         advance_main_with_parent_squashed(&local);
 
@@ -4066,6 +4078,7 @@ mod tests {
 
     #[test]
     fn restack_is_idempotent_when_already_on_new_base() {
+        let _g = restack_gh_lock();
         // After a successful restack, re-running with the same args must
         // be a clean no-op. The rebase that *would* run replays the same
         // commits onto the same base, but we'd still force-push — which
@@ -4092,6 +4105,7 @@ mod tests {
 
     #[test]
     fn restack_skips_when_workspace_holds_the_child_branch() {
+        let _g = restack_gh_lock();
         // A workspace actively working in the child branch's worktree would
         // diverge from a force-push. Mirror `delete_branch`'s skip-on-hold
         // policy: surface the workspace name so the operator can choose to
@@ -4127,6 +4141,7 @@ mod tests {
 
     #[test]
     fn restack_skips_when_child_has_no_branch() {
+        let _g = restack_gh_lock();
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         let project = project_with_no_workspaces(&local);
 
@@ -4146,6 +4161,7 @@ mod tests {
 
     #[test]
     fn restack_skips_when_child_branch_is_not_on_origin() {
+        let _g = restack_gh_lock();
         // push_branch hasn't fired yet — restack has nothing to rewrite.
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         advance_main_with_parent_squashed(&local);
@@ -4166,6 +4182,7 @@ mod tests {
 
     #[test]
     fn restack_skips_when_child_has_no_commits_past_from_base() {
+        let _g = restack_gh_lock();
         // If child's tip is at parent's tip (workspace's branch was opened
         // but never advanced), the rebase would slide the branch tip up
         // to `onto` — turning an empty stack into "the merged target."
@@ -4194,6 +4211,7 @@ mod tests {
 
     #[test]
     fn restack_skips_when_rebase_produces_conflicts() {
+        let _g = restack_gh_lock();
         // Cook a conflict: have child write to a file that main also
         // changes (after the parent squash). When restack tries to replay
         // child's commit onto main, git refuses with a conflict.
