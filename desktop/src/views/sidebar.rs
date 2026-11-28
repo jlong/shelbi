@@ -625,8 +625,8 @@ fn quiet_glyph(theme: &Theme) -> Hsla {
 pub fn render_glyph(g: StateGlyph) -> AnyElement {
     match g {
         StateGlyph::Drawn(g, color) => glyph(g).text_color(color).into_any_element(),
-        StateGlyph::Question(color) => cutout_disc(glyphs::QUESTION, color, gpui::rgb(0x131418).into()),
-        StateGlyph::Waiting(color) => cutout_disc(glyphs::WAITING, color, gpui::white()),
+        StateGlyph::Question(color) => cutout_disc(glyphs::QUESTION, color),
+        StateGlyph::Waiting(color) => cutout_disc(glyphs::WAITING, color),
         StateGlyph::Text(text, color) => div()
             .flex()
             .flex_none()
@@ -640,9 +640,14 @@ pub fn render_glyph(g: StateGlyph) -> AnyElement {
     }
 }
 
-/// A disc glyph with its mark cut out, over a 10pt disc in `under` so the
-/// mark reads on either theme (the Figma `Status` glyphs' `circle` layer).
-fn cutout_disc(g: crate::assets::Glyph, color: Hsla, under: Hsla) -> AnyElement {
+/// The near-black fill under a cut-out glyph's mark, the same in every theme:
+/// it shows through the Question glyph's `?` and the Waiting glyph's dots.
+const CUTOUT_UNDER: u32 = 0x131418;
+
+/// A disc glyph with its mark cut out, over a 10pt disc in [`CUTOUT_UNDER`]
+/// so the mark reads on either theme (the Figma `Status` glyphs' `circle`
+/// layer).
+fn cutout_disc(g: crate::assets::Glyph, color: Hsla) -> AnyElement {
     div()
         .relative()
         .flex_none()
@@ -654,7 +659,7 @@ fn cutout_disc(g: crate::assets::Glyph, color: Hsla, under: Hsla) -> AnyElement 
                 .left(px(1.0))
                 .size(px(10.0))
                 .rounded_full()
-                .bg(under),
+                .bg(gpui::rgb(CUTOUT_UNDER)),
         )
         .child(glyph(g).absolute().top_0().left_0().text_color(color))
         .into_any_element()
