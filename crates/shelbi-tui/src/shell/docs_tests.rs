@@ -21,6 +21,8 @@ pub(crate) struct FakeDocs {
     pub set_up: bool,
     /// Held documents' sides (`ours` is `docs`' text).
     pub conflicts: BTreeMap<String, DocsConflict>,
+    /// The docs' root folder the status names.
+    pub root: String,
 }
 
 impl FakeDocs {
@@ -39,6 +41,7 @@ impl FakeDocs {
             asked: Vec::new(),
             set_up: true,
             conflicts: BTreeMap::new(),
+            root: "/tmp/docs".into(),
         }
     }
 
@@ -69,7 +72,7 @@ impl FakeDocs {
             auto: true,
             source: "branch".into(),
             branch: "docs/planning".into(),
-            root: "/tmp/docs".into(),
+            root: self.root.clone(),
             last_synced: None,
             pull_request: None,
         }
@@ -663,4 +666,46 @@ fn a_refused_apply_keeps_the_inspector_with_the_reason() {
     page.changed(&["Plans/opencode.md".to_string()]);
     settle(&mut page);
     assert!(page.inspector().unwrap().conflict().ours.as_deref().unwrap().contains("New."));
+}
+
+#[test]
+fn a_kitty_terminal_draws_a_documents_images_relative_to_its_folder() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("Plans/img")).unwrap();
+    image::RgbaImage::from_pixel(200, 60, image::Rgba([0, 0, 0, 255]))
+        .save(root.path().join("Plans/img/board.png"))
+        .unwrap();
+    let mut fake = FakeDocs::sample();
+    fake.root = root.path().display().to_string();
+    fake.docs.insert(
+        "Plans/shots.md".into(),
+        "# Shots\n\nIntro.\n\n![The board](img/board.png)\n\n![Missing one](img/gone.png)\n\nAfter.\n".into(),
+    );
+    let docs = Arc::new(Mutex::new(fake));
+    let mut page = DocsPage::new("proj", ask_of(&docs));
+    page.open();
+    settle(&mut page);
+    page.open_doc("Plans/shots.md");
+    settle(&mut page);
+
+    // Without graphics: the source, as before.
+    let text = drawn(&mut page, 60, 30, true);
+    assert!(text.contains("![The board](img/board.png)"), "{text}");
+    assert!(page.take_placements().is_empty());
+
+    // With them: the picture (200×60 px in 10×20 cells: 20 cols, 3 rows)
+    // under the prose, its caption under it; the missing one keeps its source.
+    page.set_graphics(Some(crate::kitty::Graphics { cell: (10, 20) }));
+    let text = drawn(&mut page, 60, 30, true);
+    assert!(!text.contains("![The board]"), "{text}");
+    assert!(text.contains("The board"), "{text}");
+    assert!(text.contains("![Missing one](img/gone.png)"), "{text}");
+    let placements = page.take_placements();
+    assert_eq!(placements.len(), 1, "{placements:?}");
+    let p = &placements[0];
+    assert_eq!((p.cols, p.rows, p.shown), (20, 3, 3));
+    assert_eq!(p.path, root.path().join("Plans/img/board.png"));
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[p.y as usize - 2].contains("Intro."), "{text}");
+    assert!(lines[p.y as usize + 3].contains("The board"), "{text}");
 }

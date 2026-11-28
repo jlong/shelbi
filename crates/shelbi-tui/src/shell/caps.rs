@@ -15,6 +15,12 @@
 //! - **Emoji** need a UTF-8 locale and a terminal with a pictograph font. The
 //!   Linux virtual console (`TERM=linux`) and a non-UTF-8 locale can't draw
 //!   them, so the sidebar footer's buttons fall back to plain words there.
+//! - **Kitty graphics** (kitty, Ghostty, WezTerm) draw the Changelog's and the
+//!   Documentation's images inline ([`crate::kitty`]). Probed with a graphics
+//!   query in the same round-trip as the keyboard one; no `OK` reply means
+//!   placeholders. Not probed inside tmux or Screen at all: an image placed
+//!   through tmux passthrough lands at the outer terminal's cursor, not the
+//!   pane's, and tmux repaints over it, so nested shells keep placeholders.
 //!
 //! Detection must never block the first frame (`rt-tui-headless-startup-block`).
 //! crossterm's own `supports_keyboard_enhancement` waits up to **2 s** for the
@@ -22,9 +28,9 @@
 //! `tmux`/`screen` capture harnesses) never does — so the shell drew nothing for
 //! seconds. We instead split detection: the env-derived signals (truecolor,
 //! nesting) are read instantly at construction ([`Caps::detect_fast`]), and the
-//! kitty round-trip is probed *after* the first frame with a short timeout
-//! ([`probe_keyboard_enhancement`]), falling back to the safe `kitty: false`
-//! default when no reply arrives.
+//! kitty round-trips (keyboard and graphics) are probed *after* the first
+//! frame with a short timeout ([`probe_terminal`]), falling back to the safe
+//! `false` defaults when no reply arrives.
 
 /// An outer multiplexer the shell is running inside, detected from the
 /// environment. We don't branch behavior on it (the shell is just a full-screen
@@ -64,7 +70,7 @@ pub const KEYBOARD_NOTICE_SCREEN: &str = "⚠ Modified keys like Shift+Enter may
 pub const KEYBOARD_NOTICE_GENERIC: &str = "⚠ Modified keys like Shift+Enter may not reach the \
     agent here (this terminal doesn't support the kitty keyboard protocol)";
 
-/// How long [`probe_keyboard_enhancement`] waits for the terminal to answer the
+/// How long [`probe_terminal`] waits for the terminal to answer the
 /// `CSI ? u` query before falling back to `kitty: false`. Short enough that a
 /// non-answering (headless) terminal never visibly stalls the shell, generous
 /// enough that a real terminal's near-instant reply always lands first.
@@ -75,7 +81,7 @@ impl Caps {
     /// from `COLORTERM`, nesting from `$TMUX` / `$STY`. The kitty round-trip is
     /// *not* probed here (it can block up to 2 s on a terminal that never
     /// answers — see the module docs); it defaults to the safe `false` and is
-    /// filled in later by [`probe_keyboard_enhancement`] after the first frame.
+    /// filled in later by [`probe_terminal`] after the first frame.
     ///
     /// Truecolor over-reporting inside a multiplexer is harmless: the renderer
     /// still quantizes correctly because the outer terminal does, so the worst
@@ -139,65 +145,97 @@ pub(crate) fn truecolor_from_env(colorterm: Option<&str>) -> bool {
     matches!(colorterm, Some("truecolor") | Some("24bit"))
 }
 
-/// Probe whether the terminal speaks the kitty keyboard protocol, waiting at
-/// most `timeout` for a reply. Writes the standard detection query — the
-/// progressive-flags query `CSI ? u` followed by the primary-device-attributes
-/// query `CSI c` — to the controlling terminal, then reads the reply from
-/// stdin. A terminal that supports the protocol answers the flags query (a
-/// `CSI ? … u` reply) *before* the device-attributes reply (`CSI ? … c`); one
-/// that doesn't answers only the device attributes. A terminal that answers
-/// neither within `timeout` (a headless PTY, or an outer tmux/Screen that
-/// swallows the query) yields the safe `false`.
+/// What the post-first-frame probe found the terminal answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Probe {
+    /// The kitty keyboard protocol (a `CSI ? … u` flags reply).
+    pub keyboard: bool,
+    /// The kitty graphics protocol (an `OK` to the graphics query).
+    pub graphics: bool,
+}
+
+/// The id the graphics query asks about (any id: the query stores nothing).
+const GRAPHICS_QUERY_ID: u32 = 31;
+
+/// Whether to ask the terminal about kitty graphics at all: not inside tmux or
+/// Screen (see the module docs), not in Apple's Terminal (it doesn't speak
+/// the protocol), and not on a bare console.
+pub(crate) fn graphics_wanted(nested: Option<Nesting>, term_program: Option<&str>, term: Option<&str>) -> bool {
+    let bare = term.is_some_and(|t| t == "linux" || t == "dumb" || t.starts_with("vt"));
+    nested.is_none() && term_program != Some("Apple_Terminal") && !bare
+}
+
+/// The probe's query: the kitty graphics query (a 1×1 RGB pixel, `a=q`, so
+/// nothing is stored) when `graphics`, then the progressive-flags query
+/// `CSI ? u`, then primary device attributes `CSI c`, which every terminal
+/// answers and so ends the reply.
+pub(crate) fn probe_query(graphics: bool) -> Vec<u8> {
+    let mut q = Vec::new();
+    if graphics {
+        q.extend_from_slice(format!("\x1b_Gi={GRAPHICS_QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\").as_bytes());
+    }
+    q.extend_from_slice(b"\x1b[?u\x1b[c");
+    q
+}
+
+/// Probe what the terminal speaks, waiting at most `timeout` for a reply:
+/// the kitty keyboard protocol, and (when `graphics`, see [`graphics_wanted`])
+/// kitty graphics. Writes [`probe_query`] to the controlling terminal and reads
+/// the reply from stdin ([`parse_probe_reply`]). A terminal that answers
+/// nothing within `timeout` (a headless PTY, or an outer tmux/Screen that
+/// swallows the query) yields the safe defaults.
 ///
 /// **Precondition:** the terminal is already in raw mode and nothing else is
 /// draining stdin — the shell calls this once, after the first frame and before
 /// the event loop begins reading input, so the reply isn't line-buffered and
 /// isn't stolen by a concurrent reader.
 #[cfg(unix)]
-pub(crate) fn probe_keyboard_enhancement(timeout: std::time::Duration) -> bool {
+pub(crate) fn probe_terminal(timeout: std::time::Duration, graphics: bool) -> Probe {
     use std::io::Write;
 
-    // ESC [ ? u   progressive keyboard enhancement flags (kitty protocol)
-    // ESC [ c     primary device attributes
-    const QUERY: &[u8] = b"\x1b[?u\x1b[c";
-
+    let query = probe_query(graphics);
     // Write the query to the controlling terminal; fall back to stdout if
     // `/dev/tty` can't be opened (e.g. no controlling terminal).
     let wrote_tty = std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/tty")
         .ok()
-        .and_then(|mut f| f.write_all(QUERY).and_then(|()| f.flush()).ok())
+        .and_then(|mut f| f.write_all(&query).and_then(|()| f.flush()).ok())
         .is_some();
     if !wrote_tty {
         let mut out = std::io::stdout();
-        if out.write_all(QUERY).and_then(|()| out.flush()).is_err() {
-            return false;
+        if out.write_all(&query).and_then(|()| out.flush()).is_err() {
+            return Probe::default();
         }
     }
 
-    read_kitty_reply(libc::STDIN_FILENO, timeout)
+    read_probe_reply(libc::STDIN_FILENO, timeout)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn probe_keyboard_enhancement(_timeout: std::time::Duration) -> bool {
-    false
+pub(crate) fn probe_terminal(_timeout: std::time::Duration, _graphics: bool) -> Probe {
+    Probe::default()
 }
 
-/// Read bytes from `fd` until the terminal's reply classifies (see
-/// [`classify_kitty_reply`]) or `timeout` elapses. Returns the classification,
-/// or `false` on timeout / read error.
+/// Read bytes from `fd` until the terminal's reply ends (its device
+/// attributes, see [`parse_probe_reply`]) or `timeout` elapses. Returns what
+/// the reply showed by then: on a timeout or a read error, whatever had
+/// arrived (nothing, usually).
 #[cfg(unix)]
-fn read_kitty_reply(fd: std::os::unix::io::RawFd, timeout: std::time::Duration) -> bool {
+fn read_probe_reply(fd: std::os::unix::io::RawFd, timeout: std::time::Duration) -> Probe {
     use std::time::Instant;
 
     let deadline = Instant::now() + timeout;
-    let mut buf: Vec<u8> = Vec::with_capacity(64);
-    let mut chunk = [0u8; 64];
+    let mut buf: Vec<u8> = Vec::with_capacity(128);
+    let mut chunk = [0u8; 128];
     loop {
+        let (probe, done) = parse_probe_reply(&buf);
+        if done {
+            return probe;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return false;
+            return probe;
         }
         let ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
         let mut pfd = libc::pollfd {
@@ -211,13 +249,11 @@ fn read_kitty_reply(fd: std::os::unix::io::RawFd, timeout: std::time::Duration) 
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return false;
+            return probe;
         }
-        if r == 0 {
-            return false; // timed out with no reply
-        }
-        if pfd.revents & libc::POLLIN == 0 {
-            return false; // POLLERR / POLLHUP / POLLNVAL — no reply coming
+        if r == 0 || pfd.revents & libc::POLLIN == 0 {
+            // Timed out, or POLLERR / POLLHUP / POLLNVAL: no more reply coming.
+            return probe;
         }
         // SAFETY: `fd` is readable (POLLIN); `chunk` is a valid writable buffer.
         let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast::<libc::c_void>(), chunk.len()) };
@@ -225,38 +261,67 @@ fn read_kitty_reply(fd: std::os::unix::io::RawFd, timeout: std::time::Duration) 
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return false;
+            return probe;
         }
         if n == 0 {
-            return false; // EOF
+            return probe; // EOF
         }
         buf.extend_from_slice(&chunk[..n as usize]);
-        if let Some(verdict) = classify_kitty_reply(&buf) {
-            return verdict;
-        }
     }
 }
 
-/// Classify the terminal's reply to the `CSI ? u` + `CSI c` detection query.
+/// Read the terminal's reply to [`probe_query`] so far: what it showed, and
+/// whether it's complete.
 ///
-/// A terminal that speaks the kitty keyboard protocol answers the flags query
-/// first, with a `CSI ? … u` sequence; its device-attributes reply (`CSI ? … c`)
-/// follows. A terminal that doesn't answers only the device attributes. Since
-/// the parameter bytes of both replies are only digits and `;`, the final byte
-/// `u` or `c` is unambiguous: whichever appears first decides.
-///
-/// Returns `Some(true)` once a `u` is seen before any `c` (kitty supported),
-/// `Some(false)` once a `c` is seen first (device attributes only), or `None`
-/// when neither terminator has arrived yet (read more).
-pub(crate) fn classify_kitty_reply(buf: &[u8]) -> Option<bool> {
-    let u = buf.iter().position(|&b| b == b'u');
-    let c = buf.iter().position(|&b| b == b'c');
-    match (u, c) {
-        (Some(ui), Some(ci)) => Some(ui < ci),
-        (Some(_), None) => Some(true),
-        (None, Some(_)) => Some(false),
-        (None, None) => None,
+/// The replies come in the order asked: a kitty-graphics terminal answers the
+/// graphics query with an APC string, `ESC _ G i=31;OK ESC \` (an error text
+/// in place of `OK` when it can't); a kitty-keyboard terminal answers the
+/// flags query with `CSI ? <flags> u`; every terminal answers the device
+/// attributes with `CSI ? … c`, which ends the reply. Sequences are read
+/// whole, so a `u` or `c` inside the graphics reply's text decides nothing.
+/// Anything else (a key typed meanwhile, another reply) is skipped.
+pub(crate) fn parse_probe_reply(buf: &[u8]) -> (Probe, bool) {
+    let mut probe = Probe::default();
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        match buf.get(i + 1) {
+            None => break,
+            // APC: up to the string terminator `ESC \`.
+            Some(b'_') => {
+                let body = &buf[i + 2..];
+                let Some(end) = body.windows(2).position(|w| w == b"\x1b\\") else {
+                    break; // not all here yet
+                };
+                let apc = &body[..end];
+                if let Some(rest) = apc.strip_prefix(b"G") {
+                    if let Some(semi) = rest.iter().position(|&b| b == b';') {
+                        probe.graphics |= rest[semi + 1..].starts_with(b"OK");
+                    }
+                }
+                i += 2 + end + 2;
+            }
+            // CSI: parameter and intermediate bytes, then a final byte.
+            Some(b'[') => {
+                let body = &buf[i + 2..];
+                let Some(fin) = body.iter().position(|&b| (0x40..=0x7e).contains(&b)) else {
+                    break; // not all here yet
+                };
+                let private = body.first() == Some(&b'?');
+                match body[fin] {
+                    b'u' if private => probe.keyboard = true,
+                    b'c' if private => return (probe, true),
+                    _ => {}
+                }
+                i += 2 + fin + 1;
+            }
+            Some(_) => i += 2,
+        }
     }
+    (probe, false)
 }
 
 /// Pure `$TMUX` / `$STY` → nesting decision, split out for testing. tmux wins
@@ -318,16 +383,37 @@ mod tests {
     }
 
     #[test]
-    fn classify_kitty_reply_reads_the_first_terminator() {
-        // Flags reply (`u`) before device attributes (`c`) → kitty supported.
-        assert_eq!(classify_kitty_reply(b"\x1b[?1u\x1b[?62;c"), Some(true));
-        // Device-attributes reply only → not supported.
-        assert_eq!(classify_kitty_reply(b"\x1b[?62;1;6c"), Some(false));
-        // Neither terminator yet → inconclusive, keep reading.
-        assert_eq!(classify_kitty_reply(b"\x1b[?62;1;6"), None);
-        assert_eq!(classify_kitty_reply(b""), None);
-        // A lone flags reply with no trailing device attributes still decides.
-        assert_eq!(classify_kitty_reply(b"\x1b[?0u"), Some(true));
+    fn probe_reply_reads_each_answer_until_the_device_attributes() {
+        let both = Probe { keyboard: true, graphics: true };
+        // Ghostty / kitty: graphics OK, keyboard flags, device attributes.
+        assert_eq!(parse_probe_reply(b"\x1b_Gi=31;OK\x1b\\\x1b[?1u\x1b[?62;c"), (both, true));
+        // Keyboard only (the graphics query ignored): the flags, then the end.
+        let keyboard = Probe { keyboard: true, graphics: false };
+        assert_eq!(parse_probe_reply(b"\x1b[?1u\x1b[?62;c"), (keyboard, true));
+        // Device attributes only (Terminal.app): neither.
+        assert_eq!(parse_probe_reply(b"\x1b[?62;1;6c"), (Probe::default(), true));
+        // A graphics error isn't support, and its text (`c`, `u`) decides nothing.
+        let err = b"\x1b_Gi=31;ENOTSUPPORTED:cannot use u\x1b\\\x1b[?62;c";
+        assert_eq!(parse_probe_reply(err), (Probe::default(), true));
+        // Not all here yet: what's arrived, not done.
+        assert_eq!(parse_probe_reply(b"\x1b_Gi=31;OK\x1b\\\x1b[?62;1"), (Probe { keyboard: false, graphics: true }, false));
+        assert_eq!(parse_probe_reply(b"\x1b_Gi=31;O"), (Probe::default(), false));
+        assert_eq!(parse_probe_reply(b""), (Probe::default(), false));
+        // A key typed meanwhile, or a non-private CSI, is skipped.
+        assert_eq!(parse_probe_reply(b"j\x1b[2c\x1b[?0u"), (keyboard, false));
+    }
+
+    #[test]
+    fn graphics_are_asked_about_outside_multiplexers_and_apple_terminal() {
+        assert!(graphics_wanted(None, Some("ghostty"), Some("xterm-ghostty")));
+        assert!(graphics_wanted(None, None, Some("xterm-kitty")));
+        assert!(!graphics_wanted(Some(Nesting::Tmux), Some("tmux"), Some("tmux-256color")));
+        assert!(!graphics_wanted(Some(Nesting::Screen), None, Some("screen")));
+        assert!(!graphics_wanted(None, Some("Apple_Terminal"), Some("xterm-256color")));
+        assert!(!graphics_wanted(None, None, Some("linux")));
+        // The query carries the graphics command only when asked.
+        assert!(probe_query(true).starts_with(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"));
+        assert_eq!(probe_query(false), b"\x1b[?u\x1b[c".to_vec());
     }
 
     #[cfg(unix)]
@@ -343,9 +429,9 @@ mod tests {
         let (reader, _writer) = std::io::pipe().expect("pipe");
         let timeout = Duration::from_millis(80);
         let start = Instant::now();
-        let supported = super::read_kitty_reply(reader.as_raw_fd(), timeout);
+        let probe = super::read_probe_reply(reader.as_raw_fd(), timeout);
         let elapsed = start.elapsed();
-        assert!(!supported, "a terminal that never answers is treated as no-kitty");
+        assert_eq!(probe, Probe::default(), "a terminal that never answers is treated as no-kitty");
         assert!(
             elapsed < timeout + Duration::from_millis(400),
             "the probe must return near its {timeout:?} budget, not block (took {elapsed:?})"
@@ -362,9 +448,10 @@ mod tests {
         // A kitty flags reply already waiting on the read end: the probe reads it
         // and reports support without waiting out the timeout.
         let (reader, mut writer) = std::io::pipe().expect("pipe");
-        writer.write_all(b"\x1b[?1u\x1b[?62;c").expect("seed reply");
+        writer.write_all(b"\x1b_Gi=31;OK\x1b\\\x1b[?1u\x1b[?62;c").expect("seed reply");
         drop(writer); // EOF after the reply so a mis-parse can't block
-        assert!(super::read_kitty_reply(reader.as_raw_fd(), Duration::from_secs(1)));
+        let probe = super::read_probe_reply(reader.as_raw_fd(), Duration::from_secs(1));
+        assert_eq!(probe, Probe { keyboard: true, graphics: true });
     }
 
     #[test]
