@@ -63,10 +63,12 @@ impl Doc {
     }
 
     /// Which rows a view leaves out: each fenced block's fence rows, unless
-    /// `selection` (`None` for a view without the keys) touches the block.
-    /// One entry per row.
+    /// `selection` (`None` for a view without the keys) touches the block,
+    /// and each table's delimiter line while it draws as a grid
+    /// ([`Doc::grid_rows`]). One entry per row.
     pub fn hidden_rows(&self, selection: Option<Range<usize>>) -> Vec<bool> {
         let mut hidden = vec![false; self.rows.len()];
+        self.hide_table_delimiters(&self.grid_rows(selection.clone()), &mut hidden);
         for (_, rows) in block_rows(self) {
             let span = &self.rows[*rows.start()..=*rows.end()];
             let fenced = span.iter().any(|r| matches!(r.kind, RowKind::Fence { .. }));

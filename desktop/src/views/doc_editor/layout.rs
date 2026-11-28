@@ -10,13 +10,25 @@
 //! fence rows are left out while the caret is elsewhere ([`Code::hidden`]):
 //! a hidden row takes no room and no visual line, so the caret and the
 //! pointer can't land in it, and the block's padding wraps what's shown.
+//!
+//! A table drawn as a grid ([`Code::grid`]) lays its lines out as rows of
+//! cells ([`TableLayout`], [`CellLayout`]): each column as wide as its
+//! content wants while the table fits, its cells wrapping inside their
+//! column when it doesn't, and the grid scrolling sideways inside its own box
+//! when even its narrowest columns are wider than the editor. A grid row is
+//! one visual line as tall as the row, so a click or a vertical move lands in
+//! it and the source offset it picks is in the cell under the point
+//! ([`DocLayout::source_at`]).
+
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
 
 use gpui::{
     font, point, px, size, App, Bounds, Font, FontStyle, FontWeight, Hsla, Pixels, Point, SharedString,
-    StrikethroughStyle, TextRun, UnderlineStyle, Window, WrappedLine,
+    StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window, WrappedLine,
 };
 use shelbi_app::diff::highlight::{SyntaxClass, SyntaxSpan};
-use shelbi_app::markdown_edit::{Doc, Gap, Marker, Row, RowKind, Style};
+use shelbi_app::markdown_edit::{column_widths, Align, Doc, Gap, Marker, Row, RowKind, Style, TablePart};
 
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::theme::diff::syntax_color;
@@ -33,6 +45,17 @@ const CODE_INSET: f32 = 12.0;
 const QUOTE_INSET: f32 = 14.0;
 /// The check's edge.
 pub const CHECK: f32 = 14.0;
+/// A table cell's padding.
+const CELL_PAD_X: f32 = 10.0;
+const CELL_PAD_Y: f32 = 6.0;
+/// The narrowest a table column gets, and the widest its longest word can
+/// hold it open (a longer word breaks).
+const MIN_COLUMN: f32 = 40.0;
+const MAX_WORD: f32 = 220.0;
+/// The room under a table that scrolls sideways, for its scroll bar.
+const SCROLL_ROOM: f32 = 8.0;
+/// A grid's corners.
+pub const TABLE_RADIUS: f32 = 6.0;
 
 /// Which field the editor is: the title's one line, or the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,18 +72,28 @@ pub enum Gutter {
     Check(bool),
 }
 
-/// How a doc's code shows: one entry per row in each (empty for none).
+/// How a doc's code and tables show: one entry per row in each (empty for
+/// none).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Code<'a> {
-    /// Rows left out (a block's fences, the caret elsewhere).
+    /// Rows left out (a block's fences, a grid's delimiter line, the caret
+    /// elsewhere).
     pub hidden: &'a [bool],
     /// Each row's syntax spans, in display offsets.
     pub spans: &'a [Vec<SyntaxSpan>],
+    /// Rows drawn as a table's grid rather than as their source.
+    pub grid: &'a [bool],
+    /// Each table's sideways scroll, by its block.
+    pub scroll: Option<&'a HashMap<usize, Pixels>>,
 }
 
 impl Code<'_> {
     fn hidden(&self, row: usize) -> bool {
         self.hidden.get(row).copied().unwrap_or(false)
+    }
+
+    fn grid(&self, row: usize) -> bool {
+        self.grid.get(row).copied().unwrap_or(false)
     }
 
     fn spans(&self, row: usize) -> &[SyntaxSpan] {
@@ -80,6 +113,40 @@ pub struct RowLayout {
     pub gutter: Option<(Gutter, Bounds<Pixels>)>,
     /// Left out: no lines, no height, no visual line.
     pub hidden: bool,
+    /// A grid row's cells (its `lines` are empty, its `line_height` the
+    /// row's height).
+    pub cells: Vec<CellLayout>,
+    /// The table ([`DocLayout::tables`]) a grid row is in.
+    pub table: Option<usize>,
+}
+
+/// A table cell drawn in its grid.
+pub struct CellLayout {
+    /// The cell, padding and all (the table's scroll applied).
+    pub cell: Bounds<Pixels>,
+    /// Its text's box: the cell less its padding.
+    pub text: Bounds<Pixels>,
+    /// Each `\n`-separated line of the cell's display: where it starts, and
+    /// its shaping (wrapped to the column).
+    pub lines: Vec<(usize, WrappedLine)>,
+    pub line_height: Pixels,
+    pub align: TextAlign,
+}
+
+/// A table drawn as a grid.
+pub struct TableLayout {
+    pub block: usize,
+    /// The box it shows in: the grid's width, or the editor's when the grid
+    /// is wider (it scrolls inside it), and the scroll bar's room.
+    pub bounds: Bounds<Pixels>,
+    /// The grid's outline (the scroll applied).
+    pub grid: Bounds<Pixels>,
+    /// The rules between its rows and its columns.
+    pub rules: Vec<Bounds<Pixels>>,
+    /// How far it can scroll (its grid's width past the box's).
+    pub max_scroll: Pixels,
+    /// The scroll bar's thumb, for a grid wider than its box.
+    pub thumb: Option<Bounds<Pixels>>,
 }
 
 pub struct DocLayout {
@@ -91,6 +158,8 @@ pub struct DocLayout {
     pub bars: Vec<Bounds<Pixels>>,
     /// Thematic breaks.
     pub rules: Vec<Bounds<Pixels>>,
+    /// Tables drawn as grids.
+    pub tables: Vec<TableLayout>,
 }
 
 /// How a row's text is set: its font, size, line height and color.
@@ -153,7 +222,7 @@ fn face_at_base(field: Field, row: &Row, theme: &Theme) -> Face {
             weight: FontWeight::NORMAL,
             color: theme.foreground,
         },
-        RowKind::Fence { .. } | RowKind::Raw => Face {
+        RowKind::Fence { .. } | RowKind::Raw | RowKind::Table(_) => Face {
             family: PRIMARY_FAMILY,
             size: 12.0,
             line_height: 18.0,
@@ -318,6 +387,9 @@ pub fn layout(
     let mut blocks: Vec<Bounds<Pixels>> = Vec::new();
     let mut bars = Vec::new();
     let mut rules = Vec::new();
+    let mut tables: Vec<TableLayout> = Vec::new();
+    // Rows a table's grid already laid out.
+    let mut skip = 0;
     // Each level's running number in an ordered list (`None` for bullets).
     let mut numbers: Vec<Option<u64>> = Vec::new();
     // The room a left-out row would have had above it, for the next one
@@ -329,6 +401,36 @@ pub fn layout(
     let prev_block = |ri: usize| (0..ri).rev().find(|&i| !code.hidden(i)).and_then(|i| doc.rows[i].block);
     let next_block = |ri: usize| (ri + 1..doc.rows.len()).find(|&i| !code.hidden(i)).and_then(|i| doc.rows[i].block);
     for (ri, row) in doc.rows.iter().enumerate() {
+        if ri < skip {
+            continue;
+        }
+        if code.grid(ri) {
+            let last = (ri..doc.rows.len())
+                .take_while(|&i| code.grid(i) && doc.rows[i].block == row.block)
+                .last()
+                .unwrap_or(ri);
+            if shown_any {
+                y += px(room(row.gap).max(carried));
+            }
+            carried = 0.0;
+            shown_any = true;
+            numbers.clear();
+            let block = row.block.unwrap_or(0);
+            let scroll = code.scroll.and_then(|m| m.get(&block)).copied().unwrap_or(px(0.0));
+            let at = Grid {
+                top: y,
+                width,
+                scroll,
+                index: tables.len(),
+                body_line_height,
+            };
+            let (table, laid) = lay_table(doc, ri..=last, at, scale, theme, window);
+            y = table.bounds.origin.y + table.bounds.size.height;
+            tables.push(table);
+            rows.extend(laid);
+            skip = last + 1;
+            continue;
+        }
         let f = face(field, row, theme, scale, body_line_height);
         let lh = px(f.line_height);
         if code.hidden(ri) {
@@ -342,6 +444,8 @@ pub fn layout(
                 lines: Vec::new(),
                 gutter: None,
                 hidden: true,
+                cells: Vec::new(),
+                table: None,
             });
             continue;
         }
@@ -453,6 +557,8 @@ pub fn layout(
             lines,
             gutter,
             hidden: false,
+            cells: Vec::new(),
+            table: None,
         });
         y += height;
         if ends_block {
@@ -465,7 +571,239 @@ pub fn layout(
         blocks,
         bars,
         rules,
+        tables,
     }
+}
+
+/// Where a table's grid goes: its top, the editor's width, its scroll, its
+/// index in [`DocLayout::tables`], and the editor's body line height (its
+/// cells are body text).
+struct Grid {
+    top: Pixels,
+    width: Pixels,
+    scroll: Pixels,
+    index: usize,
+    body_line_height: Option<f32>,
+}
+
+/// `text`'s lines shaped in `runs`, wrapped at `wrap`: each one's start and
+/// shaping.
+fn shape_lines(text: &str, f: &Face, runs: &[TextRun], wrap: Option<Pixels>, window: &mut Window) -> Vec<(usize, WrappedLine)> {
+    let shaped = window
+        .text_system()
+        .shape_text(SharedString::from(text.to_string()), px(f.size), runs, wrap, None)
+        .map(|v| v.into_iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut at = 0;
+    shaped
+        .into_iter()
+        .map(|line| {
+            let start = at;
+            at += line.len() + 1;
+            (start, line)
+        })
+        .collect()
+}
+
+/// The words of `text` (runs of non-whitespace), as byte ranges.
+fn words(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, c) in text.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(s)) => {
+                out.push((s, i));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, text.len()));
+    }
+    out
+}
+
+/// The text's alignment for a column's.
+fn text_align(a: Align) -> TextAlign {
+    match a {
+        Align::Center => TextAlign::Center,
+        Align::Right => TextAlign::Right,
+        Align::None | Align::Left => TextAlign::Left,
+    }
+}
+
+/// Lay a table's rows (`rows`, every one drawn as its grid) out at `at`.
+fn lay_table(
+    doc: &Doc,
+    rows: RangeInclusive<usize>,
+    at: Grid,
+    scale: f32,
+    theme: &Theme,
+    window: &mut Window,
+) -> (TableLayout, Vec<RowLayout>) {
+    let first = &doc.rows[*rows.start()];
+    let aligns = first.table().map(|t| t.aligns.clone()).unwrap_or_default();
+    let n = aligns.len().max(1);
+    let (pad_x, pad_y) = (CELL_PAD_X * scale, CELL_PAD_Y * scale);
+    let rule = px(1.0);
+    // A cell's face: the body's (a paragraph's), the header's semibold and
+    // loud.
+    let cell_face = |header: bool, cell: &Row| {
+        let mut f = face(Field::Body, cell, theme, scale, at.body_line_height);
+        if header {
+            f.weight = Type::BaseSemibold.weight();
+            f.color = theme.text_loud;
+        }
+        f
+    };
+    let lines_of = |i: usize| doc.rows[i].table().filter(|t| t.part != TablePart::Delimiter);
+
+    // What each column wants (its widest line) and holds open (its widest
+    // word).
+    let mut want = vec![0.0f32; n];
+    let mut least = vec![0.0f32; n];
+    for i in rows.clone() {
+        let Some(t) = lines_of(i) else {
+            continue;
+        };
+        for (j, cell) in t.cells.iter().enumerate().take(n) {
+            let f = cell_face(t.part == TablePart::Header, cell);
+            let runs = runs(cell, &f, None, &[], theme);
+            for (off, line) in shape_lines(&cell.display, &f, &runs, None, window) {
+                let l = &line.unwrapped_layout;
+                want[j] = want[j].max(l.width.as_f32());
+                let text = &cell.display[off..off + line.len()];
+                for (a, z) in words(text) {
+                    let w = (l.x_for_index(z) - l.x_for_index(a)).as_f32();
+                    least[j] = least[j].max(w.min(MAX_WORD * scale));
+                }
+            }
+        }
+    }
+    let pad = |w: f32| (w.ceil() + 2.0 * pad_x + 1.0).max(MIN_COLUMN * scale);
+    let want: Vec<f32> = want.into_iter().map(pad).collect();
+    let least: Vec<f32> = least.into_iter().map(pad).collect();
+    let room = at.width.as_f32() - (n + 1) as f32;
+    let cols = column_widths(&want, &least, room);
+    let grid_w = px(cols.iter().sum::<f32>() + (n + 1) as f32);
+    let max_scroll = (grid_w - at.width).max(px(0.0));
+    let scroll = at.scroll.max(px(0.0)).min(max_scroll);
+    let left = -scroll;
+    let mut col_x = Vec::with_capacity(n);
+    let mut x = left + rule;
+    for w in &cols {
+        col_x.push(x);
+        x += px(*w) + rule;
+    }
+
+    let mut laid = Vec::new();
+    let mut rules = Vec::new();
+    let mut y = at.top + rule;
+    let last_shown = rows.clone().rev().find(|&i| lines_of(i).is_some());
+    for i in rows.clone() {
+        let Some(t) = lines_of(i) else {
+            laid.push(RowLayout {
+                top: y,
+                left: px(0.0),
+                line_height: px(0.0),
+                lines: Vec::new(),
+                gutter: None,
+                hidden: true,
+                cells: Vec::new(),
+                table: None,
+            });
+            continue;
+        };
+        let header = t.part == TablePart::Header;
+        let mut shaped = Vec::with_capacity(n);
+        let mut text_h = px(0.0);
+        for (j, cell) in t.cells.iter().enumerate().take(n) {
+            let f = cell_face(header, cell);
+            let lh = px(f.line_height);
+            let wrap = px((cols[j] - 2.0 * pad_x).max(1.0));
+            let lines = shape_lines(&cell.display, &f, &runs(cell, &f, None, &[], theme), Some(wrap), window);
+            let h = lines
+                .iter()
+                .map(|(_, l)| lh * (l.wrap_boundaries().len() + 1) as f32)
+                .fold(px(0.0), |a, b| a + b)
+                .max(lh);
+            text_h = text_h.max(h);
+            shaped.push((lines, lh, wrap));
+        }
+        let row_h = text_h + px(2.0 * pad_y);
+        let cells = shaped
+            .into_iter()
+            .enumerate()
+            .map(|(j, (lines, lh, wrap))| CellLayout {
+                cell: Bounds {
+                    origin: point(col_x[j], y),
+                    size: size(px(cols[j]), row_h),
+                },
+                text: Bounds {
+                    origin: point(col_x[j] + px(pad_x), y + px(pad_y)),
+                    size: size(wrap, text_h),
+                },
+                lines,
+                line_height: lh,
+                align: text_align(aligns.get(j).copied().unwrap_or_default()),
+            })
+            .collect();
+        laid.push(RowLayout {
+            top: y,
+            left: px(0.0),
+            line_height: row_h,
+            lines: Vec::new(),
+            gutter: None,
+            hidden: false,
+            cells,
+            table: Some(at.index),
+        });
+        y += row_h;
+        if Some(i) != last_shown {
+            rules.push(Bounds {
+                origin: point(left, y),
+                size: size(grid_w, rule),
+            });
+        }
+        y += rule;
+    }
+    for x in col_x.iter().skip(1) {
+        rules.push(Bounds {
+            origin: point(*x - rule, at.top),
+            size: size(rule, y - at.top),
+        });
+    }
+    let grid = Bounds {
+        origin: point(left, at.top),
+        size: size(grid_w, y - at.top),
+    };
+    let box_w = grid_w.min(at.width);
+    let mut height = y - at.top;
+    let mut thumb = None;
+    if max_scroll > px(0.0) {
+        let track = at.width.as_f32();
+        let w = (track * track / grid_w.as_f32()).max(24.0);
+        let x = (track - w) * (scroll / max_scroll);
+        thumb = Some(Bounds {
+            origin: point(px(x), y + px(3.0 * scale)),
+            size: size(px(w), px(3.0)),
+        });
+        height += px(SCROLL_ROOM * scale);
+    }
+    let table = TableLayout {
+        block: first.block.unwrap_or(0),
+        bounds: Bounds {
+            origin: point(px(0.0), at.top),
+            size: size(box_w, height),
+        },
+        grid,
+        rules,
+        max_scroll,
+        thumb,
+    };
+    (table, laid)
 }
 
 /// A shaped line's visual (wrapped) lines: each one's start and end index.
@@ -616,9 +954,71 @@ impl DocLayout {
     pub fn hit(&self, doc: &Doc, pos: Point<Pixels>) -> usize {
         let visuals = self.visuals();
         let v = self.visual_at_y(&visuals, pos.y);
+        self.source_at(doc, &v, pos)
+    }
+
+    /// The source offset on visual line `v` closest to `pos`: by its x, and
+    /// in a table's grid row by the cell under it and the line of the cell's
+    /// text at its y.
+    pub fn source_at(&self, doc: &Doc, v: &Visual, pos: Point<Pixels>) -> usize {
+        if let Some(src) = self.cell_source(doc, v.row, pos) {
+            return src;
+        }
         let row = &doc.rows[v.row];
-        let d = self.offset_at_x(&v, pos.x, &row.display);
-        row.source_of(d)
+        row.source_of(self.offset_at_x(v, pos.x, &row.display))
+    }
+
+    /// In grid row `row`, the source offset in the cell nearest `pos`.
+    fn cell_source(&self, doc: &Doc, row: usize, pos: Point<Pixels>) -> Option<usize> {
+        let r = self.rows.get(row)?;
+        let t = doc.rows.get(row)?.table()?;
+        let off = |c: &CellLayout| {
+            if pos.x < c.cell.left() {
+                (c.cell.left() - pos.x).as_f32()
+            } else {
+                (pos.x - c.cell.right()).max(px(0.0)).as_f32()
+            }
+        };
+        let (ci, c) = r
+            .cells
+            .iter()
+            .enumerate()
+            .min_by(|a, b| off(a.1).total_cmp(&off(b.1)))?;
+        let cell = t.cells.get(ci)?;
+        let subs: Vec<(usize, &WrappedLine, usize, usize, bool)> = c
+            .lines
+            .iter()
+            .flat_map(|(at, line)| {
+                let subs = sub_lines(line);
+                let last = subs.len().saturating_sub(1);
+                subs.into_iter()
+                    .enumerate()
+                    .map(move |(k, (s, e))| (*at, line, s, e, k == last))
+            })
+            .collect();
+        if subs.is_empty() {
+            return Some(cell.source_of(0));
+        }
+        let k = ((pos.y - c.text.top()).as_f32() / c.line_height.as_f32()).floor().max(0.0) as usize;
+        let (at, line, s, e, last) = subs[k.min(subs.len() - 1)];
+        let l = &line.unwrapped_layout;
+        let line_w = l.x_for_index(e) - l.x_for_index(s);
+        let shift = match c.align {
+            TextAlign::Left => px(0.0),
+            TextAlign::Center => (c.text.size.width - line_w) / 2.0,
+            TextAlign::Right => c.text.size.width - line_w,
+        };
+        let mut i = l
+            .closest_index_for_x(pos.x - c.text.left() - shift + l.x_for_index(s))
+            .clamp(s, e);
+        if i == e && !last && i > s {
+            i = shelbi_app::markdown_edit::prev_boundary(&cell.display[at..], i);
+        }
+        let mut d = (at + i).min(cell.display.len());
+        while d > 0 && !cell.display.is_char_boundary(d) {
+            d -= 1;
+        }
+        Some(cell.source_of(d))
     }
 
     /// The row whose checkbox is at `pos`.

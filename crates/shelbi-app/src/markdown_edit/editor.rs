@@ -392,7 +392,7 @@ impl Editor {
         let (r, _) = self.doc.locate(self.head);
         let code = matches!(
             self.doc.rows[r].kind,
-            RowKind::Code | RowKind::Fence { .. } | RowKind::Raw
+            RowKind::Code | RowKind::Fence { .. } | RowKind::Raw | RowKind::Table(_)
         );
         self.insert(if code { "\n" } else { "\\\n" });
     }
@@ -637,13 +637,13 @@ impl Editor {
         let row = self.doc.rows[r].clone();
         let at_end = d == row.display.len();
         match &row.kind {
-            RowKind::Code | RowKind::Raw => {
+            RowKind::Code | RowKind::Raw | RowKind::Table(_) => {
                 let line_start = self.text[..self.head].rfind('\n').map_or(0, |i| i + 1);
                 let indent: String = self.text[line_start..]
                     .chars()
                     .take_while(|c| *c == ' ' || *c == '\t')
                     .collect();
-                let indent = if row.kind == RowKind::Raw {
+                let indent = if matches!(row.kind, RowKind::Raw | RowKind::Table(_)) {
                     String::new()
                 } else {
                     indent
@@ -1565,7 +1565,7 @@ fn block_kind(row: &Row) -> Option<BlockKind> {
         },
         RowKind::Quote => BlockKind::Quote,
         RowKind::Code | RowKind::Fence { .. } => BlockKind::Code,
-        RowKind::Rule | RowKind::Raw => return None,
+        RowKind::Rule | RowKind::Raw | RowKind::Table(_) => return None,
     })
 }
 

@@ -336,16 +336,17 @@ fn toks_to_line(toks: &[Tok]) -> Line<'static> {
 /// blocks and rules as blocks, and inside them the inline styles. The rows
 /// come from the shared Markdown model the desktop's document editor lays
 /// out ([`shelbi_app::markdown_edit::Doc`]), so both clients read a document
-/// the same way; what it doesn't render (a table, HTML) shows as written,
-/// muted. A leading frontmatter block is left out.
+/// the same way. A table draws as a box-drawn grid, its cells wrapping in
+/// their columns ([`draw_table`]); what the model doesn't render (HTML) shows
+/// as written, muted. A leading frontmatter block is left out.
 pub fn render_document(src: &str, width: usize) -> Vec<Line<'static>> {
-    use shelbi_app::markdown_edit::{Doc, Gap, Marker, RowKind};
+    use shelbi_app::markdown_edit::{Doc, Gap, Marker, RowKind, TablePart};
     let width = width.max(8);
     let body = strip_frontmatter(src);
     let doc = Doc::parse(body);
     let p = palette();
     let mut out: Vec<Line<'static>> = Vec::new();
-    for row in &doc.rows {
+    for (ri, row) in doc.rows.iter().enumerate() {
         let spaced = matches!(row.gap, Gap::Block | Gap::Heading | Gap::List);
         if spaced && !out.is_empty() && !matches!(row.kind, RowKind::Fence { .. }) {
             out.push(Line::default());
@@ -396,6 +397,21 @@ pub fn render_document(src: &str, width: usize) -> Vec<Line<'static>> {
                 out.push(Line::from(Span::styled(format!("{shown}{}", " ".repeat(pad)), code_style())));
             }
             RowKind::Rule => out.push(Line::from(Span::styled("─".repeat(width), Style::default().fg(p.ansi_dark_gray)))),
+            // A table draws whole at its header line.
+            RowKind::Table(t) if t.part == TablePart::Header => {
+                let lines: Vec<&shelbi_app::markdown_edit::Row> =
+                    doc.rows[ri..].iter().take_while(|r| r.block == row.block && r.table().is_some()).collect();
+                let shown: Vec<&shelbi_app::markdown_edit::TableRow> =
+                    lines.iter().filter_map(|r| r.table()).filter(|t| t.part != TablePart::Delimiter).collect();
+                if !draw_table(&shown, width, &mut out) {
+                    // Too narrow for its columns: the source, as written.
+                    let base = Style::default().fg(p.ansi_gray);
+                    for r in lines {
+                        wrap_segments(vec![(r.display.clone(), Style::default())], width, "", "", base, &mut out);
+                    }
+                }
+            }
+            RowKind::Table(_) => {}
             RowKind::Raw => {
                 let base = Style::default().fg(p.ansi_gray);
                 wrap_segments(vec![(row.display.clone(), Style::default())], width, "", "", base, &mut out);
@@ -403,6 +419,130 @@ pub fn render_document(src: &str, width: usize) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+/// The widest a word holds a table column open in the TUI (a longer one
+/// is cut at the column's edge).
+const MAX_WORD: usize = 24;
+
+/// Draw a table's lines (`rows`: its header, then its body) as a box-drawn
+/// grid `width` cells wide: the header bold, a rule under every row, each
+/// column sized to its content ([`shelbi_app::markdown_edit::column_widths`],
+/// as the desktop sizes them) and aligned as its delimiter says, a long cell
+/// wrapping inside its column. `false` (nothing drawn) when the columns
+/// can't fit three cells each.
+fn draw_table(rows: &[&shelbi_app::markdown_edit::TableRow], width: usize, out: &mut Vec<Line<'static>>) -> bool {
+    use shelbi_app::markdown_edit::{column_widths, Align};
+    let Some(first) = rows.first() else {
+        return true;
+    };
+    let n = first.aligns.len().max(1);
+    // Each column's border and a space either side.
+    let chrome = 3 * n + 1;
+    if width < chrome + 3 * n {
+        return false;
+    }
+    let room = width - chrome;
+    let mut want = vec![1.0f32; n];
+    let mut least = vec![1.0f32; n];
+    for t in rows {
+        for (j, c) in t.cells.iter().enumerate().take(n) {
+            for line in c.display.split('\n') {
+                want[j] = want[j].max(UnicodeWidthStr::width(line) as f32);
+                for word in line.split_whitespace() {
+                    least[j] = least[j].max(UnicodeWidthStr::width(word).min(MAX_WORD) as f32);
+                }
+            }
+        }
+    }
+    let mut cols: Vec<usize> = column_widths(&want, &least, room as f32)
+        .into_iter()
+        .map(|w| (w.floor() as usize).max(1))
+        .collect();
+    // The words don't fit: take from the widest columns, three cells at the
+    // least.
+    while cols.iter().sum::<usize>() > room {
+        let j = (0..n).max_by_key(|&j| cols[j]).unwrap_or(0);
+        if cols[j] <= 3 {
+            return false;
+        }
+        cols[j] -= 1;
+    }
+    let rule = Style::default().fg(palette().ansi_dark_gray);
+    let border = |l: char, m: char, r: char| {
+        let mut s = String::new();
+        s.push(l);
+        for (j, w) in cols.iter().enumerate() {
+            if j > 0 {
+                s.push(m);
+            }
+            s.push_str(&"─".repeat(w + 2));
+        }
+        s.push(r);
+        Line::from(Span::styled(s, rule))
+    };
+    out.push(border('┌', '┬', '┐'));
+    for (ri, t) in rows.iter().enumerate() {
+        let base = if ri == 0 { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
+        let cells: Vec<Vec<Line<'static>>> = (0..n)
+            .map(|j| {
+                let mut lines = Vec::new();
+                if let Some(c) = t.cells.get(j) {
+                    wrap_segments(styled_segments(&c.display, &c.styles), cols[j], "", "", base, &mut lines);
+                }
+                lines
+            })
+            .collect();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        for k in 0..height {
+            let mut spans = vec![Span::styled("│", rule)];
+            for (j, w) in cols.iter().enumerate() {
+                let align = first.aligns.get(j).copied().unwrap_or_default();
+                spans.push(Span::raw(" "));
+                let (mut text, used) = fit(cells[j].get(k), *w);
+                let pad = w - used;
+                let (before, after) = match align {
+                    Align::Right => (pad, 0),
+                    Align::Center => (pad / 2, pad - pad / 2),
+                    Align::None | Align::Left => (0, pad),
+                };
+                if before > 0 {
+                    spans.push(Span::raw(" ".repeat(before)));
+                }
+                spans.append(&mut text);
+                spans.push(Span::raw(" ".repeat(after + 1)));
+                spans.push(Span::styled("│", rule));
+            }
+            out.push(Line::from(spans));
+        }
+        if ri + 1 < rows.len() {
+            out.push(border('├', '┼', '┤'));
+        }
+    }
+    out.push(border('└', '┴', '┘'));
+    true
+}
+
+/// `line`'s spans cut to `width` cells, and the cells they take.
+fn fit(line: Option<&Line<'static>>, width: usize) -> (Vec<Span<'static>>, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in line.map_or(&[][..], |l| &l.spans[..]) {
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > width {
+                break;
+            }
+            used += w;
+            text.push(ch);
+        }
+        if !text.is_empty() {
+            out.push(Span::styled(text, span.style));
+        }
+    }
+    (out, used)
 }
 
 /// `src` without a leading `---` frontmatter block (YAML), which a reader
@@ -748,6 +888,47 @@ mod tests {
         let lines = doc_text("Tagline here.\n\n<br />\n\nNext\n\n- one<br/>two", 30);
         assert_eq!(lines, ["Tagline here.", "", "", "", "Next", "", "• one", "  two"]);
         assert!(!doc_text("a<br>b\\\nc", 30).iter().any(|l| l.contains('\n')));
+    }
+
+    #[test]
+    fn a_table_draws_as_a_grid_with_wrapped_aligned_cells() {
+        let src = "Intro.\n\n| Element | Shelbi | Since |\n| :--- | :---: | ---: |\n| **Use case** | Shipping code changes, large and small, with multiple coding agents | `v1` |\n| Tool | Tabs<br>one each | 9 |\n\nAfter.";
+        let lines = doc_text(src, 50);
+        let grid: Vec<&String> = lines.iter().filter(|l| l.starts_with(['┌', '│', '├', '└'])).collect();
+        assert!(grid.first().unwrap().starts_with('┌'), "{lines:#?}");
+        assert!(grid.last().unwrap().starts_with('└'), "{lines:#?}");
+        // Every line of the grid is as wide as the others, inside the pane.
+        let w = UnicodeWidthStr::width(grid[0].as_str());
+        assert!(w <= 50, "{lines:#?}");
+        for l in &grid {
+            assert_eq!(UnicodeWidthStr::width(l.as_str()), w, "{l:?} in {lines:#?}");
+        }
+        // The header, the cells' Markdown drawn (no `**`, no `<br>`), the
+        // long cell wrapped in its column, the right column right-aligned.
+        assert!(grid[1].contains("Element") && grid[1].contains("Shelbi"), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("**") || l.contains("<br>") || l.contains("---")), "{lines:#?}");
+        let use_case = grid.iter().position(|l| l.contains("Use case")).unwrap();
+        assert!(grid[use_case + 1].starts_with('│'), "wrapped: {lines:#?}");
+        assert!(grid[use_case].contains(" v1 │"), "{lines:#?}");
+        assert!(grid.iter().any(|l| l.contains("one each")), "{lines:#?}");
+        // Row rules between the rows.
+        assert_eq!(grid.iter().filter(|l| l.starts_with('├')).count(), 2, "{lines:#?}");
+        // The header is bold.
+        let rendered = render_document(src, 50);
+        let header = rendered.iter().find(|l| line_text(l).contains("Element")).unwrap();
+        assert!(header
+            .spans
+            .iter()
+            .any(|s| s.content.contains("Element") && s.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn a_table_too_narrow_for_its_columns_shows_its_source() {
+        let src = "| a | b | c | d | e |\n|---|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 |";
+        let lines = doc_text(src, 20);
+        assert!(lines[0].starts_with("| a | b |"), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.contains("|---|")), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.starts_with('┌')), "{lines:#?}");
     }
 
     #[test]
