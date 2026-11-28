@@ -1487,11 +1487,10 @@ impl DocsView {
     }
 
     /// One row of the tree.
-    fn render_row(&self, ix: usize, row: &TreeRow, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&self, ix: usize, row: &TreeRow, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let path = row.path.clone();
         let selected = self.tree.selected_path() == Some(path.as_str());
         let open = self.open.as_deref() == Some(path.as_str());
-        let focused = self.focus.is_focused(window) || self.menu.is_some();
         let id = SharedString::from(format!("docs-row-{path}"));
         let folder_icon = self.tree.node(&path).and_then(|n| n.icon.clone());
         let icon = match (row.kind, row.expanded) {
@@ -1568,7 +1567,8 @@ impl DocsView {
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_color(if open { theme.text_loud } else { theme.foreground })
+                // The selected row's label takes the chip's loud, medium text.
+                .when(!selected, |d| d.text_color(if open { theme.text_loud } else { theme.foreground }))
                 .child(row.title.clone())
                 .into_any_element(),
         };
@@ -1585,17 +1585,13 @@ impl DocsView {
         let (click, menu_path, drop_path, move_path) = (path.clone(), path.clone(), path.clone(), path.clone());
         let is_folder = row.is_folder();
         let tip = row.name.clone();
-        let fill = if selected && focused {
-            Some(theme.nested(theme.background_active))
-        } else if selected {
-            Some(theme.nested(theme.background_hover))
-        } else {
-            None
-        };
-        div()
-            .id(id.clone())
+        // Painted as the sidebar's nav items are: the raised chip on the
+        // selected row (focused or not, as the sidebar's), the hover fill
+        // fading in on the others. Painted first, so its hover layer sits
+        // under the guides and the content.
+        let key = id.clone();
+        style::row_state_rounded(div().id(id.clone()), key, selected, false, true, px(NAV_RADIUS), theme)
             .debug_selector(move || id.to_string())
-            .relative()
             .flex()
             .flex_row()
             .flex_none()
@@ -1608,8 +1604,6 @@ impl DocsView {
             .rounded(px(NAV_RADIUS))
             .type_style(Type::Base)
             .cursor_pointer()
-            .when_some(fill, |d, f| d.bg(f))
-            .when(fill.is_none(), |d| d.hover(|s| s.bg(theme.nested(theme.background_hover))))
             .when(drop_edge == Some(DropAt::Into), |d| d.bg(theme.accent.opacity(0.18)))
             .children(guides)
             .when(selected, |d| d.child(div().debug_selector(|| "docs-selection".into()).absolute().size_0()))
@@ -1878,7 +1872,7 @@ impl Render for DocsView {
                     .child(text)
             });
             let row_elements: Vec<AnyElement> =
-                rows.iter().enumerate().map(|(ix, row)| self.render_row(ix, row, window, &theme, cx)).collect();
+                rows.iter().enumerate().map(|(ix, row)| self.render_row(ix, row, &theme, cx)).collect();
             div()
                 .flex()
                 .flex_col()
