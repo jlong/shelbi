@@ -1549,7 +1549,7 @@ fn marker(kind: MarkKind) -> &'static str {
         MarkKind::Italic => "*",
         MarkKind::Strike => "~~",
         MarkKind::Code => "`",
-        MarkKind::Link | MarkKind::Escape => "",
+        MarkKind::Link | MarkKind::Escape | MarkKind::Break => "",
     }
 }
 

@@ -3,9 +3,9 @@
 //!
 //! A pragmatic GitHub-flavored subset: backslash escapes, code spans,
 //! `**strong**` / `*emphasis*` (and `_` forms, CommonMark's flanking rules),
-//! `~~strikethrough~~`, `[links](url)`, `<autolinks>` and bare URLs. Images
-//! and inline HTML are left visible as their source (muted), so nothing the
-//! subset doesn't know is hidden or lost. Whatever this gets wrong only
+//! `~~strikethrough~~`, `[links](url)`, `<autolinks>`, bare URLs and `<br>`
+//! line breaks. Images and other inline HTML are left visible as their
+//! source (muted), so nothing the subset doesn't know is hidden or lost. Whatever this gets wrong only
 //! changes how text looks: the source is never rewritten by parsing.
 
 use std::ops::Range;
@@ -48,6 +48,10 @@ pub enum MarkKind {
     /// A backslash escape: `open` is the backslash, the content the
     /// escaped character.
     Escape,
+    /// A `<br>` tag that breaks a line: the content is the byte shown as
+    /// the break (the tag's `>`, or the line's `\n` right after it), `open`
+    /// the tag before it, `close` any spaces after.
+    Break,
 }
 
 impl MarkKind {
@@ -59,7 +63,7 @@ impl MarkKind {
             MarkKind::Strike => s.strike = true,
             MarkKind::Code => s.code = true,
             MarkKind::Link => s.link = true,
-            MarkKind::Escape => {}
+            MarkKind::Escape | MarkKind::Break => {}
         }
         s
     }
@@ -152,6 +156,7 @@ pub fn parse(text: &str) -> Inline {
     }
     out.hidden = merged;
     out.breaks.sort_unstable();
+    out.breaks.dedup();
     out
 }
 
@@ -221,7 +226,9 @@ fn parse_into(text: &str, range: Range<usize>, out: &mut Inline) {
                 }
             }
             b'<' => {
-                if let Some(close) = autolink(text, i, end) {
+                if let Some(n) = br_tag(&text[i..end]) {
+                    i = line_break(text, i, i + n, end, out);
+                } else if let Some(close) = autolink(text, i, end) {
                     out.hidden.push(i..i + 1);
                     out.hidden.push(close..close + 1);
                     out.spans.push((i + 1..close, MarkKind::Link.style()));
@@ -375,7 +382,52 @@ fn autolink(text: &str, i: usize, end: usize) -> Option<usize> {
     (uri || email).then_some(i + 1 + close)
 }
 
-/// An inline HTML tag (`<b>`, `</b>`, `<!-- x -->`, `<br/>`): where it ends.
+/// A `<br>` tag at the start of `s` (`<br>`, `<br/>`, `<br />`, any case):
+/// its length.
+pub(crate) fn br_tag(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.len() < 4 || b[0] != b'<' || !b[1..3].eq_ignore_ascii_case(b"br") {
+        return None;
+    }
+    let mut j = 3 + run_while(&b[3..], |c| c == b' ' || c == b'\t');
+    if b.get(j) == Some(&b'/') {
+        j += 1;
+    }
+    (b.get(j) == Some(&b'>')).then_some(j + 1)
+}
+
+fn run_while(b: &[u8], f: impl Fn(u8) -> bool) -> usize {
+    b.iter().take_while(|&&c| f(c)).count()
+}
+
+/// The `<br>` tag at `i..close` breaks the line, so it hides. Right before
+/// the line's own `\n`, that `\n` is the break; mid-line, the tag's `>`
+/// shows as it, the spaces after hidden so the next line starts flush. At
+/// the end of the text there's nothing to break (a browser drops a block's
+/// last `<br>` too), so a line holding only the tag shows empty. Returns
+/// where parsing goes on.
+fn line_break(text: &str, i: usize, close: usize, end: usize, out: &mut Inline) -> usize {
+    let bytes = text.as_bytes();
+    let next = close + run_while(&bytes[close..end], |c| c == b' ' || c == b'\t');
+    if next == end {
+        out.hidden.push(i..next);
+        return next;
+    }
+    let shown = if bytes[next] == b'\n' { next } else { close - 1 };
+    out.hidden.push(i..shown);
+    out.hidden.push(shown + 1..next.max(shown + 1));
+    out.breaks.push(shown);
+    // A mark, so deleting the break takes the tag with it.
+    out.marks.push(Mark {
+        kind: MarkKind::Break,
+        open: i..shown,
+        close: shown + 1..next.max(shown + 1),
+        url: String::new(),
+    });
+    next
+}
+
+/// An inline HTML tag (`<b>`, `</b>`, `<!-- x -->`): where it ends.
 fn html_tag(text: &str, i: usize, end: usize) -> Option<usize> {
     let rest = &text[i + 1..end];
     let first = rest.chars().next()?;

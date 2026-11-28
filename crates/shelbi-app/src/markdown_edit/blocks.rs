@@ -486,10 +486,15 @@ fn is_table(line: &str) -> bool {
     cols <= 3 && line[bytes..].starts_with('|')
 }
 
+/// A line that opens an HTML block (shown as source). A line holding only
+/// a `<br>` tag isn't one: it's a paragraph whose tag hides, so it shows as
+/// the blank line it's written for.
 fn is_html_start(line: &str) -> bool {
     let (cols, bytes) = indent(line);
     let rest = &line[bytes..];
+    let trimmed = rest.trim_end();
     cols <= 3
+        && inline::br_tag(trimmed) != Some(trimmed.len())
         && rest.starts_with('<')
         && rest[1..]
             .chars()
@@ -884,7 +889,8 @@ fn finish(src: &str, b: Building, gap: Gap) -> Row {
     for v in &visible {
         display.push_str(&content[v.clone()]);
     }
-    // Soft breaks show as spaces, hard breaks as new lines.
+    // Soft breaks show as spaces, hard breaks as new lines (a `<br>` tag's
+    // `>` among them).
     let breaks: Vec<usize> = parsed
         .breaks
         .iter()
@@ -892,12 +898,10 @@ fn finish(src: &str, b: Building, gap: Gap) -> Row {
         .collect();
     row.display = display
         .char_indices()
-        .map(|(i, ch)| {
-            if ch == '\n' && !breaks.contains(&i) {
-                ' '
-            } else {
-                ch
-            }
+        .map(|(i, ch)| match (ch, breaks.contains(&i)) {
+            (_, true) => '\n',
+            ('\n', false) => ' ',
+            _ => ch,
         })
         .collect();
     row.styles = parsed
