@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
-use shelbi_app::wiki::{FailureKind, NodeKind, SyncState, WikiNode, WikiReply, WikiRequest, WikiStatus};
+use shelbi_app::wiki::{FailureKind, NodeKind, SyncState, WikiConflict, WikiNode, WikiReply, WikiRequest, WikiStatus};
 
 use super::*;
 
@@ -19,6 +19,8 @@ pub(crate) struct FakeWiki {
     pub folders: Vec<String>,
     pub asked: Vec<WikiRequest>,
     pub set_up: bool,
+    /// Held documents' sides (`ours` is `docs`' text).
+    pub conflicts: BTreeMap<String, WikiConflict>,
 }
 
 impl FakeWiki {
@@ -36,7 +38,23 @@ impl FakeWiki {
             folders: vec!["Plans".into(), "Plans/Archive".into(), "Research".into()],
             asked: Vec::new(),
             set_up: true,
+            conflicts: BTreeMap::new(),
         }
+    }
+
+    /// Hold `path`: `ours` here, `theirs` from elsewhere.
+    pub(crate) fn hold(&mut self, path: &str, ours: &str, theirs: &str) {
+        self.docs.insert(path.into(), ours.into());
+        self.conflicts.insert(
+            path.into(),
+            WikiConflict {
+                path: path.into(),
+                base: None,
+                ours: Some(ours.into()),
+                theirs: Some(theirs.into()),
+                detected_at: "2026-11-27T00:00:00Z".into(),
+            },
+        );
     }
 
     fn status(&self) -> WikiStatus {
@@ -45,8 +63,8 @@ impl FakeWiki {
         }
         WikiStatus {
             set_up: true,
-            state: SyncState::Synced,
-            conflicts: Vec::new(),
+            state: if self.conflicts.is_empty() { SyncState::Synced } else { SyncState::Conflict },
+            conflicts: self.conflicts.keys().cloned().collect(),
             paused: false,
             auto: true,
             source: "branch".into(),
@@ -125,6 +143,31 @@ impl FakeWiki {
                     return missing(&from);
                 }
                 WikiReply::Done
+            }
+            WikiRequest::Conflict { path } => match self.conflicts.get(&path) {
+                Some(c) => {
+                    let mut c = c.clone();
+                    c.ours = self.docs.get(&path).cloned();
+                    WikiReply::Conflict(c)
+                }
+                None => WikiReply::failed(FailureKind::Conflict, format!("`{path}` isn't in conflict")),
+            },
+            WikiRequest::Resolve { path, resolution, .. } => {
+                let Some(mut held) = self.conflicts.get(&path).cloned() else {
+                    return WikiReply::failed(FailureKind::Conflict, format!("`{path}` isn't in conflict"));
+                };
+                held.ours = self.docs.get(&path).cloned();
+                match shelbi_app::wiki_conflict::resolve(&held, &resolution) {
+                    Ok(content) => {
+                        self.conflicts.remove(&path);
+                        match content {
+                            Some(c) => self.docs.insert(path, c),
+                            None => self.docs.remove(&path),
+                        };
+                        WikiReply::Done
+                    }
+                    Err(e) => WikiReply::failed(FailureKind::Conflict, e),
+                }
             }
             WikiRequest::Remove { path, .. } => {
                 self.docs.retain(|d, _| d != &path && !d.starts_with(&format!("{path}/")));
@@ -501,4 +544,123 @@ fn the_tree_and_document_draw_and_a_click_opens_a_row() {
     assert_eq!(page.doc_path(), Some("README.md"));
     // The back button goes back to the nav.
     assert_eq!(page.click_tree(3, 1), WikiStep::Back);
+}
+
+const OURS: &str = "# Auth\n\n## Alpha\n\nAlpha ours.\n\n## Beta\n\nBeta ours.\n";
+const THEIRS: &str = "# Auth\n\n## Alpha\n\nAlpha theirs.\n\n## Beta\n\nBeta theirs.\n";
+
+fn held() -> (Arc<Mutex<FakeWiki>>, WikiPage) {
+    let wiki = Arc::new(Mutex::new(FakeWiki::sample()));
+    wiki.lock().unwrap().hold("Plans/opencode.md", OURS, THEIRS);
+    let mut page = WikiPage::new("proj", ask_of(&wiki));
+    page.open();
+    settle(&mut page);
+    (wiki, page)
+}
+
+fn drawn(page: &mut WikiPage, width: u16, height: u16, doc: bool) -> String {
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        if doc {
+            page.render_doc(f.buffer_mut(), area);
+        } else {
+            page.render_tree(f, area, true);
+        }
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n")
+        .collect()
+}
+
+#[test]
+fn a_held_document_shows_a_notice_in_the_tree_and_on_the_document() {
+    let (_, mut page) = held();
+    let tree = drawn(&mut page, 60, 20, false);
+    assert!(tree.contains("1 document couldn't be merged · c resolves"), "{tree}");
+    assert!(tree.contains("Conflict (1)"), "{tree}");
+    page.reveal("Plans/opencode.md");
+    settle(&mut page);
+    let doc = drawn(&mut page, 200, 12, true);
+    assert!(doc.contains("This document couldn't be merged"), "{doc}");
+    page.reveal("README.md");
+    settle(&mut page);
+    assert!(!drawn(&mut page, 200, 12, true).contains("couldn't be merged"));
+}
+
+#[test]
+fn the_inspector_resolves_per_hunk_and_the_document_reloads() {
+    let (wiki, mut page) = held();
+    page.reveal("Plans/opencode.md");
+    settle(&mut page);
+    assert_eq!(page.handle_doc_key(ch('c')), WikiStep::Stay);
+    settle(&mut page);
+    assert_eq!(page.inspecting(), Some("Plans/opencode.md"));
+    assert_eq!(page.inspector().unwrap().hunks().len(), 2);
+    let shown = drawn(&mut page, 100, 30, true);
+    assert!(shown.contains("Resolve Plans › Auth · 0 of 2 chosen"), "{shown}");
+    assert!(shown.contains("Alpha ours."), "{shown}");
+    assert!(shown.contains("Alpha theirs."), "{shown}");
+
+    // Apply waits for every hunk.
+    page.handle_doc_key(key(KeyCode::Enter));
+    assert!(!asked(&wiki).iter().any(|r| matches!(r, WikiRequest::Resolve { .. })));
+    page.handle_doc_key(ch('t'));
+    page.handle_doc_key(ch('o'));
+    assert!(drawn(&mut page, 100, 30, true).contains("2 of 2 chosen"));
+    page.handle_doc_key(key(KeyCode::Enter));
+    settle(&mut page);
+    assert_eq!(page.inspecting(), None, "closed once applied");
+    assert_eq!(page.note(), Some("Resolved Plans/opencode.md"));
+    let merged = "# Auth\n\n## Alpha\n\nAlpha theirs.\n\n## Beta\n\nBeta ours.\n";
+    assert_eq!(wiki.lock().unwrap().docs["Plans/opencode.md"], merged);
+    assert_eq!(page.doc_content(), Some(merged), "the open document reads the result");
+    assert!(!drawn(&mut page, 60, 20, false).contains("couldn't be merged"));
+}
+
+#[test]
+fn use_all_theirs_and_esc_from_the_tree() {
+    let (wiki, mut page) = held();
+    // From the tree, `c` opens the first held document and gives it the keys.
+    assert_eq!(page.handle_tree_key(ch('c')), WikiStep::FocusDoc);
+    settle(&mut page);
+    assert_eq!(page.inspecting(), Some("Plans/opencode.md"));
+    // Esc cancels without resolving.
+    page.handle_doc_key(key(KeyCode::Esc));
+    assert_eq!(page.inspecting(), None);
+    page.handle_tree_key(ch('c'));
+    settle(&mut page);
+    page.handle_doc_key(ch('T'));
+    page.handle_doc_key(key(KeyCode::Enter));
+    settle(&mut page);
+    assert_eq!(wiki.lock().unwrap().docs["Plans/opencode.md"], THEIRS);
+    assert!(asked(&wiki).iter().any(|r| matches!(
+        r,
+        WikiRequest::Resolve { resolution: shelbi_app::wiki::Resolution::Hunks { choices, .. }, .. }
+            if choices.iter().all(|c| *c == shelbi_app::wiki_conflict::Side::Theirs)
+    )));
+    // Nothing left: `c` says so.
+    assert_eq!(page.handle_tree_key(ch('c')), WikiStep::Stay);
+    assert!(page.note().unwrap().starts_with("Nothing to resolve"));
+}
+
+#[test]
+fn a_refused_apply_keeps_the_inspector_with_the_reason() {
+    let (wiki, mut page) = held();
+    page.handle_tree_key(ch('c'));
+    settle(&mut page);
+    // The document changed here since the sides were read.
+    wiki.lock().unwrap().docs.insert("Plans/opencode.md".into(), "# Auth\n\nNew.\n".into());
+    page.handle_doc_key(ch('O'));
+    page.handle_doc_key(key(KeyCode::Enter));
+    settle(&mut page);
+    assert_eq!(page.inspecting(), Some("Plans/opencode.md"));
+    let shown = drawn(&mut page, 120, 30, true);
+    assert!(shown.contains("changed since its conflict was read"), "{shown}");
+    // The hub's change re-reads the sides.
+    page.changed(&["Plans/opencode.md".to_string()]);
+    settle(&mut page);
+    assert!(page.inspector().unwrap().conflict().ours.as_deref().unwrap().contains("New."));
 }

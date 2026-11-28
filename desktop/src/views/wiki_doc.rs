@@ -453,6 +453,7 @@ impl WikiView {
             .size_full()
             .min_h_0()
             .child(self.render_toolbar(&path, theme, cx))
+            .children(self.render_held_bar(&path, theme, cx))
             .children(self.render_elsewhere(theme, cx))
             .child(body)
             .children(self.render_doc_menu(cx))

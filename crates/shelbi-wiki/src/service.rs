@@ -319,9 +319,17 @@ impl WikiService {
         }
     }
 
-    /// A held file's three sides.
+    /// A held file's three sides, `ours` as the file is here now (an edit
+    /// made while it's held is ours too).
     pub fn conflict(&self, path: &str) -> Option<crate::sync::conflicts::Conflict> {
-        lock(&self.shared.engine).conflicts().iter().find(|c| c.path == path).cloned()
+        let engine = lock(&self.shared.engine);
+        self.live_conflict(&engine, path)
+    }
+
+    fn live_conflict(&self, engine: &Engine, path: &str) -> Option<crate::sync::conflicts::Conflict> {
+        let mut c = engine.conflicts().iter().find(|c| c.path == path).cloned()?;
+        c.ours = std::fs::read_to_string(self.shared.root.join(path)).ok();
+        Some(c)
     }
 
     /// The uncommitted change under wiki-relative `path` (the whole wiki
@@ -395,15 +403,44 @@ impl WikiService {
     /// Resolve a held file with `content` (`None` deletes it), commit it,
     /// and sync.
     pub fn resolve(&self, path: &str, content: Option<&str>) -> Result<(), OpError> {
+        let content = content.map(str::to_string);
+        self.resolve_with(path, ChangeSource::Local, move |_| Ok(content))
+    }
+
+    /// Resolve a held file with what `decide` makes of its sides (as
+    /// [`Self::conflict`] reads them), under the same lock as the pull, so
+    /// no newer side lands between the read and the commit. `source` says
+    /// who settled it.
+    pub fn resolve_with(
+        &self,
+        path: &str,
+        source: ChangeSource,
+        decide: impl FnOnce(&crate::sync::conflicts::Conflict) -> Result<Option<String>, OpError>,
+    ) -> Result<(), OpError> {
         let changed = {
             let mut engine = lock(&self.shared.engine);
-            engine.resolve(path, content).map_err(|e| match e {
+            let conflict = self
+                .live_conflict(&engine, path)
+                .ok_or_else(|| OpError::Conflict(format!("`{path}` isn't in conflict")))?;
+            let content = decide(&conflict)?;
+            let by = match source {
+                ChangeSource::Agent => vec!["agent"],
+                _ => vec!["person"],
+            };
+            engine.resolve(path, content.as_deref(), &by).map_err(|e| match e {
                 SyncError::Setup(m) => OpError::Invalid(m),
                 other => OpError::from(other),
             })?;
             self.shared.rescan_locked()
         };
-        self.shared.announce(changed, ChangeSource::Local);
+        // The resolved file is news even when its text didn't change here
+        // (ours kept whole): its hold is gone.
+        let mut changed = changed;
+        if !changed.iter().any(|p| p == path) {
+            changed.push(path.to_string());
+        }
+        // Committed already: announced, but nothing for the commit clock.
+        self.shared.sink.changed(&changed, source);
         let mut s = lock(&self.shared.sched);
         s.sync_requested = true;
         self.shared.wake.notify_all();

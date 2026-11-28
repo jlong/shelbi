@@ -85,9 +85,10 @@ state.
   can and merges when it can't, resolving Markdown edits to different parts of
   a document on its own.
 - **Conflicts**: a document the merge can't resolve is held. Sync leaves it
-  alone, both apps show a notice, and you pick your version, theirs, or a mix
-  of the two, hunk by hunk. The resolution is committed as "Resolve merge
-  conflicts".
+  alone, both apps show a notice, and the conflict inspector shows the two
+  versions side by side: you pick yours, theirs, or a mix of the two, hunk by
+  hunk (`shelbi wiki resolve <path> --ours` or `--theirs` takes a whole side).
+  The resolution is committed as "Resolve merge conflicts".
 - **Manual sync**: with `sync: manual` the hub commits, pulls and pushes only
   when asked (`shelbi wiki sync now`, or **Sync now** in the apps).
 

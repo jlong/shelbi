@@ -376,19 +376,25 @@ fn answer_for(svc: &WikiService, source_kind: WikiSource, project: Option<&str>,
         }
         WikiRequest::Conflict { path } => svc
             .conflict(&path)
-            .map(|c| {
-                WikiReply::Conflict(WikiConflict {
-                    path: c.path,
-                    base: c.base,
-                    ours: c.ours,
-                    theirs: c.theirs,
-                    detected_at: c.detected_at,
-                })
-            })
+            .map(|c| WikiReply::Conflict(wire_conflict(c)))
             .ok_or_else(|| OpError::Conflict(format!("`{path}` isn't in conflict"))),
-        WikiRequest::Resolve { path, content } => svc.resolve(&path, content.as_deref()).map(|()| WikiReply::Done),
+        WikiRequest::Resolve { path, resolution, by } => svc
+            .resolve_with(&path, source(by), |held| {
+                shelbi_app::wiki_conflict::resolve(&wire_conflict(held.clone()), &resolution).map_err(OpError::Conflict)
+            })
+            .map(|()| WikiReply::Done),
     };
     result.unwrap_or_else(op_failure)
+}
+
+fn wire_conflict(c: shelbi_wiki::sync::conflicts::Conflict) -> WikiConflict {
+    WikiConflict {
+        path: c.path,
+        base: c.base,
+        ours: c.ours,
+        theirs: c.theirs,
+        detected_at: c.detected_at,
+    }
 }
 
 fn source(by: Author) -> ChangeSource {
@@ -924,6 +930,125 @@ mod tests {
 
         stop_all();
         GIT_ENV.with(|e| e.borrow_mut().clear());
+    }
+
+    struct NoSink;
+
+    impl EventSink for NoSink {
+        fn changed(&self, _: &[String], _: ChangeSource) {}
+        fn status(&self, _: &SyncStatus) {}
+    }
+
+    /// A conflict settled per hunk through [`answer_with`]: the client's
+    /// choices, made on the [`WikiRequest::Conflict`] it read, applied to the
+    /// hub's own diff of the sides; stale choices are refused.
+    #[test]
+    fn a_held_document_resolves_per_hunk_through_the_hub() {
+        use shelbi_app::wiki::Resolution;
+        use shelbi_app::wiki_conflict::{diff_of, revision, Side};
+
+        let _home = crate::test_lock::isolated_home();
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let gitconfig = root.join("gitconfig");
+        std::fs::write(
+            &gitconfig,
+            "[user]\n\tname = Test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n\
+             [commit]\n\tgpgsign = false\n[core]\n\thooksPath = /dev/null\n",
+        )
+        .unwrap();
+        let env = vec![
+            ("GIT_CONFIG_GLOBAL".to_string(), gitconfig.to_string_lossy().into_owned()),
+            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ];
+        git(&env, &root, &["init", "-q", "--bare", "origin.git"]);
+        git(&env, &root, &["clone", "-q", "origin.git", "hub"]);
+        let hub = root.join("hub");
+        std::fs::write(hub.join("main.txt"), "code\n").unwrap();
+        git(&env, &hub, &["add", "-A"]);
+        git(&env, &hub, &["commit", "-q", "-m", "init"]);
+        git(&env, &hub, &["push", "-q", "origin", "main"]);
+        let spec = ServiceSpec {
+            layout: Layout::branch(&hub, root.join("wiki"), "docs/planning"),
+            name: "Demo".into(),
+            auto: false,
+            conflicts_file: root.join("conflicts.json"),
+            timing: Timing::default(),
+            git_env: env.clone(),
+            pull_requests: None,
+        };
+        let (svc, _) = WikiService::start(spec, Arc::new(NoSink)).unwrap();
+        let ask = |req| answer_with(&svc, WikiSource::Branch, req);
+        let write = |content: &str| WikiRequest::Write {
+            path: "Plan.md".into(),
+            content: content.into(),
+            section: None,
+            by: Author::Person,
+        };
+        let sync = || match ask(WikiRequest::Sync(SyncOp::Now)) {
+            WikiReply::Status(s) => s,
+            other => panic!("{other:?}"),
+        };
+
+        let base = "# Plan\n\n## Alpha\n\nAlpha.\n\n## Beta\n\nBeta.\n";
+        assert_eq!(ask(write(base)), WikiReply::Done);
+        assert_eq!(sync().state, SyncState::Synced);
+        // Both sections change on both sides: the merge can't combine them.
+        git(&env, &root, &["clone", "-q", "-b", "docs/planning", "origin.git", "other"]);
+        let other = root.join("other");
+        let theirs = base.replace("Alpha.", "Alpha theirs.").replace("Beta.", "Beta theirs.");
+        std::fs::write(other.join("Plan.md"), &theirs).unwrap();
+        git(&env, &other, &["commit", "-qam", "elsewhere"]);
+        git(&env, &other, &["push", "-q", "origin", "docs/planning"]);
+        let ours = base.replace("Alpha.", "Alpha ours.").replace("Beta.", "Beta ours.");
+        assert_eq!(ask(write(&ours)), WikiReply::Done);
+        let status = sync();
+        assert_eq!((status.state.clone(), status.conflicts.clone()), (SyncState::Conflict, vec!["Plan.md".to_string()]));
+
+        let conflict = match ask(WikiRequest::Conflict { path: "Plan.md".into() }) {
+            WikiReply::Conflict(c) => c,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(diff_of(&conflict).hunks.len(), 2);
+        let pick = Resolution::Hunks {
+            choices: vec![Side::Theirs, Side::Ours],
+            revision: revision(&conflict),
+        };
+
+        // An edit since the read makes the choices stale: refused, still held.
+        let edited = ours.replace("## Beta", "## Beta (edited)");
+        assert_eq!(ask(write(&edited)), WikiReply::Done);
+        match ask(WikiRequest::Resolve { path: "Plan.md".into(), resolution: pick, by: Author::Person }) {
+            WikiReply::Failed(f) => assert_eq!(f.kind, FailureKind::Conflict, "{}", f.message),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(ask(write(&ours)), WikiReply::Done);
+
+        let conflict = match ask(WikiRequest::Conflict { path: "Plan.md".into() }) {
+            WikiReply::Conflict(c) => c,
+            other => panic!("{other:?}"),
+        };
+        let pick = Resolution::Hunks {
+            choices: vec![Side::Theirs, Side::Ours],
+            revision: revision(&conflict),
+        };
+        assert_eq!(
+            ask(WikiRequest::Resolve { path: "Plan.md".into(), resolution: pick, by: Author::Person }),
+            WikiReply::Done
+        );
+        let status = sync();
+        assert_eq!(status.state, SyncState::Synced, "{status:?}");
+        assert!(status.conflicts.is_empty());
+        let merged = base.replace("Alpha.", "Alpha theirs.").replace("Beta.", "Beta ours.");
+        assert_eq!(git(&env, &root.join("origin.git"), &["show", "docs/planning:Plan.md"]), merged);
+        assert_eq!(
+            git(&env, &root.join("origin.git"), &["log", "-1", "--format=%s", "docs/planning"]).trim(),
+            "Resolve merge conflicts"
+        );
+        match ask(WikiRequest::Resolve { path: "Plan.md".into(), resolution: Resolution::Ours, by: Author::Person }) {
+            WikiReply::Failed(f) => assert_eq!(f.kind, FailureKind::Conflict),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

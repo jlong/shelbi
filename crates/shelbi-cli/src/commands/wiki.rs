@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use shelbi_app::wiki::{
-    Author, EntryKind, FailureKind, NodeKind, SyncOp, WikiEntry, WikiFailure, WikiNode, WikiReply, WikiRequest,
-    WikiStatus,
+    Author, EntryKind, FailureKind, NodeKind, Resolution, SyncOp, WikiConflict, WikiEntry, WikiFailure, WikiNode,
+    WikiReply, WikiRequest, WikiStatus,
 };
 use shelbi_core::{WikiConfig, WikiSource};
 
@@ -59,6 +59,7 @@ TASKS
 
 SYNC
   sync        Show the sync's status, or sync now, pause, resume
+  resolve     Settle a document the sync couldn't merge (--ours, --theirs)
   init        Set up the wiki (an orphan branch, or a repo folder)
 
 APP INTEGRATION
@@ -83,6 +84,7 @@ EXAMPLES
   shelbi wiki search \"PIX-\\d+\" --regex
   shelbi wiki tasks Plans/ --pending               Open tasks across a folder
   shelbi wiki sync now
+  shelbi wiki resolve Plans/auth.md --theirs       Settle a conflict
 
 Paths are relative to the wiki's root. Every read and write goes through the
 hub, the wiki's single writer, which commits and syncs on its own.
@@ -405,6 +407,29 @@ EXAMPLES
     Sync {
         #[arg(value_enum, default_value_t = SyncAction::Status)]
         action: SyncAction,
+    },
+    /// Settle a document the sync couldn't merge: keep ours or take theirs.
+    #[command(after_help = "\
+A document edited here and elsewhere in a way the merge can't combine is held:
+origin keeps the other version, this machine keeps ours, and the document
+stays out of the sync until it's resolved. `shelbi wiki sync status` lists the
+held documents. Without --ours or --theirs this shows the document's hunks,
+the runs of lines where the two versions differ; the Wiki in the desktop app
+and the TUI can choose a side per hunk. Resolving commits \"Resolve merge
+conflicts\" and syncs.
+
+EXAMPLES
+  shelbi wiki resolve Plans/auth.md            Show the hunks
+  shelbi wiki resolve Plans/auth.md --ours     Keep this machine's version
+  shelbi wiki resolve Plans/auth.md --theirs   Take the version from elsewhere")]
+    Resolve {
+        path: String,
+        /// Keep this machine's version whole.
+        #[arg(long, conflicts_with = "theirs")]
+        ours: bool,
+        /// Take the version from elsewhere whole.
+        #[arg(long)]
+        theirs: bool,
     },
     /// Set up the project's wiki: write the project YAML's `wiki:` block and
     /// have the hub create it.
@@ -907,7 +932,99 @@ pub fn execute(hub: &dyn Hub, input: &dyn Input, cmd: WikiCmd, json: bool) -> Ou
                 other => Err(unexpected(other)),
             }
         }
+        WikiCmd::Resolve { path, ours, theirs } => {
+            let path = clean(&path)?;
+            let resolution = match (ours, theirs) {
+                (true, _) => Resolution::Ours,
+                (_, true) => Resolution::Theirs,
+                _ => {
+                    let conflict = match hub.ask(WikiRequest::Conflict { path: path.clone() }) {
+                        WikiReply::Conflict(c) => c,
+                        other => return Err(unexpected(other)),
+                    };
+                    return Ok(render_conflict(&conflict, json));
+                }
+            };
+            let side = if ours { "ours" } else { "theirs" };
+            expect_done(hub.ask(WikiRequest::Resolve {
+                path: path.clone(),
+                resolution,
+                by,
+            }))?;
+            Ok(done(
+                json,
+                &format!("Resolved {path} ({side}); committed \"Resolve merge conflicts\""),
+                json!({ "resolved": path, "side": side }),
+            ))
+        }
         WikiCmd::Init { source, branch, path } => init(hub, source.map(WikiSource::from), branch, path, json),
+    }
+}
+
+/// `resolve <path>` without a side: the held document's hunks, ours above
+/// theirs, with a few lines of context.
+pub fn render_conflict(c: &WikiConflict, json: bool) -> String {
+    use shelbi_app::wiki_conflict::{context_shown, diff_of, hidden_label, revision};
+    let diff = diff_of(c);
+    if json {
+        let hunks: Vec<Value> = diff
+            .hunks
+            .iter()
+            .map(|h| json!({ "context_before": h.context_before, "ours": h.ours, "theirs": h.theirs }))
+            .collect();
+        return pretty(&json!({
+            "path": c.path,
+            "detected_at": c.detected_at,
+            "ours_deleted": c.ours.is_none(),
+            "theirs_deleted": c.theirs.is_none(),
+            "revision": revision(c),
+            "hunks": hunks,
+            "trailing_context": diff.trailing_context,
+        }));
+    }
+    let hunks = match diff.hunks.len() {
+        1 => "1 hunk".to_string(),
+        n => format!("{n} hunks"),
+    };
+    let mut out = format!("{} couldn't be merged ({hunks})\n", c.path);
+    if c.ours.is_none() {
+        out.push_str("Ours: deleted here\n");
+    }
+    if c.theirs.is_none() {
+        out.push_str("Theirs: deleted elsewhere\n");
+    }
+    for (i, h) in diff.hunks.iter().enumerate() {
+        out.push_str(&format!("\n@@ hunk {} @@\n", i + 1));
+        let (context, hidden) = context_shown(&h.context_before, true);
+        if hidden > 0 {
+            out.push_str(&format!("  {}\n", hidden_label(hidden)));
+        }
+        for line in context {
+            out.push_str(&format!("  {line}\n"));
+        }
+        out.push_str("<<<<<<< ours\n");
+        for line in &h.ours {
+            out.push_str(&format!("{line}\n"));
+        }
+        out.push_str("=======\n");
+        for line in &h.theirs {
+            out.push_str(&format!("{line}\n"));
+        }
+        out.push_str(">>>>>>> theirs\n");
+    }
+    out.push_str(&format!(
+        "\nshelbi wiki resolve {} --ours | --theirs\n",
+        shell_word(&c.path)
+    ));
+    out
+}
+
+/// `path` as one shell word.
+fn shell_word(path: &str) -> String {
+    if path.chars().all(|ch| ch.is_ascii_alphanumeric() || "/._-".contains(ch)) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
     }
 }
 
@@ -1388,6 +1505,7 @@ pub fn render_status(s: &WikiStatus, json: bool) -> String {
         for c in &s.conflicts {
             out.push_str(&format!("  {c}\n"));
         }
+        out.push_str("Held out of the sync until resolved: shelbi wiki resolve <path> --ours | --theirs\n");
     }
     out
 }
@@ -1787,6 +1905,51 @@ mod tests {
         assert!(text.contains("  Plans/a.md"), "{text}");
         let v: Value = serde_json::from_str(&render_status(&status, true)).unwrap();
         assert_eq!(v["state"], "conflict");
+        assert_eq!(v["conflicts"][0], "Plans/a.md");
+    }
+
+    fn held() -> WikiConflict {
+        WikiConflict {
+            path: "Plans/a.md".into(),
+            base: Some("# A\n\nBase.\n".into()),
+            ours: Some("# A\n\nOurs.\n".into()),
+            theirs: Some("# A\n\nTheirs.\n".into()),
+            detected_at: "2026-11-27T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn resolve_takes_a_whole_side_or_shows_the_hunks() {
+        let hub = FakeHub::new(|req| match req {
+            WikiRequest::Conflict { .. } => WikiReply::Conflict(held()),
+            _ => WikiReply::Done,
+        });
+        let out = exec(&hub, None, &["resolve", "/Plans/a.md", "--theirs"]).unwrap();
+        assert!(out.starts_with("Resolved Plans/a.md (theirs)"), "{out}");
+        assert!(matches!(
+            &hub.asked.borrow()[0],
+            WikiRequest::Resolve { path, resolution: Resolution::Theirs, .. } if path == "Plans/a.md"
+        ));
+        exec(&hub, None, &["resolve", "Plans/a.md", "--ours"]).unwrap();
+        assert!(matches!(&hub.asked.borrow()[1], WikiRequest::Resolve { resolution: Resolution::Ours, .. }));
+
+        // No side: the hunks, and nothing resolved.
+        let out = exec(&hub, None, &["resolve", "Plans/a.md"]).unwrap();
+        assert!(out.contains("Plans/a.md couldn't be merged (1 hunk)"), "{out}");
+        assert!(out.contains("<<<<<<< ours\nOurs.\n=======\nTheirs.\n>>>>>>> theirs"), "{out}");
+        assert!(out.contains("shelbi wiki resolve Plans/a.md --ours | --theirs"), "{out}");
+        assert_eq!(hub.asked.borrow().len(), 3);
+        let v: Value = serde_json::from_str(&exec(&hub, None, &["resolve", "Plans/a.md", "--agent"]).unwrap()).unwrap();
+        assert_eq!(v["hunks"][0]["theirs"][0], "Theirs.");
+        assert_eq!(v["revision"], shelbi_app::wiki_conflict::revision(&held()));
+    }
+
+    #[test]
+    fn resolve_refuses_both_sides_and_keeps_the_conflict_exit_code() {
+        use clap::Parser;
+        assert!(Harness::try_parse_from(["wiki", "resolve", "a.md", "--ours", "--theirs"]).is_err());
+        let hub = FakeHub::new(|_| WikiReply::failed(FailureKind::Conflict, "`a.md` isn't in conflict"));
+        assert_eq!(exec(&hub, None, &["resolve", "a.md", "--ours"]).unwrap_err().kind.exit_code(), 4);
     }
 
     #[test]

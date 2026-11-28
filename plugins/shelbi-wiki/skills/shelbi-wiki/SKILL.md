@@ -138,12 +138,16 @@ more than one task fails, so pass enough of the text to be unique.
 shelbi wiki sync                              # status: synced, pending, syncing, offline, conflict
 shelbi wiki sync now                          # commit, pull and push now, and wait
 shelbi wiki diff                              # the change not yet committed
+shelbi wiki resolve Plans/auth.md             # a held document's hunks (ours vs theirs)
+shelbi wiki resolve Plans/auth.md --theirs    # settle it: --ours keeps this machine's
 ```
 
 You don't need to sync after writing; the hub does it within seconds. Run
 `sync now` only when someone else must see the change before you go on (on
-another machine, say). On `conflict`, tell the user: they resolve it in the
-app.
+another machine, say). On `conflict`, `sync` lists the held documents. Don't
+pick a side yourself unless the user asked you to: tell them, and they
+resolve it in the app (side by side, hunk by hunk) or with `shelbi wiki
+resolve`.
 
 ## Exit codes
 

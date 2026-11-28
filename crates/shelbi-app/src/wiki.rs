@@ -137,9 +137,33 @@ pub enum WikiRequest {
     Sync(SyncOp),
     /// A held file's three sides. Answers [`WikiReply::Conflict`].
     Conflict { path: String },
-    /// Resolve a held file with `content` (`None` deletes it), commit it
-    /// as "Resolve merge conflicts", and sync.
-    Resolve { path: String, content: Option<String> },
+    /// Resolve a held file as `resolution` says, commit it as "Resolve
+    /// merge conflicts" (even when the result is what's committed), stop
+    /// holding it, and sync.
+    Resolve {
+        path: String,
+        resolution: Resolution,
+        by: Author,
+    },
+}
+
+/// How [`WikiRequest::Resolve`] settles a held file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Resolution {
+    /// Keep this machine's version whole (a deletion stays deleted).
+    Ours,
+    /// Take the version from elsewhere whole.
+    Theirs,
+    /// One side per hunk of [`crate::wiki_conflict::diff_of`] the conflict,
+    /// in order. `revision` is [`crate::wiki_conflict::revision`] of the
+    /// conflict the choices were made on; the hub refuses them when its
+    /// sides have moved on since.
+    Hunks {
+        choices: Vec<crate::wiki_conflict::Side>,
+        revision: String,
+    },
+    /// This text (`None` deletes the file).
+    Content(Option<String>),
 }
 
 /// Who a write is from, for the `source` the change is announced with.
@@ -360,7 +384,9 @@ pub struct WikiCommit {
 }
 
 /// A held file's sides, for [`WikiReply::Conflict`]. `None` is "deleted on
-/// that side" (or, for `base`, "added on both").
+/// that side" (or, for `base`, "added on both"). `ours` is the file as it
+/// is on the hub's machine now (edits made while it's held included);
+/// `theirs` what is committed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WikiConflict {
     pub path: String,

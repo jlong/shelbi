@@ -24,6 +24,7 @@ shelbi wiki uncheck <PATH> <TEXT> [--section <HEADING>]
 shelbi wiki diff    [<PATH>]
 shelbi wiki log     [<PATH>] [-n <N>]
 shelbi wiki sync    [status|now|pause|resume]
+shelbi wiki resolve <PATH> [--ours | --theirs]
 shelbi wiki open    [<PATH>] [--no-launch]
 shelbi wiki init
 ```
@@ -229,6 +230,22 @@ Last synced:  2026-11-27T10:42:13-08:00
 
 `sync now` commits, pulls and pushes at once and waits for it. `sync pause`
 stops syncing on the clock until `sync resume`; changes are still kept.
+
+### resolve
+
+A document edited here and elsewhere in a way the merge can't combine is held:
+origin keeps the other version, this machine keeps yours, and the document stays
+out of the sync until it's resolved. `sync status` lists held documents under
+`Conflicts:`.
+
+```sh
+shelbi wiki resolve Plans/auth.md            # the hunks: where the versions differ
+shelbi wiki resolve Plans/auth.md --ours     # keep this machine's version
+shelbi wiki resolve Plans/auth.md --theirs   # take the version from elsewhere
+```
+
+Resolving commits "Resolve merge conflicts" and syncs. To mix the two versions
+hunk by hunk, use the conflict inspector in the desktop app or the TUI.
 
 ## App integration
 

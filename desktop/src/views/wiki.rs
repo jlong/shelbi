@@ -41,7 +41,9 @@
 //! A project without a wiki shows the set-up screen in the main area: the
 //! two sources, and one click sets either up (the shared Settings ▸ Wiki
 //! form's Set up, [`WikiForm`]). The open document is edited in place, its
-//! saves going through the hub ([`doc`]).
+//! saves going through the hub ([`doc`]). A document the sync couldn't merge
+//! is resolved in the conflict inspector ([`conflict`]), from the notice over
+//! the footer or the bar over the document.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +71,8 @@ use crate::theme::Theme;
 
 #[path = "wiki_doc.rs"]
 pub mod doc;
+#[path = "wiki_conflict.rs"]
+pub mod conflict;
 
 use doc::DocMenu;
 
@@ -211,6 +215,8 @@ pub struct WikiView {
     doc_menu_anchor: style::Anchor,
     /// The save debounce's wake.
     save_timer: Option<Task<()>>,
+    /// The conflict inspector, over the main area in place of the document.
+    conflict: Option<conflict::ConflictPane>,
     setup: WikiForm,
     /// Increments on every reload, so a stale answer is dropped.
     generation: u64,
@@ -298,6 +304,7 @@ impl WikiView {
             doc_menu: None,
             doc_menu_anchor: Default::default(),
             save_timer: None,
+            conflict: None,
             setup: WikiForm::default(),
             generation: 0,
             shown: false,
@@ -417,6 +424,7 @@ impl WikiView {
             match wake {
                 WikiWake::Changed { paths, source } => {
                     tree = true;
+                    self.conflict_changed(&paths, window, cx);
                     if self.open.as_ref().is_some_and(|open| paths.iter().any(|p| p == open)) {
                         doc = true;
                         // Who changed it: the change says (a pull's commit
@@ -483,6 +491,7 @@ impl WikiView {
                 WikiReply::Failed(f) => Err(f.message),
                 other => Err(format!("the hub answered {other:?}")),
             });
+            this.conflict_status_landed();
             let set_up = matches!(&this.status, Some(Ok(s)) if s.set_up);
             if set_up && (!was_set_up || !this.tree.is_loaded()) {
                 this.read_tree(window, cx);
@@ -623,6 +632,8 @@ impl WikiView {
 
     /// Show the document at `path` in the main area.
     pub fn open_doc(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Picking a document leaves the inspector.
+        self.conflict = None;
         if self.open.as_deref() != Some(path) {
             // What's typed in the one open now saves first.
             self.flush_save(window, cx);
@@ -1255,6 +1266,7 @@ impl WikiView {
             None => note("wiki-main-loading", "Loading the wiki…", None, &theme).into_any_element(),
             Some(Err(e)) => note("wiki-main-error", "Couldn't reach the wiki", Some(e.clone()), &theme).into_any_element(),
             Some(Ok(s)) if !s.set_up => self.render_setup(&theme, cx),
+            Some(Ok(_)) if self.conflict.is_some() => self.render_conflict(&theme, cx),
             Some(Ok(_)) => match &self.open {
                 Some(path) => self.render_doc(path.clone(), &theme, cx),
                 None => {
@@ -1761,6 +1773,7 @@ impl WikiView {
             .flex_col()
             .flex_none()
             .children(notice)
+            .children(self.render_conflict_notice(theme, cx))
             .children(undo)
             .child(
                 div()
@@ -1929,6 +1942,10 @@ impl Render for WikiView {
 #[path = "wiki_doc_tests.rs"]
 mod doc_tests;
 
+#[cfg(test)]
+#[path = "wiki_conflict_tests.rs"]
+mod conflict_tests;
+
 /// A fake hub for the tests and the visual check: a wiki in memory.
 #[cfg(any(test, feature = "visual-check"))]
 pub(crate) mod fake {
@@ -1954,6 +1971,8 @@ pub(crate) mod fake {
         pub commits: BTreeMap<String, Vec<WikiCommit>>,
         /// Refuse writes with this.
         pub refuse_writes: Option<String>,
+        /// Held documents' sides (`ours` is the entry's text).
+        pub conflicts: BTreeMap<String, shelbi_app::wiki::WikiConflict>,
         pub asked: Vec<WikiRequest>,
         trashed: Vec<Vec<(String, Entry)>>,
     }
@@ -1985,6 +2004,31 @@ pub(crate) mod fake {
             }
             hub.icons.insert("Research".into(), "🔬".into());
             hub
+        }
+
+        /// Hold `path` (a document of the sample): its text is ours, and
+        /// `theirs` came from elsewhere.
+        pub(crate) fn hold(&mut self, path: &str, ours: &str, theirs: &str) {
+            let title = ours.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or(path).to_string();
+            self.entries.insert(path.into(), (false, title, ours.into()));
+            self.conflicts.insert(
+                path.into(),
+                shelbi_app::wiki::WikiConflict {
+                    path: path.into(),
+                    base: None,
+                    ours: Some(ours.into()),
+                    theirs: Some(theirs.into()),
+                    detected_at: "2026-11-27T00:00:00Z".into(),
+                },
+            );
+            self.sync_conflicts();
+        }
+
+        fn sync_conflicts(&mut self) {
+            if let Some(status) = self.status.as_mut() {
+                status.conflicts = self.conflicts.keys().cloned().collect();
+                status.state = if status.conflicts.is_empty() { SyncState::Synced } else { SyncState::Conflict };
+            }
         }
 
         fn nodes(&self, under: &str) -> Vec<WikiNode> {
@@ -2100,6 +2144,37 @@ pub(crate) mod fake {
                         .collect();
                     self.trashed.push(gone);
                     WikiReply::Trashed { token: format!("t{}", self.trashed.len()) }
+                }
+                WikiRequest::Conflict { path } => match self.conflicts.get(&path) {
+                    Some(c) => {
+                        let mut c = c.clone();
+                        c.ours = self.entries.get(&path).map(|e| e.2.clone());
+                        WikiReply::Conflict(c)
+                    }
+                    None => WikiReply::failed(shelbi_app::wiki::FailureKind::Conflict, format!("`{path}` isn't in conflict")),
+                },
+                WikiRequest::Resolve { path, resolution, .. } => {
+                    let Some(mut held) = self.conflicts.get(&path).cloned() else {
+                        return WikiReply::failed(shelbi_app::wiki::FailureKind::Conflict, format!("`{path}` isn't in conflict"));
+                    };
+                    held.ours = self.entries.get(&path).map(|e| e.2.clone());
+                    match shelbi_app::wiki_conflict::resolve(&held, &resolution) {
+                        Ok(content) => {
+                            self.conflicts.remove(&path);
+                            self.sync_conflicts();
+                            match content {
+                                Some(text) => {
+                                    let title = self.entries.get(&path).map(|e| e.1.clone()).unwrap_or_default();
+                                    self.entries.insert(path, (false, title, text));
+                                }
+                                None => {
+                                    self.entries.remove(&path);
+                                }
+                            }
+                            WikiReply::Done
+                        }
+                        Err(e) => WikiReply::failed(shelbi_app::wiki::FailureKind::Conflict, e),
+                    }
                 }
                 WikiRequest::Untrash { token, .. } => {
                     let ix: usize = token[1..].parse().unwrap();

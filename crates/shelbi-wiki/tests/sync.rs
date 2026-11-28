@@ -370,6 +370,80 @@ fn an_unresolvable_edit_is_held_reported_and_resolved() {
     assert_eq!(fx.origin_log("docs/planning")[0], "Resolve merge conflicts");
 }
 
+/// A service holding `Plan.md`: "Ours." here, "Theirs." on origin.
+fn held_setup(fx: &Fixture) -> (WikiService, Arc<Recorder>, String, String) {
+    let (svc, sink, other) = diverge_setup(fx, TWO_SECTIONS);
+    let ours = TWO_SECTIONS.replace("Alpha text.", "Ours.");
+    svc.write("Plan.md", &ours, ChangeSource::Local).unwrap();
+    let theirs = TWO_SECTIONS.replace("Alpha text.", "Theirs.");
+    push_from(fx, &other, "Plan.md", &theirs);
+    assert_eq!(svc.sync_now(SYNC).status, SyncStatus::Conflict);
+    (svc, sink, ours, theirs)
+}
+
+fn origin_trailers(fx: &Fixture) -> String {
+    fx.git(&fx.origin(), &["log", "-1", "--format=%(trailers:key=Shelbi-By,valueonly)", "docs/planning"])
+}
+
+#[test]
+fn keeping_ours_whole_commits_it_and_syncs() {
+    let fx = Fixture::new();
+    let (svc, _sink, ours, _) = held_setup(&fx);
+    svc.resolve_with("Plan.md", ChangeSource::Local, |held| {
+        assert_eq!(held.ours.as_deref(), Some(ours.as_str()));
+        Ok(held.ours.clone())
+    })
+    .unwrap();
+    let status = svc.sync_now(SYNC);
+    assert_eq!(status.status, SyncStatus::Synced, "{status:?}");
+    assert!(status.conflicts.is_empty());
+    assert_eq!(fx.origin_file("docs/planning", "Plan.md").unwrap(), ours);
+    assert_eq!(fx.origin_log("docs/planning")[0], "Resolve merge conflicts");
+    assert_eq!(origin_trailers(&fx).trim(), "person");
+}
+
+#[test]
+fn taking_theirs_whole_still_commits_the_resolution() {
+    let fx = Fixture::new();
+    let (svc, sink, _, theirs) = held_setup(&fx);
+    svc.resolve_with("Plan.md", ChangeSource::Agent, |held| Ok(held.theirs.clone())).unwrap();
+    // The worktree takes theirs, and the clients hear of it.
+    assert_eq!(std::fs::read_to_string(fx.worktree().join("Plan.md")).unwrap(), theirs);
+    assert!(sink
+        .changes
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, s)| p.contains(&"Plan.md".to_string()) && *s == ChangeSource::Agent));
+    let status = svc.sync_now(SYNC);
+    assert_eq!(status.status, SyncStatus::Synced, "{status:?}");
+    assert_eq!(fx.origin_file("docs/planning", "Plan.md").unwrap(), theirs);
+    // Nothing changed in the file, but the history says it was settled.
+    assert_eq!(fx.origin_log("docs/planning")[0], "Resolve merge conflicts");
+    assert_eq!(origin_trailers(&fx).trim(), "agent");
+}
+
+#[test]
+fn an_edit_while_held_is_ours_and_a_refused_resolution_keeps_the_hold() {
+    let fx = Fixture::new();
+    let (svc, _sink, ours, theirs) = held_setup(&fx);
+    // Ours is the file as it is now, not as it was when the pull found it.
+    let edited = ours.replace("Beta text.", "Beta, edited while held.");
+    svc.write("Plan.md", &edited, ChangeSource::Local).unwrap();
+    assert_eq!(svc.conflict("Plan.md").unwrap().ours.as_deref(), Some(edited.as_str()));
+
+    let refused = svc.resolve_with("Plan.md", ChangeSource::Local, |_| {
+        Err(shelbi_wiki::service::OpError::Conflict("stale".into()))
+    });
+    assert!(refused.is_err());
+    assert_eq!(svc.status().conflicts, vec!["Plan.md".to_string()]);
+    assert_eq!(std::fs::read_to_string(fx.worktree().join("Plan.md")).unwrap(), edited, "nothing written");
+    assert_eq!(fx.origin_file("docs/planning", "Plan.md").unwrap(), theirs);
+
+    // A file that isn't held can't be resolved.
+    assert!(svc.resolve("README.md", Some("# x\n")).is_err());
+}
+
 #[test]
 fn an_unreachable_remote_reads_offline() {
     let fx = Fixture::new();

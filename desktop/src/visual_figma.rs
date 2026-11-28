@@ -1398,7 +1398,9 @@ impl Run {
     /// context menu; `wiki-rename` renaming a document in place;
     /// `wiki-undo` after a delete; `wiki-history` with the open document's
     /// ⋯ ▸ Show History; `wiki-changed` with the changed-elsewhere bar over
-    /// an edited document; `wiki-palette` with the palette finding
+    /// an edited document; `wiki-conflict-held` with a held document's bar
+    /// and the footer's notice, and `wiki-conflict` with its inspector;
+    /// `wiki-palette` with the palette finding
     /// documents; `wiki-setup` for a project with no wiki.
     /// `SHELBI_VISUAL_ONLY=wiki` renders just these.
     fn wiki(&mut self) {
@@ -1543,6 +1545,46 @@ impl Run {
             .unwrap();
         self.settle(handle);
         self.save(handle, "wiki-changed");
+
+        // A document the sync couldn't merge: the notice and the bar, then
+        // the inspector with one change chosen.
+        let hc = hub(true);
+        {
+            let base = "# OpenCode integration\n\n## Context\n\nOpenCode is a terminal coding agent. Shelbi runs it like Claude Code and Codex.\n\n## Goals\n\n- [x] Launch OpenCode from a workspace\n- [ ] Awareness events from its plugin\n\n## Decisions\n\n1. The config layer lives in `.shelbi/opencode/`.\n2. Models come from the user's own OpenCode config.\n";
+            let ours = base
+                .replace("Shelbi runs it like Claude Code and Codex.", "Shelbi runs it like Claude Code and Codex, in its own session.")
+                .replace("- [ ] Awareness events from its plugin\n", "- [x] Awareness events from its plugin\n- [ ] Usage-limit detection\n");
+            let theirs = base
+                .replace("Shelbi runs it like Claude Code and Codex.", "Shelbi runs it as it runs every agent: one session, the shared preamble.")
+                .replace("2. Models come from the user's own OpenCode config.", "2. Models are picked per workspace.");
+            hc.lock().unwrap().hold("Plans/opencode-integration.md", &ours, &theirs);
+        }
+        let (handle, wiki, _) = open_wiki(self, &hc);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| v.reveal("Plans/opencode-integration.md", window, cx))
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-conflict-held");
+        let (handle, wiki, _) = open_wiki(self, &hc);
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                wiki.update(cx, |v, cx| {
+                    v.reveal("Plans/opencode-integration.md", window, cx);
+                    v.inspect("Plans/opencode-integration.md", window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        handle
+            .update(&mut self.cx, |_, _, cx| {
+                use shelbi_app::wiki_conflict::Side;
+                wiki.update(cx, |v, cx| v.choose_for_visual(&[(0, Side::Theirs), (2, Side::Ours)], cx))
+            })
+            .unwrap();
+        self.settle(handle);
+        self.save(handle, "wiki-conflict");
 
         // The palette finds documents by title and text.
         let (handle, _, _) = open_wiki(self, &h);

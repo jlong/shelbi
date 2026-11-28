@@ -22,9 +22,14 @@
 //! one). Tree keys: ↑↓ / `j` `k` move, → / `l` open a folder (or step into
 //! it), ← / `h` close it (or step out), Enter opens a document (or toggles a
 //! folder), `n` a new document, `N` a new folder, `r` rename, `m` move, `d`
-//! delete (after a `y`), `/` filter, `e` edit, Esc back to the nav. In the
-//! document: the arrows, `j` `k`, Page Up/Down, Space, `g` `G` scroll, `e`
-//! edits, Esc goes back to the tree.
+//! delete (after a `y`), `/` filter, `e` edit, `c` resolve a conflict, Esc
+//! back to the nav. In the document: the arrows, `j` `k`, Page Up/Down,
+//! Space, `g` `G` scroll, `e` edits, `c` resolves a conflict, Esc goes back
+//! to the tree.
+//!
+//! A document the sync couldn't merge is held: the tree's footer says how
+//! many are, the open one shows a bar, and `c` opens the conflict inspector
+//! ([`conflict`]) in the main area.
 //!
 //! Every read and write goes through the project's hub (its wiki service is
 //! the single writer), off the UI thread: [`WikiPage::poll`] folds the
@@ -125,6 +130,10 @@ struct OpenDoc {
 
 /// A finished piece of hub work.
 enum Msg {
+    /// A held document's sides, for the inspector.
+    Conflict(String, WikiReply),
+    /// The inspector's Apply came back.
+    Resolved(String, WikiReply),
     Status(WikiReply),
     Tree(u64, WikiReply),
     Doc(u64, String, WikiReply),
@@ -147,6 +156,8 @@ pub(crate) struct WikiPage {
     /// Why the last status or tree read failed.
     error: Option<String>,
     doc: Option<OpenDoc>,
+    /// The conflict inspector, over the main area in place of the document.
+    conflict: Option<conflict::ConflictView>,
     prompt: Option<Prompt>,
     /// The path a `d` asks to delete, until `y` (or anything else).
     confirm: Option<String>,
@@ -190,6 +201,7 @@ impl WikiPage {
             status: None,
             error: None,
             doc: None,
+            conflict: None,
             prompt: None,
             confirm: None,
             filtering: false,
@@ -234,6 +246,13 @@ impl WikiPage {
     /// tree again, and the open document when it's one of them.
     pub(crate) fn changed(&mut self, paths: &[String]) {
         self.read_tree();
+        let inspected = self.conflict.as_ref().filter(|c| !c.applying).map(|c| c.path.clone());
+        if let Some(path) = inspected {
+            if paths.is_empty() || paths.iter().any(|p| p == &path) {
+                // Its sides moved: choices made on the old ones don't hold.
+                self.inspect(&path);
+            }
+        }
         if let Some(path) = self.doc.as_ref().map(|d| d.path.clone()) {
             if paths.is_empty() || paths.iter().any(|p| p == &path) {
                 self.read_doc(&path);
@@ -363,9 +382,18 @@ impl WikiPage {
 
     fn apply(&mut self, msg: Msg) {
         match msg {
+            Msg::Conflict(path, reply) => self.take_conflict(path, reply),
+            Msg::Resolved(path, reply) => self.take_resolved(path, reply),
             Msg::Status(WikiReply::Status(s)) => {
                 let was_not_set_up = self.status.as_ref().is_some_and(|s| !s.set_up);
                 let now_set_up = s.set_up;
+                // Resolved elsewhere (the CLI, another client) while open.
+                if let Some(view) = self.conflict.as_ref().filter(|c| !c.applying) {
+                    if !s.conflicts.contains(&view.path) {
+                        self.note = Some(format!("{} was resolved", view.path));
+                        self.conflict = None;
+                    }
+                }
                 self.status = Some(s);
                 self.error = None;
                 // Just set up (elsewhere: `shelbi wiki init`, Settings): there's
@@ -718,6 +746,11 @@ impl WikiPage {
                 }
             }
             KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Char('c') => {
+                if self.inspect_conflict() {
+                    return WikiStep::FocusDoc;
+                }
+            }
             KeyCode::Char('e') => match selected {
                 Some(row) if !row.is_folder() => self.edit(row.path),
                 _ => {}
@@ -736,10 +769,16 @@ impl WikiPage {
 
     /// A key while the document has the keyboard.
     pub(crate) fn handle_doc_key(&mut self, k: KeyEvent) -> WikiStep {
+        if self.conflict.is_some() {
+            return self.handle_conflict_key(k);
+        }
         let page = self.doc_height.max(2) - 1;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Esc => return WikiStep::FocusTree,
+            KeyCode::Char('c') => {
+                self.inspect_conflict();
+            }
             KeyCode::Char('e') => {
                 if let Some(path) = self.doc_path().map(str::to_string) {
                     self.edit(path);
@@ -760,6 +799,9 @@ impl WikiPage {
 
     /// Scroll the document by `delta` lines (clamped when it draws).
     pub(crate) fn scroll_by(&mut self, delta: isize) {
+        if self.scroll_conflict(delta) {
+            return;
+        }
         if let Some(doc) = self.doc.as_mut() {
             doc.scroll = doc.scroll.saturating_add_signed(delta);
         }
@@ -851,6 +893,7 @@ impl WikiPage {
         if let Some(note) = self.note.as_ref().or(self.error.as_ref()) {
             footer.push(Line::from(Span::styled(note.clone(), Style::default().fg(p.ansi_gray))));
         }
+        footer.extend(self.conflict_notice());
         footer.push(self.status_line(chrono::Utc::now()));
         let footer_h = (footer.len() as u16 + 1).min(area.height.saturating_sub(y - area.y));
         let footer_top = bottom.saturating_sub(footer_h) + 1;
@@ -947,9 +990,14 @@ impl WikiPage {
         if area.width < 4 || area.height < 3 {
             return;
         }
+        if self.conflict.is_some() {
+            self.render_conflict(buf, area);
+            return;
+        }
         let p = palette();
         let x = area.x + 2;
         let w = area.width.saturating_sub(4) as usize;
+        let held = self.doc_path().is_some_and(|path| self.is_held(path));
         let Some(doc) = self.doc.as_mut() else {
             let text = if self.status.as_ref().is_some_and(|s| !s.set_up) {
                 "No wiki yet: press i in the tree to set one up."
@@ -969,8 +1017,20 @@ impl WikiPage {
         crumbs.push(title);
         let crumb = crumbs.join(" › ");
         buf.set_stringn(x, area.y, truncate_right(&crumb, w), w, Style::default().fg(p.ansi_gray));
-        buf.set_stringn(x, area.y + 1, "─".repeat(w), w, Style::default().fg(p.ansi_dark_gray));
-        let top = area.y + 2;
+        let mut top = area.y + 1;
+        if held {
+            let bar = Line::from(vec![
+                Span::styled(
+                    format!("⚠ {}", shelbi_app::wiki_conflict::DOC_NOTICE),
+                    Style::default().fg(p.ansi_red),
+                ),
+                Span::styled(" c resolves", Style::default().fg(p.ansi_gray)),
+            ]);
+            buf.set_line(x, top, &bar, w as u16);
+            top += 1;
+        }
+        buf.set_stringn(x, top, "─".repeat(w), w, Style::default().fg(p.ansi_dark_gray));
+        let top = top + 1;
         let height = area.bottom().saturating_sub(top) as usize;
         self.doc_height = height;
         let lines = match (&doc.content, &doc.error) {
@@ -1060,6 +1120,9 @@ fn ago(when: &str, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
         _ => format!("{}d ago", secs / 86_400),
     })
 }
+
+#[path = "wiki_conflict.rs"]
+mod conflict;
 
 #[cfg(test)]
 #[path = "wiki_tests.rs"]

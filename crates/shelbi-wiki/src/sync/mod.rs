@@ -36,6 +36,9 @@ pub const REMOTE: &str = "origin";
 /// `agent`), one line each.
 pub const BY_TRAILER: &str = "Shelbi-By";
 
+/// The subject of the commit that settles a held file.
+pub const RESOLVE_MESSAGE: &str = "Resolve merge conflicts";
+
 /// Why a sync step failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SyncError {
@@ -612,15 +615,33 @@ impl Engine {
 
     /// Resolve a held file with `content` (`None` deletes it): write it,
     /// commit it as "Resolve merge conflicts", and stop holding it. The
-    /// caller pushes.
-    pub fn resolve(&mut self, wiki_path: &str, content: Option<&str>) -> Result<Option<Committed>, SyncError> {
+    /// commit is made even when the result is what's committed already
+    /// (taking theirs whole), so the history says the conflict was settled.
+    /// `by` is the commit's [`BY_TRAILER`]s. The caller pushes.
+    pub fn resolve(&mut self, wiki_path: &str, content: Option<&str>, by: &[&str]) -> Result<Committed, SyncError> {
         if !self.conflicts.is_held(wiki_path) {
             return Err(SyncError::Setup(format!("`{wiki_path}` isn't in conflict")));
         }
         self.write_worktree(wiki_path, content)?;
         let repo_path = self.layout.repo_path(wiki_path);
         self.git.ok(&["add", "-A", "--", &format!(":(literal){repo_path}")])?;
-        let committed = self.commit_staged(Some("Resolve merge conflicts"), &[])?;
+        let committed = match self.commit_staged(Some(RESOLVE_MESSAGE), by)? {
+            Some(c) => c,
+            None => {
+                let mut full = RESOLVE_MESSAGE.to_string();
+                if !by.is_empty() {
+                    full.push('\n');
+                    for who in by {
+                        full.push_str(&format!("\n{BY_TRAILER}: {who}"));
+                    }
+                }
+                self.git.ok(&["commit", "-q", "--no-verify", "--allow-empty", "-m", &full])?;
+                Committed {
+                    message: RESOLVE_MESSAGE.to_string(),
+                    paths: vec![wiki_path.to_string()],
+                }
+            }
+        };
         self.conflicts.release(wiki_path).map_err(|e| io("releasing a conflict", e))?;
         Ok(committed)
     }
