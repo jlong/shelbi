@@ -8,12 +8,13 @@
 //! a heading, a checkbox) is one edit of the source and one undo step. Text
 //! an edit doesn't touch keeps its exact bytes, so opening, reading or
 //! clicking into a task never changes it, and any Markdown the editor doesn't
-//! render (tables, HTML, footnotes) shows as the source it is rather than
-//! being dropped or rewritten.
+//! render (HTML, footnotes) shows as the source it is rather than being
+//! dropped or rewritten.
 //!
 //! Fenced code blocks draw as rendered code ([`code`]): highlighted in the
 //! language their fence names, the fence lines hidden until the caret is in
-//! the block.
+//! the block. GFM tables draw as grids ([`table`]), their source shown
+//! while the caret is in the table.
 //!
 //! A client draws the rows ([`blocks::Row`]: display text, styles, the
 //! source each display offset stands for), turns pointer and keys into these
@@ -25,9 +26,11 @@ pub mod code;
 pub mod editor;
 mod history;
 pub mod inline;
+pub mod table;
 
-pub use blocks::{Chunk, Doc, Gap, Item, Marker, Row, RowKind};
+pub use blocks::{Align, Chunk, Doc, Gap, Item, Marker, Row, RowKind, TablePart, TableRow};
 pub use code::{fence_language, CodeHighlights};
+pub use table::column_widths;
 pub use editor::{
     next_boundary, prev_boundary, word_left, word_right, BlockKind, Editor, LinkTarget,
 };

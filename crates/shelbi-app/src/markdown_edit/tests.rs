@@ -74,8 +74,6 @@ fn unsupported_markdown_shows_as_its_source() {
     let e = Editor::markdown(ROUND_TRIP);
     let rows = shown(&e);
     for raw in [
-        "| a | b |",
-        "|---|---|",
         "<details><summary>more</summary>",
         "[^1]: a footnote",
     ] {

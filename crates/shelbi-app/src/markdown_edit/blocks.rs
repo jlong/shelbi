@@ -6,8 +6,14 @@
 //! syntax hidden, soft line breaks as spaces) and how display offsets map
 //! back to source bytes ([`Chunk`]s). Edits are made to the source; the doc
 //! is read again after each one. So whatever the subset understands is
-//! drawn formatted, and anything it doesn't (a table, HTML, a footnote)
-//! shows as the source it is, never dropped.
+//! drawn formatted, and anything it doesn't (HTML, a footnote) shows as the
+//! source it is, never dropped.
+//!
+//! A GFM table is one row per source line ([`RowKind::Table`]), each holding
+//! its cells as rows of their own (inline Markdown read the way a paragraph's
+//! is, offsets into the same source) and the table's column alignments. A
+//! view draws the lines as a grid while the caret is elsewhere and as the
+//! source they are while it's in the table ([`super::table`]).
 //!
 //! Blank lines separate rows and take no caret. A blank line with blank
 //! lines (or the document's edge) on both sides is an empty paragraph the
@@ -37,8 +43,45 @@ pub enum RowKind {
     Code,
     /// A thematic break (`---`).
     Rule,
-    /// Source the editor doesn't render (a table row, HTML), as written.
+    /// One line of a GFM table, as written; its cells read as Markdown.
+    Table(TableRow),
+    /// Source the editor doesn't render (HTML, a pipe line that isn't part
+    /// of a table), as written.
     Raw,
+}
+
+/// Which line of a table a [`RowKind::Table`] row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablePart {
+    Header,
+    /// The `| --- | :---: |` line under the header.
+    Delimiter,
+    Body,
+}
+
+/// A table column's alignment, from its delimiter cell (`:---`, `:---:`,
+/// `---:`; `None` for a plain `---`, drawn as left).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// A table line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRow {
+    pub part: TablePart,
+    /// The table's columns, one per header cell.
+    pub aligns: Vec<Align>,
+    /// The line's cells (none for the delimiter line), one per column: a
+    /// line with fewer has empty cells at its end, one with more loses the
+    /// rest (as GFM reads it). Each is a paragraph row over the cell's text
+    /// (trimmed, its pipes outside), so its display, styles and offsets
+    /// work as any row's do.
+    pub cells: Vec<Row>,
 }
 
 /// A list item's marker.
@@ -111,8 +154,8 @@ pub struct Row {
     /// The inline syntax in it, in source offsets.
     pub marks: Vec<Mark>,
     pub gap: Gap,
-    /// The code block (or raw block) the row belongs to, for drawing their
-    /// background as one.
+    /// The code block (or raw block, or table) the row belongs to, for
+    /// drawing their background as one.
     pub block: Option<usize>,
 }
 
@@ -179,7 +222,7 @@ impl Row {
     }
 
     /// Whether the row's display is text the inline subset formatted (not
-    /// code, raw source, a rule or an empty line).
+    /// code, raw source, a table line, a rule or an empty line).
     pub fn is_text(&self) -> bool {
         matches!(
             self.kind,
@@ -190,6 +233,14 @@ impl Row {
     pub fn task(&self) -> Option<bool> {
         match &self.kind {
             RowKind::Item(item) => item.task,
+            _ => None,
+        }
+    }
+
+    /// The table line it is, if it's one.
+    pub fn table(&self) -> Option<&TableRow> {
+        match &self.kind {
+            RowKind::Table(t) => Some(t),
             _ => None,
         }
     }
@@ -481,9 +532,88 @@ fn quote(line: &str) -> Option<usize> {
     Some(bytes + 1 + usize::from(after.starts_with([' ', '\t'])))
 }
 
-fn is_table(line: &str) -> bool {
+/// A line starting with a pipe that isn't part of a table: shown as the
+/// source it is, line by line.
+fn is_pipe_line(line: &str) -> bool {
     let (cols, bytes) = indent(line);
     cols <= 3 && line[bytes..].starts_with('|')
+}
+
+/// Whether the `|` at byte `i` of `line` is escaped (an odd run of
+/// backslashes before it).
+fn escaped(line: &[u8], i: usize) -> bool {
+    line[..i].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1
+}
+
+/// A table line's cells: each one's text, trimmed, as byte ranges of
+/// `line`. The pipes at the line's edges are optional; an escaped one
+/// (`\|`) is text, not a cell edge.
+fn table_cells(line: &str) -> Vec<Range<usize>> {
+    let b = line.as_bytes();
+    let (_, ind) = indent(line);
+    let mut start = ind;
+    let mut end = line.trim_end().len().max(ind);
+    if b.get(start) == Some(&b'|') {
+        start += 1;
+    }
+    if end > start && b[end - 1] == b'|' && !escaped(b, end - 1) {
+        end -= 1;
+    }
+    let trim = |r: Range<usize>| {
+        let text = &line[r.clone()];
+        let lead = text.len() - text.trim_start_matches([' ', '\t']).len();
+        let a = r.start + lead;
+        let z = a + line[a..r.end].trim_end_matches([' ', '\t']).len();
+        a..z
+    };
+    let mut out = Vec::new();
+    let mut at = start;
+    for i in start..end {
+        if b[i] == b'|' && !escaped(b, i) {
+            out.push(trim(at..i));
+            at = i + 1;
+        }
+    }
+    out.push(trim(at..end.max(at)));
+    out
+}
+
+/// A table's delimiter line (`| --- | :---: | ---: |`): its columns'
+/// alignments. It needs a pipe, so `---` alone stays a rule (or a setext
+/// underline).
+fn table_delimiter(line: &str) -> Option<Vec<Align>> {
+    let (cols, _) = indent(line);
+    if cols > 3 || !line.contains('|') {
+        return None;
+    }
+    table_cells(line)
+        .into_iter()
+        .map(|r| {
+            let cell = &line[r];
+            let left = cell.starts_with(':');
+            let right = cell.len() > 1 && cell.ends_with(':');
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            if dashes.is_empty() || !dashes.bytes().all(|b| b == b'-') {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => Align::Center,
+                (true, false) => Align::Left,
+                (false, true) => Align::Right,
+                (false, false) => Align::None,
+            })
+        })
+        .collect()
+}
+
+/// Whether `line` starts a block that ends a table above it.
+fn ends_table(line: &str) -> bool {
+    fence_open(line).is_some()
+        || atx(line).is_some()
+        || quote(line).is_some()
+        || is_rule(line)
+        || list_item(line).is_some()
+        || is_html_start(line)
 }
 
 /// A line that opens an HTML block (shown as source). A line holding only
@@ -532,7 +662,11 @@ fn build(src: &str) -> Vec<Row> {
         blocks += 1;
         blocks
     };
-    for (start, line) in lines(src) {
+    // An open table: its block and columns, and whether its delimiter line
+    // is next.
+    let mut table: Option<(usize, Vec<Align>, bool)> = None;
+    let all = lines(src);
+    for (li, &(start, line)) in all.iter().enumerate() {
         let whole = |content: usize| part(start, start + content, line);
         if let Some((ch, len, block)) = fence {
             let closing = is_fence_close(line, ch, len);
@@ -557,7 +691,20 @@ fn build(src: &str) -> Vec<Row> {
                 end: start + line.len(),
             });
             html = false;
+            table = None;
             continue;
+        }
+        if let Some((block, aligns, delimiter)) = &mut table {
+            if *delimiter || !ends_table(line) {
+                let part = if std::mem::take(delimiter) {
+                    TablePart::Delimiter
+                } else {
+                    TablePart::Body
+                };
+                entries.push(table_row(src, start, line, part, aligns, *block));
+                continue;
+            }
+            table = None;
         }
         let (last_kind, last_block) = match entries.last() {
             Some(Entry::Row(b)) => (Some(b.kind.clone()), b.block),
@@ -644,7 +791,23 @@ fn build(src: &str) -> Vec<Row> {
             }
             continue;
         }
-        if is_table(line) {
+        // A table: this line and a delimiter line under it with as many
+        // cells. It can interrupt a paragraph or a list.
+        if cols <= 3 {
+            let header = table_cells(line).len();
+            if let Some(aligns) = all
+                .get(li + 1)
+                .and_then(|(_, next)| table_delimiter(next))
+                .filter(|a| a.len() == header)
+            {
+                let block = next_block();
+                entries.push(table_row(src, start, line, TablePart::Header, &aligns, block));
+                table = Some((block, aligns, true));
+                list.clear();
+                continue;
+            }
+        }
+        if is_pipe_line(line) {
             let block = match last_kind {
                 Some(RowKind::Raw) => last_block,
                 _ => Some(next_block()),
@@ -742,6 +905,53 @@ fn build(src: &str) -> Vec<Row> {
     rows
 }
 
+/// A table line's row: its cells read as paragraphs over the source.
+fn table_row(src: &str, start: usize, line: &str, which: TablePart, aligns: &[Align], block: usize) -> Entry {
+    let cells = if which == TablePart::Delimiter {
+        Vec::new()
+    } else {
+        let mut ranges = table_cells(line);
+        let end = start + line.trim_end().len();
+        let last = ranges.last().map_or(end, |r| start + r.end);
+        ranges.truncate(aligns.len());
+        let mut cells: Vec<Row> = ranges
+            .into_iter()
+            .map(|r| cell(src, start + r.start, start + r.end))
+            .collect();
+        while cells.len() < aligns.len() {
+            cells.push(cell(src, last, last));
+        }
+        cells
+    };
+    let kind = RowKind::Table(TableRow {
+        part: which,
+        aligns: aligns.to_vec(),
+        cells,
+    });
+    Entry::Row(Building {
+        kind,
+        level: 0,
+        parts: vec![part(start, start, line)],
+        block: Some(block),
+    })
+}
+
+/// A table cell's text, `start..end` of the source, as a paragraph row.
+fn cell(src: &str, start: usize, end: usize) -> Row {
+    let b = Building {
+        kind: RowKind::Paragraph,
+        level: 0,
+        parts: vec![Part {
+            start,
+            content: start,
+            end,
+            hidden: false,
+        }],
+        block: None,
+    };
+    finish(src, b, Gap::None)
+}
+
 fn last_row(entries: &mut [Entry]) -> Option<&mut Building> {
     match entries.last_mut() {
         Some(Entry::Row(b)) => Some(b),
@@ -785,7 +995,7 @@ fn finish(src: &str, b: Building, gap: Gap) -> Row {
         block: b.block,
     };
     match row.kind {
-        RowKind::Code | RowKind::Fence { .. } | RowKind::Raw => {
+        RowKind::Code | RowKind::Fence { .. } | RowKind::Raw | RowKind::Table(_) => {
             row.display = src[first.content..first.end].to_string();
             row.chunks.push(Chunk {
                 display: 0,
@@ -793,7 +1003,7 @@ fn finish(src: &str, b: Building, gap: Gap) -> Row {
                 len: first.end - first.content,
                 snap_right: false,
             });
-            if row.kind == RowKind::Raw {
+            if matches!(row.kind, RowKind::Raw | RowKind::Table(_)) {
                 row.styles.push((
                     0..row.display.len(),
                     Style {
@@ -950,6 +1160,7 @@ mod tests {
                     RowKind::Fence { open } => format!("fence{}", if *open { "+" } else { "-" }),
                     RowKind::Code => "code".into(),
                     RowKind::Rule => "rule".into(),
+                    RowKind::Table(t) => format!("{:?}", t.part).to_lowercase(),
                     RowKind::Raw => "raw".into(),
                 };
                 (k, r.display.clone())
@@ -1023,12 +1234,11 @@ mod tests {
 
     #[test]
     fn unsupported_blocks_stay_visible_as_source() {
-        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n\n<details>\n<summary>x</summary>\n</details>\n\n> quoted **text**\n> more";
+        let src = "| a | b |\n| 1 | 2 |\n\n<details>\n<summary>x</summary>\n</details>\n\n> quoted **text**\n> more";
         assert_eq!(
             kinds(src),
             pairs(&[
                 ("raw", "| a | b |"),
-                ("raw", "|---|---|"),
                 ("raw", "| 1 | 2 |"),
                 ("raw", "<details>"),
                 ("raw", "<summary>x</summary>"),

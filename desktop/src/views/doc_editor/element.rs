@@ -7,10 +7,10 @@ use std::panic::Location;
 use std::rc::Rc;
 
 use gpui::{
-    fill, point, px, relative, size, App, AvailableSpace, Bounds, CursorStyle, DispatchPhase, Element, ElementId,
-    ElementInputHandler, Entity, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, SharedString, Style, TextAlign,
-    TextRun, Window,
+    fill, point, px, relative, size, transparent_black, App, AvailableSpace, Bounds, ContentMask, CursorStyle,
+    DispatchPhase, Element, ElementId, ElementInputHandler, Entity, GlobalElementId, Hitbox, HitboxBehavior,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
+    Pixels, ScrollWheelEvent, SharedString, Style, TextAlign, TextRun, Window,
 };
 use shelbi_app::markdown_edit::RowKind;
 
@@ -65,7 +65,7 @@ impl Element for DocElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         // The fences show by the same test the caret paints by.
         let focused = self.editor.read(cx).focus.is_focused(window);
-        let (hidden, spans) = self.editor.update(cx, |e, _| e.code_view(focused));
+        let (hidden, spans, grid) = self.editor.update(cx, |e, _| e.code_view(focused));
         let e = self.editor.read(cx);
         let doc = e.model.doc().clone();
         let field = e.field;
@@ -73,6 +73,7 @@ impl Element for DocElement {
         let body_line_height = e.body_line_height;
         let marked = e.model.marked();
         let theme = e.theme(cx);
+        let scroll = e.table_scroll.clone();
         let shared: Shared = Rc::new(RefCell::new(None));
         let out = shared.clone();
         let mut style = Style::default();
@@ -86,6 +87,8 @@ impl Element for DocElement {
             let code = layout::Code {
                 hidden: &hidden,
                 spans: &spans,
+                grid: &grid,
+                scroll: Some(&scroll),
             };
             let l = layout::layout(&doc, field, width, marked.clone(), code, scale, body_line_height, &theme, window, cx);
             let h = l.height;
@@ -169,6 +172,24 @@ impl Element for DocElement {
         for b in &l.rules {
             window.paint_quad(fill(at(*b), theme.divider));
         }
+        // Tables' grids: the outline and rules inside the box each scrolls
+        // in, and a scroll bar under one wider than the editor.
+        for t in &l.tables {
+            window.with_content_mask(Some(ContentMask { bounds: at(t.bounds) }), |window| {
+                window.paint_quad(
+                    fill(at(t.grid), transparent_black())
+                        .corner_radii(px(layout::TABLE_RADIUS * scale))
+                        .border_widths(px(1.0))
+                        .border_color(theme.divider),
+                );
+                for r in &t.rules {
+                    window.paint_quad(fill(at(*r), theme.divider));
+                }
+            });
+            if let Some(thumb) = t.thumb {
+                window.paint_quad(fill(at(thumb), theme.divider_strong).corner_radii(px(1.5)));
+            }
+        }
         if focused {
             for b in l.selection(&doc, sel.clone()) {
                 window.paint_quad(fill(at(b), theme.text_selection));
@@ -179,6 +200,24 @@ impl Element for DocElement {
             for (_, line) in &r.lines {
                 let _ = line.paint(o + point(r.left, y), r.line_height, TextAlign::Left, None, window, cx);
                 y += r.line_height * (line.wrap_boundaries().len() + 1) as f32;
+            }
+            if let Some(t) = r.table.and_then(|i| l.tables.get(i)) {
+                window.with_content_mask(Some(ContentMask { bounds: at(t.bounds) }), |window| {
+                    for c in &r.cells {
+                        let mut y = c.text.origin.y;
+                        for (_, line) in &c.lines {
+                            let _ = line.paint(
+                                o + point(c.text.origin.x, y),
+                                c.line_height,
+                                c.align,
+                                Some(at(c.text)),
+                                window,
+                                cx,
+                            );
+                            y += c.line_height * (line.wrap_boundaries().len() + 1) as f32;
+                        }
+                    }
+                });
             }
             if let Some((g, gb)) = &r.gutter {
                 paint_gutter(g, at(*gb), r.line_height, scale, &theme, doc.rows[ri].kind.clone(), window, cx);
@@ -222,6 +261,36 @@ impl Element for DocElement {
             window.prevent_default();
             cx.stop_propagation();
         });
+        // A sideways scroll over a table wider than the editor scrolls it
+        // inside its box; an up-and-down one is the page's.
+        let scrollers: Vec<(usize, Bounds<Pixels>, Pixels)> = l
+            .tables
+            .iter()
+            .filter(|t| t.max_scroll > px(0.0))
+            .map(|t| (t.block, at(t.bounds), t.max_scroll))
+            .collect();
+        if !scrollers.is_empty() {
+            let ed = self.editor.clone();
+            let hb = pre.hitbox.clone();
+            window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || !hb.is_hovered(window) {
+                    return;
+                }
+                let Some(&(block, _, max)) = scrollers.iter().find(|s| s.1.contains(&e.position)) else {
+                    return;
+                };
+                let d = e.delta.pixel_delta(px(20.0));
+                let dx = if d.x.as_f32().abs() > d.y.as_f32().abs() {
+                    d.x
+                } else if e.modifiers.shift {
+                    d.y
+                } else {
+                    return;
+                };
+                ed.update(cx, |ed, cx| ed.scroll_table(block, dx, max, cx));
+                cx.stop_propagation();
+            });
+        }
         let ed = self.editor.clone();
         window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && e.pressed_button == Some(MouseButton::Left) {
