@@ -560,7 +560,7 @@ fn picker(id: impl Into<SharedString>, label: impl Into<SharedString>, icon: Opt
     let size = if small { ButtonSize::Small } else { ButtonSize::Base };
     style::button_base(id, ButtonKind::Secondary, size, false, theme)
         .w_full()
-        .children(icon.map(|c| style::left_slot(size, style::status_icon_large(c, theme))))
+        .children(icon.map(|c| style::left_slot(size, style::status_icon(c, theme))))
         .child(div().flex_1().min_w_0().truncate().child(label.into()))
         .child(style::dropdown_slot(size, theme.button_icon))
 }
@@ -1406,7 +1406,7 @@ impl WorkflowEditor {
         let from = self.status_picker(Menu::DrawFrom, "builder-draw-from", &d.from, |this, sid, _, _| this.builder.set_from(&sid), theme, cx);
         let destination = match d.over.as_deref().and_then(|id| state.status(id)) {
             Some(s) => style::button_base("builder-destination", ButtonKind::Secondary, ButtonSize::Base, false, theme)
-                .child(style::left_slot(ButtonSize::Base, style::status_icon_large(s.category, theme)))
+                .child(style::left_slot(ButtonSize::Base, style::status_icon(s.category, theme)))
                 .child(s.name.clone())
                 .into_any_element(),
             None => div()
