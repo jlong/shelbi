@@ -64,8 +64,18 @@ pub const HISTORY_LIMIT: usize = 30;
 const MENU_W: f32 = 220.0;
 /// The history list's width.
 const HISTORY_W: f32 = 360.0;
-/// The document column's widest.
+/// The document column's widest at the UI's base size ([`Type::Base`]).
 const MAX_W: f32 = 760.0;
+/// The room either side of the column when the main area is narrower than
+/// it.
+const SIDE_PAD: f32 = 32.0;
+
+/// The document column's widest with the body at `size` points:
+/// [`MAX_W`] scaled as the text is, so a line holds about as many
+/// characters at any font size.
+pub fn column_width(size: f32) -> f32 {
+    MAX_W * (size / Type::Base.size()).max(0.1)
+}
 
 /// The open document's editor and the hub's side of it.
 pub(super) struct DocPane {
@@ -449,15 +459,20 @@ impl WikiView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&pane.scroll)
-                    .px(px(32.0))
+                    // The column sits in the middle; the scroll container
+                    // keeps the main area's width, so the scrollbar stays
+                    // at its right edge.
+                    .items_center()
+                    .px(px(SIDE_PAD))
                     .pt(px(24.0))
                     .child(
                         div()
+                            .debug_selector(|| "wiki-doc-column".into())
                             .flex()
                             .flex_col()
                             .flex_1()
                             .w_full()
-                            .max_w(px(MAX_W))
+                            .max_w(px(column_width(body_size(cx))))
                             .child(div().w_full().min_w_0().child(pane.editor.clone()))
                             .child(rest),
                     )

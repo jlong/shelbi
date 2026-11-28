@@ -329,6 +329,45 @@ fn the_document_reads_at_the_terminal_font_size_and_follows_it(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn the_document_column_is_centered_and_scales_with_the_body(cx: &mut TestAppContext) {
+    use gpui::{px, size};
+    let mut t = T::open(cx, FakeHub::sample());
+    t.set_terminal_size(DEFAULT_FONT_SIZE);
+    t.open_doc();
+    let bounds = |t: &mut T| {
+        t.frame();
+        let body = t.cx.debug_bounds("wiki-doc-body").expect("the body is drawn");
+        let column = t.cx.debug_bounds("wiki-doc-column").expect("the column is drawn");
+        let left = f32::from(column.left() - body.left());
+        let right = f32::from(body.right() - column.right());
+        (f32::from(body.size.width), f32::from(column.size.width), left, right)
+    };
+
+    // Wide: the column at its widest, equal room either side.
+    t.cx.simulate_resize(size(px(2000.0), px(900.0)));
+    let (body_w, col_w, left, right) = bounds(&mut t);
+    let widest = super::doc::column_width(DEFAULT_FONT_SIZE);
+    assert!(body_w > widest + 64.0, "the main area is wider than the column: {body_w}");
+    assert!((col_w - widest).abs() < 0.5, "{col_w} vs {widest}");
+    assert!((left - right).abs() < 1.0, "centered: {left} | {right}");
+    assert!(left > 32.0);
+
+    // A bigger font widens the column by as much as the text grows.
+    t.set_terminal_size(DEFAULT_FONT_SIZE * 1.25);
+    let (_, col_w, left, right) = bounds(&mut t);
+    assert!((col_w - widest * 1.25).abs() < 0.5, "{col_w} vs {}", widest * 1.25);
+    assert!((left - right).abs() < 1.0, "still centered: {left} | {right}");
+
+    // Narrow: the column fills the main area inside the side padding.
+    t.set_terminal_size(DEFAULT_FONT_SIZE);
+    t.cx.simulate_resize(size(px(700.0), px(900.0)));
+    let (body_w, col_w, left, right) = bounds(&mut t);
+    assert!(body_w < widest, "the main area is narrower than the column: {body_w}");
+    assert!((left - 32.0).abs() < 0.5 && (right - 32.0).abs() < 0.5, "{left} | {right}");
+    assert!((col_w - (body_w - 64.0)).abs() < 0.5);
+}
+
+#[gpui::test]
 fn the_main_area_is_the_terminals_surface_in_every_theme(cx: &mut TestAppContext) {
     use crate::theme::Theme;
     use gpui::WindowAppearance;
