@@ -69,6 +69,7 @@ impl Element for DocElement {
         let e = self.editor.read(cx);
         let doc = e.model.doc().clone();
         let field = e.field;
+        let scale = e.scale;
         let marked = e.model.marked();
         let theme = e.theme(cx);
         let shared: Shared = Rc::new(RefCell::new(None));
@@ -85,7 +86,7 @@ impl Element for DocElement {
                 hidden: &hidden,
                 spans: &spans,
             };
-            let l = layout::layout(&doc, field, width, marked.clone(), code, &theme, window, cx);
+            let l = layout::layout(&doc, field, width, marked.clone(), code, scale, &theme, window, cx);
             let h = l.height;
             *out.borrow_mut() = Some(Rc::new(l));
             size(width, h)
@@ -151,6 +152,7 @@ impl Element for DocElement {
         let placeholder = editor.placeholder.clone();
         let empty = editor.model.text().is_empty();
         let field = editor.field;
+        let scale = editor.scale;
         let o = bounds.origin;
         let at = |b: Bounds<Pixels>| Bounds {
             origin: o + b.origin,
@@ -178,16 +180,16 @@ impl Element for DocElement {
                 y += r.line_height * (line.wrap_boundaries().len() + 1) as f32;
             }
             if let Some((g, gb)) = &r.gutter {
-                paint_gutter(g, at(*gb), r.line_height, &theme, doc.rows[ri].kind.clone(), window, cx);
+                paint_gutter(g, at(*gb), r.line_height, scale, &theme, doc.rows[ri].kind.clone(), window, cx);
             }
         }
         if empty {
             if let Some(r) = l.rows.first() {
                 let ty = if field == Field::Title { Type::Title } else { Type::Base };
-                let line = shape(&placeholder, ty, theme.muted, window);
+                let line = shape(&placeholder, ty, scale, theme.muted, window);
                 let _ = line.paint(
                     o + point(r.left, r.top),
-                    px(ty.line_height()),
+                    px((ty.line_height() * scale).round()),
                     TextAlign::Left,
                     None,
                     window,
@@ -239,7 +241,8 @@ impl Element for DocElement {
     }
 }
 
-fn shape(text: &SharedString, ty: Type, color: gpui::Hsla, window: &mut Window) -> gpui::ShapedLine {
+/// `text` in `ty` at `scale` (the editor's [`super::DocEditor::scale`]).
+fn shape(text: &SharedString, ty: Type, scale: f32, color: gpui::Hsla, window: &mut Window) -> gpui::ShapedLine {
     let run = TextRun {
         len: text.len(),
         font: gpui::Font {
@@ -253,14 +256,18 @@ fn shape(text: &SharedString, ty: Type, color: gpui::Hsla, window: &mut Window) 
     };
     window
         .text_system()
-        .shape_line(text.clone(), px(ty.size()), &[run], None)
+        .shape_line(text.clone(), px(ty.size() * scale), &[run], None)
 }
 
 /// A list item's marker: a bullet, its number, or the frame's checkbox.
+/// The bullet and the number scale with the text; the checkbox keeps the
+/// frame's size (its hit target is [`check_box`]).
+#[allow(clippy::too_many_arguments)]
 fn paint_gutter(
     g: &Gutter,
     gb: Bounds<Pixels>,
     lh: Pixels,
+    scale: f32,
     theme: &Theme,
     _kind: RowKind,
     window: &mut Window,
@@ -268,16 +275,16 @@ fn paint_gutter(
 ) {
     match g {
         Gutter::Bullet => {
-            let d = px(5.0);
+            let d = px(5.0 * scale);
             let b = Bounds {
-                origin: point(gb.origin.x + px(5.0), gb.origin.y + (lh - d) / 2.0),
+                origin: point(gb.origin.x + px(5.0 * scale), gb.origin.y + (lh - d) / 2.0),
                 size: size(d, d),
             };
             window.paint_quad(fill(b, theme.muted).corner_radii(d / 2.0));
         }
         Gutter::Number(n) => {
-            let line = shape(&n.clone().into(), Type::Base, theme.muted, window);
-            let x = gb.origin.x + gb.size.width - px(6.0) - line.width;
+            let line = shape(&n.clone().into(), Type::Base, scale, theme.muted, window);
+            let x = gb.origin.x + gb.size.width - px(6.0 * scale) - line.width;
             let _ = line.paint(
                 point(x.max(gb.origin.x), gb.origin.y),
                 lh,

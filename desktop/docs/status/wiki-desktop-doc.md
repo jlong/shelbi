@@ -19,7 +19,9 @@ on `wiki-desktop-tree` ([`wiki-desktop-tree.md`](wiki-desktop-tree.md)).
 - **Editing in place.** The open document is the task pane's editor
   (`views/doc_editor`, over `shelbi_app::markdown_edit`): no edit mode, the
   caret goes where you click, a click under the text puts it at the end.
-  Esc hands the keys back to the tree.
+  Esc hands the keys back to the tree. Its body is set at the terminal font
+  size, on the terminals' surface (see `wiki-desktop-tree.md`, "Looks like
+  a terminal").
 - **Saves through the hub.** Once the typing pauses
   (`shelbi_app::wiki_doc::SAVE_AFTER`, 600 ms), the whole document goes to
   the hub's wiki service as one `WikiRequest::Write` (`by: Person`), one

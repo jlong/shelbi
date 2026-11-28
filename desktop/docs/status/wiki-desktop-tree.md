@@ -77,6 +77,19 @@ Part of the Wiki (`Plans/wiki.md` in the Shelbi ContextStore space).
   shows the set-up screen: the two sources and "Create docs/planning" /
   "Use docs/", which write the `wiki:` block and ask the hub to set it up
   (the shared Settings ▸ Wiki form's Set up).
+- **Looks like a terminal** (`wiki-doc-terminal-look`): the whole main area
+  (breadcrumb, document, set-up screen, conflict inspector) paints the
+  surface a terminal pane does (`views::wiki::surface`, the theme's
+  `terminal_canvas` through `nested`: the terminals' own background whatever
+  the contrast, the window's glass while translucent), in every theme. The
+  document's body text is the terminal font size
+  (`TerminalSettings::font_size`, `desktop.terminal_font_size`, default
+  `DEFAULT_FONT_SIZE`): `DocEditor::set_body_size` scales headings, code,
+  list gutters and the gaps between blocks from it. The Wiki observes the
+  `TerminalSettings` global, so View ▸ Bigger / Smaller / Actual Size and
+  Settings' size resize an open document at once. Only the size changes: the
+  document keeps the UI's prose font, and the toolbar, bars and the tree
+  keep the UI's sizes. Other `DocEditor`s (the task pane) stay at scale 1.
 
 ## Decisions
 
@@ -104,7 +117,9 @@ Part of the Wiki (`Plans/wiki.md` in the Shelbi ContextStore space).
 open level, arrow keys and Enter, clicks, F2 rename and Esc, ⌘N / ⇧⌘N,
 Delete and Undo, the context menu and Move to…, Duplicate and Copy Path,
 drops (move, reorder, into itself refused), the filter, pushed changes,
-folder emoji, the set-up screen. `app::wiki_tests`: the nav row's place and
+folder emoji, the set-up screen. `views::wiki::doc_tests`: the document's
+scale tracks `TerminalSettings` (and its height with it), the main area's
+surface is the terminals' in light and dark, at a contrast and on glass. `app::wiki_tests`: the nav row's place and
 icon, the push and ‹ / Esc back, the state kept per project, the one-click
 set-up writing the `wiki:` block. `SHELBI_VISUAL_ONLY=wiki --visual-figma`
 renders `wiki`, `wiki-menu`, `wiki-rename`, `wiki-undo` and `wiki-setup`.
