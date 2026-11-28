@@ -95,7 +95,7 @@ formula = <<~RUBY
       assert_path_exists pkgshare/"plugins/shelbi-awareness/.claude-plugin/plugin.json"
       assert_path_exists pkgshare/"plugins/shelbi-awareness/hooks/hooks.json"
       assert_path_exists pkgshare/"plugins/shelbi-awareness/monitors/monitors.json"
-      assert_path_exists pkgshare/"plugins/shelbi-wiki/skills/shelbi-wiki/SKILL.md"
+      assert_path_exists pkgshare/"plugins/shelbi-docs/skills/shelbi-docs/SKILL.md"
     end
   end
 RUBY

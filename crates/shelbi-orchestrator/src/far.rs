@@ -8,8 +8,8 @@
 //! - A machine check runs [`crate::machine_readiness`] from this hub,
 //!   without recording; the window records a ready answer it still wants
 //!   ([`Request::RecordMachine`]), so a check it stopped never records.
-//! - A wiki request runs on the project's wiki service here
-//!   ([`crate::wiki`]), the wiki's single writer.
+//! - Docs request runs on the project's docs service here
+//!   ([`crate::docs`]), the docs' single writer.
 //! - An editor session runs the user's `$EDITOR` (or the hub config's
 //!   `editor:` command) on the file in a terminal session here, named
 //!   `<project>/edit/<key>`, which the window attaches to over its relay.
@@ -116,7 +116,7 @@ pub fn answer_with(services: &FarServices, project: &str, request: Request) -> R
         Request::ImportPreview(choice) => Reply::ImportPreview((services.import_preview)(project, &choice)),
         Request::LocalIssues => Reply::LocalIssues(Ok(crate::tracker_connect::local_issues(project))),
         Request::MoveIssues(choice) => Reply::MovedIssues((services.move_issues)(project, &choice)),
-        Request::Wiki(req) => Reply::Wiki(crate::wiki::answer(project, req)),
+        Request::Docs(req) => Reply::Docs(crate::docs::answer(project, req)),
     }
 }
 

@@ -27,7 +27,7 @@ a Rust workspace plus a Next.js marketing/docs site.
 - `crates/shelbi-palette`: fuzzy command palette (Ctrl+P by default) for the TUI
 - `crates/shelbi-agent`: pluggable agent CLI runners
 - `crates/shelbi-ssh`: local/SSH command execution wrapper
-- `crates/shelbi-wiki`: the wiki's storage library, copied from ContextStore's
+- `crates/shelbi-docs`: the docs' storage library, copied from ContextStore's
   Rust core (same on-disk format as a ContextStore space: `.contextstore/`,
   `.csignore`, Markdown by path). Synchronous; no git2, no tokio
 - `desktop/`: the native macOS client (gpui), a sibling of the TUI over

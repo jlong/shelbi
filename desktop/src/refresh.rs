@@ -316,8 +316,8 @@ fn feed_loop(
         }
         if let Some(changes) = &changes {
             while let Ok(change) = changes.try_recv() {
-                // A wiki change refreshes the Wiki, not the board.
-                wake |= !change.is_wiki();
+                // Docs change refreshes the Documentation, not the board.
+                wake |= !change.is_docs();
             }
         }
         if let Some(layout) = &layout {

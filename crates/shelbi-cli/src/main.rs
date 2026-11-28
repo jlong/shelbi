@@ -149,10 +149,12 @@ enum Cmd {
         /// Name of the workspace to open.
         name: String,
     },
-    /// Read and write the project's wiki (plans, decisions, docs): a CLI
+    /// Read and write the project's docs (plans, designs, decisions): a CLI
     /// shaped like `cstore`, through the hub.
-    #[command(help_template = commands::wiki::HELP_TEMPLATE)]
-    Wiki(commands::wiki::WikiArgs),
+    // `shelbi wiki` (the command's name before Documentation was called
+    // that) still works, as a hidden alias.
+    #[command(help_template = commands::docs::HELP_TEMPLATE, alias = commands::docs::LEGACY_COMMAND)]
+    Docs(commands::docs::DocsArgs),
     /// Manage the project's Kanban issue board.
     Issue {
         #[command(subcommand)]
@@ -495,14 +497,14 @@ enum Cmd {
     },
 }
 
-/// [`Cli::parse`], except that a bad `shelbi wiki` command line exits 3
-/// ("invalid", as `cstore` does) instead of clap's 2, which `shelbi wiki`
+/// [`Cli::parse`], except that a bad `shelbi docs` command line exits 3
+/// ("invalid", as `cstore` does) instead of clap's 2, which `shelbi docs`
 /// uses for "not found".
 fn parse_cli() -> Cli {
     match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
-            let code = if e.use_stderr() && commands::wiki::is_wiki_invocation(std::env::args_os().skip(1)) {
+            let code = if e.use_stderr() && commands::docs::is_docs_invocation(std::env::args_os().skip(1)) {
                 3
             } else {
                 e.exit_code()
@@ -571,7 +573,7 @@ fn main() -> Result<()> {
         Some(Cmd::Job { cmd }) => commands::job::run(cli.project, cmd),
         Some(Cmd::JobExec { id, cmd }) => commands::job::exec(cli.project, id, cmd),
         Some(Cmd::Open { name }) => commands::open::run(cli.project, name),
-        Some(Cmd::Wiki(args)) => commands::wiki::run(cli.project, args),
+        Some(Cmd::Docs(args)) => commands::docs::run(cli.project, args),
         Some(Cmd::Issue { cmd }) => commands::issue::run(cli.project, cmd),
         Some(Cmd::Task { cmd }) => {
             eprintln!(

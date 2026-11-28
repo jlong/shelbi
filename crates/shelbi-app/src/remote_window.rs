@@ -236,7 +236,7 @@ pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
         | CommandKind::CloseOtherProjects
         | CommandKind::OpenIssue { .. }
         | CommandKind::OpenChangelogEntry { .. }
-        | CommandKind::OpenWikiDoc { .. }
+        | CommandKind::OpenDoc { .. }
         | CommandKind::MoveIssue { .. }
         | CommandKind::StartIssue { .. }
         | CommandKind::AssignIssue { .. }

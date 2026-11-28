@@ -1,0 +1,13 @@
+{
+  "name": "shelbi-docs",
+  "version": "1.0.0",
+  "description": "Read and write the project's docs: plans, designs, decisions and project context.",
+  "author": {
+    "name": "Shelbi"
+  },
+  "homepage": "https://shelbi.dev",
+  "repository": "https://github.com/jlong/shelbi",
+  "license": "MIT",
+  "keywords": ["shelbi", "docs", "documentation", "plans"],
+  "skills": "./skills/"
+}

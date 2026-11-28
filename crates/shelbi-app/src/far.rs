@@ -116,9 +116,12 @@ pub enum Request {
     /// Move the project's local issues into this connection before it's
     /// switched to (the move card's Import), where the project lives.
     MoveIssues(crate::tracker_connect::TrackerChoice),
-    /// A read or write of the project's wiki, which the hub where the
-    /// project lives is the single writer of ([`crate::wiki`]).
-    Wiki(crate::wiki::WikiRequest),
+    /// A read or write of the project's docs, which the hub where the
+    /// project lives is the single writer of ([`crate::docs`]). `wiki` is
+    /// its name from before Documentation was called that, which an older
+    /// client still sends.
+    #[serde(alias = "wiki")]
+    Docs(crate::docs::DocsRequest),
 }
 
 /// The far daemon's answer to a [`Request`].
@@ -140,7 +143,9 @@ pub enum Reply {
     ImportPreview(Result<crate::tracker_connect::ImportPreview, String>),
     LocalIssues(Result<usize, String>),
     MovedIssues(Result<crate::tracker_connect::Moved, crate::tracker_connect::MoveFailed>),
-    Wiki(crate::wiki::WikiReply),
+    /// Read as `wiki` too, from an older far hub.
+    #[serde(alias = "wiki")]
+    Docs(crate::docs::DocsReply),
 }
 
 /// The far paths a path Cmd+clicked in a far terminal may name: as
@@ -456,6 +461,20 @@ mod tests {
             let json = serde_json::to_value(&r).unwrap();
             assert_eq!(serde_json::from_value::<Reply>(json).unwrap(), r);
         }
+    }
+
+    #[test]
+    fn a_docs_request_and_reply_read_under_their_old_wiki_name() {
+        // An older client or hub says `wiki`; this one writes `docs`.
+        let req = Request::Docs(crate::docs::DocsRequest::Init);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.starts_with(r#"{"docs":"#), "{json}");
+        let old = json.replacen(r#"{"docs":"#, r#"{"wiki":"#, 1);
+        assert_eq!(serde_json::from_str::<Request>(&old).unwrap(), req);
+        let reply = Reply::Docs(crate::docs::DocsReply::failed(crate::docs::FailureKind::Failed, "x"));
+        let json = serde_json::to_string(&reply).unwrap();
+        let old = json.replacen(r#"{"docs":"#, r#"{"wiki":"#, 1);
+        assert_eq!(serde_json::from_str::<Reply>(&old).unwrap(), reply);
     }
 
     #[test]

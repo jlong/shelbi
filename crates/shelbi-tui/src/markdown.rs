@@ -329,9 +329,9 @@ fn toks_to_line(toks: &[Tok]) -> Line<'static> {
     Line::from(spans)
 }
 
-// ---- whole documents (the Wiki) ---------------------------------------------
+// ---- whole documents (the Documentation) ---------------------------------------------
 
-/// Render a whole Markdown document (a wiki page) into pre-wrapped lines for
+/// Render a whole Markdown document (docs page) into pre-wrapped lines for
 /// a pane `width` cells wide: headings, lists and task lists, quotes, code
 /// blocks and rules as blocks, and inside them the inline styles. The rows
 /// come from the shared Markdown model the desktop's document editor lays

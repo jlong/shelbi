@@ -2137,6 +2137,7 @@ dependencies = [
  "shelbi-app",
  "shelbi-client",
  "shelbi-core",
+ "shelbi-docs",
  "shelbi-orchestrator",
  "shelbi-palette",
  "shelbi-proto",
@@ -2145,7 +2146,6 @@ dependencies = [
  "shelbi-state",
  "shelbi-term",
  "shelbi-tui",
- "shelbi-wiki",
  "signal-hook",
  "syn 2.0.118",
  "tempfile",
@@ -2213,6 +2213,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "shelbi-docs"
+version = "0.15.0"
+dependencies = [
+ "comrak",
+ "diff-match-patch-rs",
+ "ignore",
+ "notify",
+ "regex",
+ "serde",
+ "serde_json",
+ "static_assertions",
+ "tempfile",
+ "thiserror 1.0.69",
+ "trash",
+ "yaml_serde",
+]
+
+[[package]]
 name = "shelbi-orchestrator"
 version = "0.15.0"
 dependencies = [
@@ -2227,11 +2245,11 @@ dependencies = [
  "shelbi-app",
  "shelbi-client",
  "shelbi-core",
+ "shelbi-docs",
  "shelbi-proto",
  "shelbi-session",
  "shelbi-ssh",
  "shelbi-state",
- "shelbi-wiki",
  "signal-hook",
  "tempfile",
  "thiserror 1.0.69",
@@ -2333,24 +2351,6 @@ dependencies = [
  "tempfile",
  "tracing",
  "unicode-width",
-]
-
-[[package]]
-name = "shelbi-wiki"
-version = "0.15.0"
-dependencies = [
- "comrak",
- "diff-match-patch-rs",
- "ignore",
- "notify",
- "regex",
- "serde",
- "serde_json",
- "static_assertions",
- "tempfile",
- "thiserror 1.0.69",
- "trash",
- "yaml_serde",
 ]
 
 [[package]]

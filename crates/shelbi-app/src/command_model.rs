@@ -25,7 +25,7 @@ pub fn nav_glyph(label: &str) -> &'static str {
     match label {
         "Orchestrator" => "💬",
         "Issues" => "📋",
-        "Wiki" => "📖",
+        "Documentation" => "📖",
         "Changelog" => "🚀",
         "Activity" => "⚡",
         "Machines" => "🖥",
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn nav_glyphs_match_the_sidebar() {
         assert_eq!(nav_glyph("Issues"), "📋");
-        assert_eq!(nav_glyph("Wiki"), "📖");
+        assert_eq!(nav_glyph("Documentation"), "📖");
         assert_eq!(nav_glyph("Changelog"), "🚀");
         assert_eq!(nav_glyph("Machines"), "🖥");
         assert_eq!(nav_glyph("Other"), "•");

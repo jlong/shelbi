@@ -1,11 +1,11 @@
-//! The palette's search beyond the commands: issues, wiki documents and
+//! The palette's search beyond the commands: issues, documents and
 //! Changelog entries.
 //!
 //! Typing in the palette searches four kinds of thing at once: the commands
 //! (the registry's entries, fuzzy-matched by [`shelbi_palette::search`] as
 //! they always were), the current project's issues (title, id and body), its
-//! wiki's documents (title and content, through the hub's wiki `search`:
-//! [`WikiSearch`]), and its Changelog entries (the Changelog page's own
+//! docs' documents (title and content, through the hub's docs `search`:
+//! [`DocsSearch`]), and its Changelog entries (the Changelog page's own
 //! search, [`ChangelogEntryView::matches`]). [`result_rows`] lays the matches out for
 //! a [`SearchFilter`]: under [`SearchFilter::All`], one group per kind with a
 //! header (commands, then issues, then entries), best matches first, each capped at [`GROUP_CAP`] with a "Show all"
@@ -30,7 +30,7 @@ use shelbi_state::IssueFile;
 
 use crate::board::{BoardInput, BoardRules};
 use crate::changelog::{ChangelogEntryView, LinkKind};
-use crate::wiki::{NodeKind, WikiMatch, WikiNode, WikiReply, WikiRequest};
+use crate::docs::{NodeKind, DocsMatch, DocsNode, DocsReply, DocsRequest};
 
 /// How many of each kind [`SearchFilter::All`] shows before its "Show all"
 /// row.
@@ -46,7 +46,7 @@ pub enum SearchFilter {
     #[default]
     All,
     Issues,
-    Wiki,
+    Docs,
     Changelog,
     Commands,
 }
@@ -56,7 +56,7 @@ impl SearchFilter {
     pub const ROW: [SearchFilter; 5] = [
         SearchFilter::All,
         SearchFilter::Issues,
-        SearchFilter::Wiki,
+        SearchFilter::Docs,
         SearchFilter::Changelog,
         SearchFilter::Commands,
     ];
@@ -66,7 +66,7 @@ impl SearchFilter {
         match self {
             SearchFilter::All => "All",
             SearchFilter::Issues => "Issues",
-            SearchFilter::Wiki => "Wiki",
+            SearchFilter::Docs => "Documentation",
             SearchFilter::Changelog => "Changelog Entries",
             SearchFilter::Commands => "Commands",
         }
@@ -89,7 +89,7 @@ impl SearchFilter {
         match self {
             SearchFilter::All => None,
             SearchFilter::Issues => Some(ResultKind::Issue),
-            SearchFilter::Wiki => Some(ResultKind::Wiki),
+            SearchFilter::Docs => Some(ResultKind::Docs),
             SearchFilter::Changelog => Some(ResultKind::Changelog),
             SearchFilter::Commands => Some(ResultKind::Command),
         }
@@ -100,7 +100,7 @@ impl SearchFilter {
         match self {
             SearchFilter::All => "No matches",
             SearchFilter::Issues => "No matching issues",
-            SearchFilter::Wiki => "No matching wiki documents",
+            SearchFilter::Docs => "No matching documents",
             SearchFilter::Changelog => "No matching Changelog entries",
             SearchFilter::Commands => "No matching commands",
         }
@@ -111,7 +111,7 @@ impl SearchFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultKind {
     Issue,
-    Wiki,
+    Docs,
     Changelog,
     Command,
 }
@@ -120,13 +120,13 @@ impl ResultKind {
     /// The groups under All, top to bottom. Commands lead, so typing a
     /// command's name and Enter still runs it; a group with no matches is
     /// left out, so when no command matches the first issue is on top.
-    pub const ORDER: [ResultKind; 4] = [ResultKind::Command, ResultKind::Issue, ResultKind::Wiki, ResultKind::Changelog];
+    pub const ORDER: [ResultKind; 4] = [ResultKind::Command, ResultKind::Issue, ResultKind::Docs, ResultKind::Changelog];
 
     /// The group's header under All.
     pub fn heading(self) -> &'static str {
         match self {
             ResultKind::Issue => "Issues",
-            ResultKind::Wiki => "Wiki",
+            ResultKind::Docs => "Documentation",
             ResultKind::Changelog => "Changelog Entries",
             ResultKind::Command => "Commands",
         }
@@ -136,7 +136,7 @@ impl ResultKind {
     pub fn filter(self) -> SearchFilter {
         match self {
             ResultKind::Issue => SearchFilter::Issues,
-            ResultKind::Wiki => SearchFilter::Wiki,
+            ResultKind::Docs => SearchFilter::Docs,
             ResultKind::Changelog => SearchFilter::Changelog,
             ResultKind::Command => SearchFilter::Commands,
         }
@@ -146,7 +146,7 @@ impl ResultKind {
     pub fn show_all_label(self, count: usize) -> String {
         let noun = match self {
             ResultKind::Issue => "issues",
-            ResultKind::Wiki => "wiki documents",
+            ResultKind::Docs => "documents",
             ResultKind::Changelog => "Changelog entries",
             ResultKind::Command => "commands",
         };
@@ -259,10 +259,10 @@ pub fn issue_docs(tasks: &[IssueFile], statuses: &ProjectStatuses, rules: BoardR
 pub struct SearchCorpus {
     pub issues: Arc<Vec<IssueDoc>>,
     pub changelog: Arc<Vec<ChangelogEntryView>>,
-    /// The project's wiki, asked as each query is searched (it isn't held:
+    /// The project's docs, asked as each query is searched (it isn't held:
     /// the hub greps it). Each client attaches its own; it doesn't travel.
     #[serde(skip)]
-    pub wiki: Option<WikiSearch>,
+    pub docs: Option<DocsSearch>,
 }
 
 impl SearchCorpus {
@@ -270,13 +270,13 @@ impl SearchCorpus {
         SearchCorpus {
             issues: Arc::new(issues),
             changelog: Arc::new(changelog),
-            wiki: None,
+            docs: None,
         }
     }
 
-    /// Search the project's wiki with `wiki` too.
-    pub fn with_wiki(mut self, wiki: Option<WikiSearch>) -> Self {
-        self.wiki = wiki;
+    /// Search the project's docs with `docs` too.
+    pub fn with_docs(mut self, docs: Option<DocsSearch>) -> Self {
+        self.docs = docs;
         self
     }
 
@@ -287,7 +287,7 @@ impl SearchCorpus {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.issues.is_empty() && self.changelog.is_empty() && self.wiki.is_none()
+        self.issues.is_empty() && self.changelog.is_empty() && self.docs.is_none()
     }
 }
 
@@ -349,7 +349,7 @@ pub struct SearchHits {
     /// The query they match.
     pub query: String,
     pub issues: Vec<IssueDoc>,
-    pub wiki: Vec<WikiHit>,
+    pub docs: Vec<DocsHit>,
     pub changelog: Vec<ChangelogHit>,
 }
 
@@ -365,7 +365,7 @@ pub fn search_corpus(corpus: &SearchCorpus, query: &str) -> SearchHits {
     SearchHits {
         query: query.to_string(),
         issues: rank_issues(&corpus.issues, query),
-        wiki: corpus.wiki.as_ref().map(|w| w.search(query)).unwrap_or_default(),
+        docs: corpus.docs.as_ref().map(|w| w.search(query)).unwrap_or_default(),
         changelog: rank_changelog(&corpus.changelog, query),
     }
 }
@@ -414,10 +414,10 @@ pub fn rank_changelog(entries: &[ChangelogEntryView], query: &str) -> Vec<Change
         .collect()
 }
 
-/// A wiki document as a result row draws it.
+/// A document as a result row draws it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WikiHit {
-    /// Wiki-relative.
+pub struct DocsHit {
+    /// Documentation-relative.
     pub path: String,
     /// Its first H1 (else its file name).
     pub title: String,
@@ -426,67 +426,67 @@ pub struct WikiHit {
     pub detail: String,
 }
 
-/// Asks a project's wiki for the palette's matches: run on the search
+/// Asks a project's docs for the palette's matches: run on the search
 /// worker's thread (it blocks on the hub), once per query.
 #[derive(Clone)]
-pub struct WikiSearch(Arc<WikiSearchFn>);
+pub struct DocsSearch(Arc<DocsSearchFn>);
 
-/// What [`WikiSearch`] runs: a query in, its matches out.
-type WikiSearchFn = dyn Fn(&str) -> Vec<WikiHit> + Send + Sync;
+/// What [`DocsSearch`] runs: a query in, its matches out.
+type DocsSearchFn = dyn Fn(&str) -> Vec<DocsHit> + Send + Sync;
 
-impl WikiSearch {
-    pub fn new(f: impl Fn(&str) -> Vec<WikiHit> + Send + Sync + 'static) -> Self {
-        WikiSearch(Arc::new(f))
+impl DocsSearch {
+    pub fn new(f: impl Fn(&str) -> Vec<DocsHit> + Send + Sync + 'static) -> Self {
+        DocsSearch(Arc::new(f))
     }
 
-    /// The wiki asked through `ask` (a client's way to its project's hub):
-    /// the tree for the titles, and the hub's `search` for the text. A wiki
+    /// The docs asked through `ask` (a client's way to its project's hub):
+    /// the tree for the titles, and the hub's `search` for the text. Docs
     /// that isn't set up, or a hub out of reach, finds nothing.
-    pub fn over(ask: Arc<dyn Fn(WikiRequest) -> WikiReply + Send + Sync>) -> Self {
-        WikiSearch::new(move |query| {
-            let WikiReply::Tree(nodes) = ask(WikiRequest::Tree { path: None }) else {
+    pub fn over(ask: Arc<dyn Fn(DocsRequest) -> DocsReply + Send + Sync>) -> Self {
+        DocsSearch::new(move |query| {
+            let DocsReply::Tree(nodes) = ask(DocsRequest::Tree { path: None }) else {
                 return Vec::new();
             };
-            let matches = match ask(WikiRequest::Search {
+            let matches = match ask(DocsRequest::Search {
                 query: query.trim().to_string(),
                 folder: None,
                 regex: false,
             }) {
-                WikiReply::Matches(m) => m,
+                DocsReply::Matches(m) => m,
                 _ => Vec::new(),
             };
-            rank_wiki(&nodes, &matches, query)
+            rank_docs(&nodes, &matches, query)
         })
     }
 
-    pub fn search(&self, query: &str) -> Vec<WikiHit> {
+    pub fn search(&self, query: &str) -> Vec<DocsHit> {
         (self.0)(query)
     }
 }
 
-impl std::fmt::Debug for WikiSearch {
+impl std::fmt::Debug for DocsSearch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("WikiSearch")
+        f.write_str("DocsSearch")
     }
 }
 
-impl PartialEq for WikiSearch {
+impl PartialEq for DocsSearch {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl Eq for WikiSearch {}
+impl Eq for DocsSearch {}
 
 /// The longest a matched line reads in a row's description.
-const WIKI_LINE_MAX: usize = 40;
+const DOCS_LINE_MAX: usize = 40;
 
-/// The wiki documents matching `query`, best first: a fuzzy title match
+/// The documents matching `query`, best first: a fuzzy title match
 /// ranks above a fuzzy file-name match, which ranks above a match in the
 /// text (`matches`, the hub's search, in its order); ties keep the tree's
 /// order.
-pub fn rank_wiki(nodes: &[WikiNode], matches: &[WikiMatch], query: &str) -> Vec<WikiHit> {
-    fn docs<'a>(nodes: &'a [WikiNode], out: &mut Vec<&'a WikiNode>) {
+pub fn rank_docs(nodes: &[DocsNode], matches: &[DocsMatch], query: &str) -> Vec<DocsHit> {
+    fn docs<'a>(nodes: &'a [DocsNode], out: &mut Vec<&'a DocsNode>) {
         for n in nodes {
             match n.kind {
                 NodeKind::Document => out.push(n),
@@ -502,7 +502,7 @@ pub fn rank_wiki(nodes: &[WikiNode], matches: &[WikiMatch], query: &str) -> Vec<
     let folder_of = |path: &str| -> String {
         match path.rsplit_once('/') {
             Some((folder, _)) => folder.to_string(),
-            None => "Wiki".to_string(),
+            None => "Documentation".to_string(),
         }
     };
     let mut scorer = Scorer::new(query.trim());
@@ -530,13 +530,13 @@ pub fn rank_wiki(nodes: &[WikiNode], matches: &[WikiMatch], query: &str) -> Vec<
         };
         seen.insert(all[ix].path.as_str());
         let line = m.text.trim().trim_start_matches('#').trim();
-        let detail = format!("{} · {}", folder_of(&m.path), crate::jobs::truncate(line, WIKI_LINE_MAX));
+        let detail = format!("{} · {}", folder_of(&m.path), crate::jobs::truncate(line, DOCS_LINE_MAX));
         ranked.push(((1, 0), ix, detail));
     }
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     ranked
         .into_iter()
-        .map(|(_, ix, detail)| WikiHit {
+        .map(|(_, ix, detail)| DocsHit {
             path: all[ix].path.clone(),
             title: all[ix].title.clone(),
             detail,
@@ -553,7 +553,7 @@ pub fn rank_wiki(nodes: &[WikiNode], matches: &[WikiMatch], query: &str) -> Vec<
 pub enum ResultItem {
     Command(Entry),
     Issue(IssueDoc),
-    Wiki(WikiHit),
+    Docs(DocsHit),
     Changelog(ChangelogHit),
     /// The end of a capped group under All: switches to `kind`'s filter.
     ShowAll { kind: ResultKind, count: usize },
@@ -566,7 +566,7 @@ impl ResultItem {
         let (id, label) = match self {
             ResultItem::Command(e) => return Some(e.clone()),
             ResultItem::Issue(d) => (format!("action:open-issue:{}", d.id), d.title.clone()),
-            ResultItem::Wiki(h) => (format!("action:open-wiki-doc:{}", h.path), h.title.clone()),
+            ResultItem::Docs(h) => (format!("action:open-docs-doc:{}", h.path), h.title.clone()),
             ResultItem::Changelog(h) => (format!("action:open-changelog-entry:{}", h.id), h.title.clone()),
             ResultItem::ShowAll { .. } => return None,
         };
@@ -603,7 +603,7 @@ impl ResultRow {
 pub fn match_count(filter: SearchFilter, commands: usize, hits: &SearchHits) -> usize {
     let of = |kind| match kind {
         ResultKind::Issue => hits.issues.len(),
-        ResultKind::Wiki => hits.wiki.len(),
+        ResultKind::Docs => hits.docs.len(),
         ResultKind::Changelog => hits.changelog.len(),
         ResultKind::Command => commands,
     };
@@ -627,7 +627,7 @@ pub fn result_rows(
     let items = |kind: ResultKind| -> Vec<ResultItem> {
         match kind {
             ResultKind::Issue => hits.issues.iter().cloned().map(ResultItem::Issue).collect(),
-            ResultKind::Wiki => hits.wiki.iter().cloned().map(ResultItem::Wiki).collect(),
+            ResultKind::Docs => hits.docs.iter().cloned().map(ResultItem::Docs).collect(),
             ResultKind::Changelog => hits.changelog.iter().cloned().map(ResultItem::Changelog).collect(),
             ResultKind::Command => commands.iter().map(|(e, _)| ResultItem::Command(e.clone())).collect(),
         }
@@ -923,8 +923,8 @@ mod tests {
         assert_eq!(rank_changelog(&entries, "1902").len(), 1);
     }
 
-    fn node(path: &str, title: &str) -> WikiNode {
-        WikiNode {
+    fn node(path: &str, title: &str) -> DocsNode {
+        DocsNode {
             path: path.into(),
             name: path.rsplit('/').next().unwrap().into(),
             title: title.into(),
@@ -934,22 +934,22 @@ mod tests {
         }
     }
 
-    fn wiki_tree() -> Vec<WikiNode> {
+    fn docs_tree() -> Vec<DocsNode> {
         vec![
-            WikiNode {
+            DocsNode {
                 path: "Plans".into(),
                 name: "Plans".into(),
                 title: "Plans".into(),
                 kind: NodeKind::Folder,
                 icon: None,
-                children: vec![node("Plans/wiki.md", "Wiki"), node("Plans/sync-notes.md", "How sync works")],
+                children: vec![node("Plans/docs.md", "Documentation"), node("Plans/sync-notes.md", "How sync works")],
             },
             node("README.md", "Read me"),
         ]
     }
 
-    fn hit_at(path: &str, line: &str) -> WikiMatch {
-        WikiMatch {
+    fn hit_at(path: &str, line: &str) -> DocsMatch {
+        DocsMatch {
             path: path.into(),
             line: 3,
             text: line.into(),
@@ -959,58 +959,58 @@ mod tests {
     }
 
     #[test]
-    fn wiki_titles_lead_then_file_names_then_the_text() {
-        let tree = wiki_tree();
+    fn docs_titles_lead_then_file_names_then_the_text() {
+        let tree = docs_tree();
         let matches = vec![
-            hit_at("README.md", "See the wiki plan for the merge flow."),
-            hit_at("Plans/wiki.md", "# Wiki"),
+            hit_at("README.md", "See the docs plan for the merge flow."),
+            hit_at("Plans/docs.md", "# Documentation"),
             hit_at("README.md", "a second line"),
         ];
-        let got = rank_wiki(&tree, &matches, "wiki");
+        let got = rank_docs(&tree, &matches, "docs");
         let got: Vec<(&str, &str)> = got.iter().map(|h| (h.path.as_str(), h.detail.as_str())).collect();
         assert_eq!(
             got,
-            [("Plans/wiki.md", "Plans"), ("README.md", "Wiki · See the wiki plan for the merge flow.")],
+            [("Plans/docs.md", "Plans"), ("README.md", "Documentation · See the docs plan for the merge flow.")],
             "one row a document, its first matching line"
         );
         // A file name finds what its title doesn't say.
-        let got = rank_wiki(&tree, &[], "sync-notes");
+        let got = rank_docs(&tree, &[], "sync-notes");
         assert_eq!(got.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["How sync works"]);
         // A match the tree doesn't know (a file the tree hides) is dropped.
-        assert!(rank_wiki(&tree, &[hit_at(".contextstore/x.md", "wiki")], "zzz").is_empty());
-        assert!(rank_wiki(&tree, &matches, "  ").is_empty());
+        assert!(rank_docs(&tree, &[hit_at(".contextstore/x.md", "docs")], "zzz").is_empty());
+        assert!(rank_docs(&tree, &matches, "  ").is_empty());
     }
 
     #[test]
-    fn the_wiki_is_asked_through_the_hub_once_per_search() {
+    fn the_docs_is_asked_through_the_hub_once_per_search() {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let log = asked.clone();
-        let search = WikiSearch::over(Arc::new(move |req: WikiRequest| {
+        let search = DocsSearch::over(Arc::new(move |req: DocsRequest| {
             log.lock().unwrap().push(req.clone());
             match req {
-                WikiRequest::Tree { .. } => WikiReply::Tree(wiki_tree()),
-                WikiRequest::Search { .. } => WikiReply::Matches(vec![hit_at("README.md", "the merge flow")]),
-                _ => WikiReply::Done,
+                DocsRequest::Tree { .. } => DocsReply::Tree(docs_tree()),
+                DocsRequest::Search { .. } => DocsReply::Matches(vec![hit_at("README.md", "the merge flow")]),
+                _ => DocsReply::Done,
             }
         }));
-        let corpus = SearchCorpus::default().with_wiki(Some(search));
+        let corpus = SearchCorpus::default().with_docs(Some(search));
         let hits = search_corpus(&corpus, "merge");
-        assert_eq!(hits.wiki.len(), 1);
-        assert_eq!(hits.wiki[0].path, "README.md");
+        assert_eq!(hits.docs.len(), 1);
+        assert_eq!(hits.docs[0].path, "README.md");
         let asked = asked.lock().unwrap().clone();
         assert_eq!(
             asked,
             [
-                WikiRequest::Tree { path: None },
-                WikiRequest::Search {
+                DocsRequest::Tree { path: None },
+                DocsRequest::Search {
                     query: "merge".into(),
                     folder: None,
                     regex: false
                 }
             ]
         );
-        // A wiki not set up finds nothing.
-        let none = WikiSearch::over(Arc::new(|_| WikiReply::failed(crate::wiki::FailureKind::NotSetUp, "no wiki")));
+        // Docs not set up finds nothing.
+        let none = DocsSearch::over(Arc::new(|_| DocsReply::failed(crate::docs::FailureKind::NotSetUp, "no docs")));
         assert!(none.search("merge").is_empty());
     }
 
@@ -1020,7 +1020,7 @@ mod tests {
         let hits = SearchHits {
             query: "lo".into(),
             issues: (0..5).map(|i| doc(&i.to_string(), "Login", "")).collect(),
-            wiki: vec![WikiHit {
+            docs: vec![DocsHit {
                 path: "Plans/login.md".into(),
                 title: "Login plan".into(),
                 detail: "Plans".into(),
@@ -1037,7 +1037,7 @@ mod tests {
             .map(|r| match r {
                 ResultRow::Header(k) => format!("# {}", k.heading()),
                 ResultRow::Item(ResultItem::Issue(d)) => format!("issue {}", d.id),
-                ResultRow::Item(ResultItem::Wiki(h)) => format!("doc {}", h.path),
+                ResultRow::Item(ResultItem::Docs(h)) => format!("doc {}", h.path),
                 ResultRow::Item(ResultItem::Changelog(h)) => format!("entry {}", h.id),
                 ResultRow::Item(ResultItem::Command(e)) => format!("command {}", e.id),
                 ResultRow::Item(ResultItem::ShowAll { kind, count }) => kind.show_all_label(*count),
@@ -1053,7 +1053,7 @@ mod tests {
                 "issue 1",
                 "issue 2",
                 "Show all 5 issues",
-                "# Wiki",
+                "# Documentation",
                 "doc Plans/login.md",
                 "# Changelog Entries",
                 "entry c",
@@ -1063,7 +1063,7 @@ mod tests {
         let alone = SearchHits {
             query: "lo".into(),
             issues: hits.issues.clone(),
-            wiki: vec![],
+            docs: vec![],
             changelog: vec![],
         };
         let rows = result_rows(&[], &alone, SearchFilter::All, true);
@@ -1095,12 +1095,12 @@ mod tests {
             detail: String::new(),
         });
         assert_eq!(entry.entry().unwrap().id, "action:open-changelog-entry:2026-10-28-login");
-        let wiki = ResultItem::Wiki(WikiHit {
-            path: "Plans/wiki.md".into(),
-            title: "Wiki".into(),
+        let docs = ResultItem::Docs(DocsHit {
+            path: "Plans/docs.md".into(),
+            title: "Documentation".into(),
             detail: String::new(),
         });
-        assert_eq!(wiki.entry().unwrap().id, "action:open-wiki-doc:Plans/wiki.md");
+        assert_eq!(docs.entry().unwrap().id, "action:open-docs-doc:Plans/docs.md");
         assert!(ResultItem::ShowAll {
             kind: ResultKind::Issue,
             count: 4

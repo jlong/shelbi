@@ -1,0 +1,278 @@
+---
+title: shelbi docs
+order: 20.7
+summary: Read and write the project's docs from the command line, with commands shaped like ContextStore's `cstore`.
+---
+
+```text
+shelbi docs tree    [<PATH>] [-L <N>] [--documents]
+shelbi docs ls      [<PATH>] [--stats]
+shelbi docs read    <PATH> [--section <HEADING>] [--head <N>] [--tail <N>]
+shelbi docs cat     <PATH>... [--headers] [--head <N>] [--tail <N>]
+shelbi docs search  <QUERY> [--folder <PATH> | --document <PATH>] [--regex]
+shelbi docs new     <PATH> [--title <TITLE>] [--content <TEXT> | stdin]
+shelbi docs write   <PATH> [--section <HEADING> | --title <TITLE>] [--content <TEXT> | stdin]
+shelbi docs append  <PATH> [--section <HEADING>] [--content <TEXT> | stdin]
+shelbi docs prepend <PATH> [--section <HEADING>] [--content <TEXT> | stdin]
+shelbi docs edit    <PATH>
+shelbi docs mv      <SOURCE> <DESTINATION>
+shelbi docs cp      <SOURCE> <DESTINATION>
+shelbi docs rm      <PATH> [--section <HEADING>]
+shelbi docs tasks   <PATH> [--section <HEADING>] [--pending]
+shelbi docs check   <PATH> <TEXT> [--section <HEADING>]
+shelbi docs uncheck <PATH> <TEXT> [--section <HEADING>]
+shelbi docs diff    [<PATH>]
+shelbi docs log     [<PATH>] [-n <N>]
+shelbi docs sync    [status|now|pause|resume]
+shelbi docs resolve <PATH> [--ours | --theirs]
+shelbi docs open    [<PATH>] [--no-launch]
+shelbi docs init
+```
+
+Reads and writes the project's [docs](/docs/concepts/docs). The commands have
+the same names, arguments and exit codes as ContextStore's `cstore`, so scripts
+and agent prompts written for one work with the other.
+
+Every command goes through the hub, the docs' only writer, which starts on
+demand. Nothing touches the docs' files directly, and you never commit or push:
+the hub commits a few seconds after each change and syncs on its own.
+
+## Common flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--project <NAME>` | The project whose docs to use. Defaults to `$SHELBI_PROJECT`, then the project of the current directory, so inside a workspace you rarely need it. |
+| `--format text\|json` | Output format. `text` by default. |
+| `--agent` | JSON output with no color, for agents and scripts. |
+| `--section <HEADING>` | Work on one section, named by its heading as written (`"## Goals"`). The section runs to the next heading at its level or higher. |
+
+**Paths** are relative to the docs' root (`Plans/auth.md`). A path ending in
+`.md` is a document; any other path is a folder. A trailing `/` is optional.
+
+**Content** for `new`, `write`, `append` and `prepend` comes from `--content`,
+or from stdin when it is piped (`--content -` reads stdin explicitly).
+`--content` may start with `-`, so a list item or frontmatter works as is.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | OK. |
+| `1` | Error, including a project with no docs yet. |
+| `2` | Not found. |
+| `3` | Invalid: bad arguments, a path that already exists, or a `check` that matched more than one task. |
+| `4` | Conflict: the document is held by a sync conflict, or changed elsewhere while you edited it. |
+
+With `--format json` or `--agent`, a failure prints
+`{"error": {"kind": "...", "message": "..."}}` on stderr.
+
+## Browsing
+
+### tree
+
+Prints the docs' folders as a tree, from the root or from `<PATH>`.
+`--documents` adds the documents, labeled by title; `-L <N>` descends at most
+`N` levels. With `--format json`, each node has `path`, `name`, `title`, `kind`
+and `children`.
+
+```sh
+shelbi docs tree --documents
+shelbi docs tree Plans -L 1
+```
+
+### ls
+
+Lists one folder's entries, or, given a document, its headings. `--stats` adds
+line, word and size counts.
+
+```sh
+shelbi docs ls Plans --stats
+shelbi docs ls Plans/auth.md
+```
+
+### read
+
+Prints a document, or one section of it with `--section`. `--head <N>` and
+`--tail <N>` keep the first or last `N` lines (`--tail` wins when both are
+given). With `--format json` the result carries the `path`, the `title` and
+the `content`.
+
+```sh
+shelbi docs read Plans/auth.md
+shelbi docs read Plans/auth.md --section "## Decisions"
+```
+
+### cat
+
+Prints several documents, one after another. A folder stands for the documents
+directly in it. `--headers` puts a `--- <path> ---` line before each.
+
+```sh
+shelbi docs cat Plans/ --headers
+```
+
+### search
+
+Searches the documents' text, case-insensitively, and prints each matching line
+as `path:line: text`. `--folder` or `--document` narrows the search; `--regex`
+treats the query as a regular expression.
+
+```sh
+shelbi docs search "rate limit"
+shelbi docs search "PIX-\d+" --regex --folder Plans
+```
+
+### diff and log
+
+`diff` prints the change the hub hasn't committed yet, as a unified diff
+(usually empty, since it commits within seconds). `log` lists the commits that
+changed the docs, a folder or a document (following renames), 20 by default.
+
+```sh
+shelbi docs log Plans/auth.md -n 5
+```
+
+## Editing
+
+### new
+
+Creates a document (a path ending in `.md`) or a folder (any other path). A
+document starts with `# <title>`: `--title`, else a title made from the file
+name, unless the content starts with a heading of its own. A folder's
+`--content` is its description. Fails with exit code `3` when the path exists.
+
+```sh
+shelbi docs new Plans/auth.md --title "Auth" --content "## Goals"
+cat notes.md | shelbi docs new Research/notes.md
+shelbi docs new Design --content "Design docs"
+```
+
+### write
+
+Replaces a document's text. Its frontmatter and title stay unless the new
+content brings its own; `--title` sets the title. With `--section`, only that
+section's body is replaced and its heading stays. The document must exist.
+
+```sh
+cat auth.md | shelbi docs write Plans/auth.md
+shelbi docs write Plans/auth.md --section "## Goals" --content "- Ship it"
+```
+
+### append and prepend
+
+Add content to the end or the start of a document (after its frontmatter and
+title) or of a section (after its heading). Frontmatter is never touched.
+
+```sh
+shelbi docs append Plans/auth.md --section "## Decisions" --content "- Tokens last 15 minutes."
+shelbi docs prepend Plans/log.md --content "Latest first."
+```
+
+### edit
+
+Copies a document to a temporary file and opens it in `$EDITOR` (else
+`$VISUAL`, else `vi`). When the editor exits, a changed file is saved through
+the hub. If the document changed elsewhere in the meantime, nothing is saved:
+the command exits with `4` and prints where your copy is.
+
+```sh
+EDITOR="code --wait" shelbi docs edit Plans/auth.md
+```
+
+## File management
+
+### mv and cp
+
+Move, rename or copy a document or folder. A destination that is an existing
+folder receives the source inside it.
+
+```sh
+shelbi docs mv Plans/old.md Plans/new.md
+shelbi docs mv Plans/auth.md Archive/
+shelbi docs cp Plans/template.md Plans/billing.md
+```
+
+### rm
+
+Removes a document or folder, or one section of a document with `--section`.
+Removed files stay in the docs' history (`shelbi docs log`).
+
+```sh
+shelbi docs rm Plans/old.md
+shelbi docs rm Plans/auth.md --section "## Open questions"
+```
+
+## Tasks
+
+`tasks` lists the checkboxes (`- [ ]`, `- [x]`) in a document, a section, or
+the documents directly in a folder; `--pending` keeps the open ones. `check` and
+`uncheck` change the one task whose text contains `<TEXT>`, case-insensitively.
+No match exits with `2`, more than one with `3`.
+
+```sh
+shelbi docs tasks Plans/ --pending
+shelbi docs check Plans/auth.md "Token refresh"
+```
+
+## Sync
+
+`shelbi docs sync` (or `sync status`) prints where the sync stands: the status
+(`synced`, `syncing`, `pending`, `offline`, `conflict` or `error`), the source
+and branch, the last sync, the rolling pull request in folder mode, and any held
+documents.
+
+```text
+Status:       synced
+Source:       orphan branch on docs/planning
+Root:         /Users/you/.shelbi/projects/myapp/docs
+Last synced:  2026-11-27T10:42:13-08:00
+```
+
+`sync now` commits, pulls and pushes at once and waits for it. `sync pause`
+stops syncing on the clock until `sync resume`; changes are still kept.
+
+### resolve
+
+A document edited here and elsewhere in a way the merge can't combine is held:
+origin keeps the other version, this machine keeps yours, and the document stays
+out of the sync until it's resolved. `sync status` lists held documents under
+`Conflicts:`.
+
+```sh
+shelbi docs resolve Plans/auth.md            # the hunks: where the versions differ
+shelbi docs resolve Plans/auth.md --ours     # keep this machine's version
+shelbi docs resolve Plans/auth.md --theirs   # take the version from elsewhere
+```
+
+Resolving commits "Resolve merge conflicts" and syncs. To mix the two versions
+hunk by hunk, use the conflict inspector in the desktop app or the TUI.
+
+## App integration
+
+### open
+
+Shows the docs, or a document or folder, in every app showing the project, then
+starts the desktop app (macOS) unless `--no-launch`.
+
+```sh
+shelbi docs open Plans/auth.md
+```
+
+### init
+
+Sets the project's docs up: writes the project YAML's `docs:` block, then has
+the hub create the docs. With no flags it's the orphan branch `docs/planning`
+(or what the block already says). `--branch` picks another orphan branch;
+`--source folder` uses a folder of the repo, `docs` unless `--path` names
+another (relative to the repo's root, inside it). `--branch` alone implies
+`--source branch` and `--path` alone `--source folder`. Flags left out keep
+what the block says, so running it again changes only what you pass. A branch
+git won't take, or a path outside the repo, is refused (exit 3) before
+anything is written. See [Where it lives](/docs/concepts/docs#where-it-lives).
+
+```sh
+shelbi docs init                       # the orphan branch docs/planning
+shelbi docs init --branch docs         # another orphan branch
+shelbi docs init --source folder       # the repo's docs/ folder
+shelbi docs init --path handbook       # the repo's handbook/ folder
+```

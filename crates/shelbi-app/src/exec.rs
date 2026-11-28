@@ -36,9 +36,9 @@ pub enum Effect {
     /// Show the Changelog with entry `id` in view (a client-local view
     /// change).
     OpenChangelogEntry { project: String, id: String },
-    /// Show the Wiki with document `path` open (a client-local view
+    /// Show the Documentation with document `path` open (a client-local view
     /// change).
-    OpenWikiDoc { project: String, path: String },
+    OpenDoc { project: String, path: String },
     /// Open Settings in place of the navigation column, on the page last
     /// used (a client-local view change; nothing stops).
     OpenSettings,

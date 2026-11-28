@@ -119,7 +119,7 @@ pub(crate) mod issues;
 mod machine_form;
 pub(crate) mod properties;
 mod tool_picker;
-pub(crate) mod wiki;
+pub(crate) mod docs;
 mod workflow_editor;
 mod workflows;
 pub(crate) mod workspaces;
@@ -129,7 +129,7 @@ use agent_editor::{AgentEditorPage, Back as AgentBack, EditorAction as AgentActi
 pub(crate) use agents::CommitJob;
 use agents::{AgentsHit, AgentsPage, Outcome};
 use issues::IssuesPage;
-use wiki::WikiPage;
+use docs::DocsPage;
 use properties::PropertiesPage;
 use tool_picker::ToolLayer;
 pub(crate) use workflow_editor::{run_work, EditorDone, EditorWork};
@@ -171,7 +171,7 @@ pub(crate) const OFFERED: PageSet = PageSet::NONE
     .with(SettingsPage::Orchestrator)
     .with(SettingsPage::Properties)
     .with(SettingsPage::Issues)
-    .with(SettingsPage::Wiki);
+    .with(SettingsPage::Docs);
 
 /// A page's background read the shell starts ([`SettingsShell::begin_page_load`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,9 +303,9 @@ pub(crate) enum SettingsAction {
     /// Save the Properties page's changes off the UI thread
     /// ([`SettingsShell::properties_saved`] takes the result).
     SaveProperties(Box<PropertiesSave>),
-    /// The Wiki page has work (a read, a save, Sync now, Set up) to run off
-    /// the UI thread ([`SettingsShell::take_wiki_work`]).
-    WikiWork,
+    /// The Documentation page has work (a read, a save, Sync now, Set up) to run off
+    /// the UI thread ([`SettingsShell::take_docs_work`]).
+    DocsWork,
 }
 
 /// The Properties page's save: `project`'s config with the edited
@@ -335,10 +335,10 @@ fn issues_action(page: &IssuesPage) -> SettingsAction {
     }
 }
 
-/// What a Wiki key or click asks for: the page's work, if it has some.
-fn wiki_action(page: &WikiPage) -> SettingsAction {
+/// What a Documentation key or click asks for: the page's work, if it has some.
+fn docs_action(page: &DocsPage) -> SettingsAction {
     if page.work_due() {
-        SettingsAction::WikiWork
+        SettingsAction::DocsWork
     } else {
         SettingsAction::Stay
     }
@@ -460,7 +460,7 @@ fn page_glyph(page: SettingsPage) -> &'static str {
         SettingsPage::Orchestrator => "📡",
         SettingsPage::Properties => "📋",
         SettingsPage::Issues => "🎫",
-        SettingsPage::Wiki => "📖",
+        SettingsPage::Docs => "📖",
     }
 }
 
@@ -520,8 +520,8 @@ pub(crate) struct SettingsShell {
     prompt_properties: bool,
     /// The Issues page, loaded per project.
     issues: IssuesPage,
-    /// The Wiki page, loaded per project.
-    wiki: WikiPage,
+    /// The Documentation page, loaded per project.
+    docs: DocsPage,
     /// The page's text start column at the last draw (editor clicks).
     page_x: u16,
     /// The workflow editor, while it shows (over both columns).
@@ -584,7 +584,7 @@ impl Default for SettingsShell {
             properties: PropertiesPage::default(),
             prompt_properties: false,
             issues: IssuesPage::default(),
-            wiki: WikiPage::default(),
+            docs: DocsPage::default(),
             page_x: 0,
             editor: None,
             agent_editor: None,
@@ -679,8 +679,8 @@ impl SettingsShell {
     }
 
     #[cfg(test)]
-    pub(crate) fn wiki(&self) -> &WikiPage {
-        &self.wiki
+    pub(crate) fn docs(&self) -> &DocsPage {
+        &self.docs
     }
 
     #[cfg(test)]
@@ -1122,7 +1122,7 @@ impl SettingsShell {
         self.form.cancel_edit();
         self.properties.cancel_typing();
         self.issues.cancel_typing();
-        self.wiki.cancel_typing();
+        self.docs.cancel_typing();
         self.agents.close_editor();
         if let Some(editor) = self.editor.as_mut() {
             editor.discard_for_settings();
@@ -1188,8 +1188,8 @@ impl SettingsShell {
         if self.nav.page() == SettingsPage::Issues {
             return self.region == Region::Page && self.issues.paste(text);
         }
-        if self.nav.page() == SettingsPage::Wiki {
-            return self.region == Region::Page && self.wiki.paste(text);
+        if self.nav.page() == SettingsPage::Docs {
+            return self.region == Region::Page && self.docs.paste(text);
         }
         if self.tools.paste(text) {
             return true;
@@ -1275,7 +1275,7 @@ impl SettingsShell {
         self.orch_restart.reset();
         self.properties.project_changed();
         self.issues.project_changed();
-        self.wiki.project_changed();
+        self.docs.project_changed();
         self.save.reset();
         self.action = 0;
         self.scroll = 0;
@@ -1305,7 +1305,7 @@ impl SettingsShell {
             | SettingsPage::Orchestrator
             | SettingsPage::Properties
             | SettingsPage::Issues
-            | SettingsPage::Wiki => None,
+            | SettingsPage::Docs => None,
         }
     }
 
@@ -1359,9 +1359,9 @@ impl SettingsShell {
                 Some(Load::Issues(ticket, project?.to_string()))
             }
             // Read on every visit (a hand edit, a sync made elsewhere), as
-            // the page's own work: [`Self::take_wiki_work`].
-            SettingsPage::Wiki => {
-                self.wiki.visit(project);
+            // the page's own work: [`Self::take_docs_work`].
+            SettingsPage::Docs => {
+                self.docs.visit(project);
                 None
             }
             SettingsPage::Terminal => None,
@@ -1385,26 +1385,26 @@ impl SettingsShell {
         issues_action(&self.issues)
     }
 
-    /// The Wiki page's work to run now: its project, the generation to hand
+    /// The Documentation page's work to run now: its project, the generation to hand
     /// back with each result, and the work.
-    pub(crate) fn take_wiki_work(
+    pub(crate) fn take_docs_work(
         &mut self,
-    ) -> Option<(String, u64, Vec<shelbi_app::settings::wiki::WikiWork>)> {
-        self.wiki.take_wiki_work()
+    ) -> Option<(String, u64, Vec<shelbi_app::settings::docs::DocsWork>)> {
+        self.docs.take_docs_work()
     }
 
-    /// A piece of the Wiki page's work landed for `project`: more may
+    /// A piece of the Documentation page's work landed for `project`: more may
     /// follow (a save reads the hub's status again).
-    pub(crate) fn wiki_done(
+    pub(crate) fn docs_done(
         &mut self,
         project: &str,
         generation: u64,
-        done: shelbi_app::settings::wiki::WikiDone,
+        done: shelbi_app::settings::docs::DocsDone,
     ) -> SettingsAction {
-        if !self.wiki.wiki_done(project, generation, done) {
+        if !self.docs.docs_done(project, generation, done) {
             self.dropped += 1;
         }
-        wiki_action(&self.wiki)
+        docs_action(&self.docs)
     }
 
     /// The Issues page's work to run now, for its project.
@@ -1757,7 +1757,7 @@ impl SettingsShell {
             | SettingsPage::Agents
             | SettingsPage::Properties
             | SettingsPage::Issues
-            | SettingsPage::Wiki => Vec::new(),
+            | SettingsPage::Docs => Vec::new(),
         }
     }
 
@@ -1979,12 +1979,12 @@ impl SettingsShell {
             self.issues.key(k, nav);
             return issues_action(&self.issues);
         }
-        if self.region == Region::Page && self.nav.page() == SettingsPage::Wiki && self.wiki.typing() {
+        if self.region == Region::Page && self.nav.page() == SettingsPage::Docs && self.docs.typing() {
             // The field being typed holds every key (Esc puts it back, Enter
             // saves it; digits and Tab type).
             let nav = Nav { up: false, down: false, activate: false };
-            self.wiki.key(k, nav);
-            return wiki_action(&self.wiki);
+            self.docs.key(k, nav);
+            return docs_action(&self.docs);
         }
         let chord = crate::keymap::chord_from_event(k);
         let sidebar = chord.and_then(|c| keymaps.sidebar.dispatch(c));
@@ -2032,9 +2032,9 @@ impl SettingsShell {
             }
             Region::Page if on_workflows => self.workflows.handle_key(k, nav),
             Region::Page if self.nav.page() == SettingsPage::Keybindings => self.keys_key(k, keymaps),
-            Region::Page if self.nav.page() == SettingsPage::Wiki => {
-                if self.wiki.key(k, nav) {
-                    return wiki_action(&self.wiki);
+            Region::Page if self.nav.page() == SettingsPage::Docs => {
+                if self.docs.key(k, nav) {
+                    return docs_action(&self.docs);
                 }
                 match k.code {
                     KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
@@ -2042,8 +2042,8 @@ impl SettingsShell {
                     KeyCode::Home => self.scroll = 0,
                     KeyCode::End => self.scroll = u16::MAX,
                     KeyCode::Char('r') if k.modifiers.is_empty() => {
-                        self.wiki.refresh();
-                        return wiki_action(&self.wiki);
+                        self.docs.refresh();
+                        return docs_action(&self.docs);
                     }
                     _ => {}
                 }
@@ -2355,17 +2355,17 @@ impl SettingsShell {
                         self.issues.activate(i);
                         issues_action(&self.issues)
                     }
-                    Some(Hit::Action(i)) if self.nav.page() == SettingsPage::Wiki => {
-                        if self.wiki.typing() {
+                    Some(Hit::Action(i)) if self.nav.page() == SettingsPage::Docs => {
+                        if self.docs.typing() {
                             // A click in the field being typed leaves it
                             // typing; one elsewhere saves it first.
-                            if i == self.wiki.cursor() {
+                            if i == self.docs.cursor() {
                                 return SettingsAction::Stay;
                             }
-                            self.wiki.commit_typing();
+                            self.docs.commit_typing();
                         }
-                        self.wiki.activate(i);
-                        wiki_action(&self.wiki)
+                        self.docs.activate(i);
+                        docs_action(&self.docs)
                     }
                     Some(Hit::Action(i)) => self.run_action(i),
                     Some(Hit::Agents(h)) => {
@@ -2654,7 +2654,7 @@ impl SettingsShell {
             SettingsPage::Workspaces => self.workspaces.cursor(),
             SettingsPage::Properties => self.properties.cursor(),
             SettingsPage::Issues => self.issues.cursor(),
-            SettingsPage::Wiki => self.wiki.cursor(),
+            SettingsPage::Docs => self.docs.cursor(),
             _ => self.action,
         };
         // Keep the focused rows in view: the last marked, then the first (an
@@ -2750,7 +2750,7 @@ impl SettingsShell {
             SettingsPage::Workflows => self.workflows.rows(width, self.region == Region::Page, self.has_project),
             SettingsPage::Properties => self.properties.rows(width, self.region == Region::Page, self.has_project),
             SettingsPage::Issues => self.issues.rows(width, self.region == Region::Page, self.has_project),
-            SettingsPage::Wiki => self.wiki.rows(width, self.region == Region::Page, self.has_project),
+            SettingsPage::Docs => self.docs.rows(width, self.region == Region::Page, self.has_project),
             SettingsPage::Agents => {
                 let focused = self.region == Region::Page;
                 self.agents.rows(width, height, focused)
@@ -4061,7 +4061,7 @@ mod tests {
                 Stop::Page(SettingsPage::Orchestrator),
                 Stop::Page(SettingsPage::Agents),
                 Stop::Page(SettingsPage::Issues),
-                Stop::Page(SettingsPage::Wiki),
+                Stop::Page(SettingsPage::Docs),
                 Stop::Page(SettingsPage::Workflows),
                 Stop::Page(SettingsPage::Workspaces)
             ]
@@ -4085,7 +4085,7 @@ mod tests {
             SettingsPage::Orchestrator,
             SettingsPage::Agents,
             SettingsPage::Issues,
-            SettingsPage::Wiki,
+            SettingsPage::Docs,
             SettingsPage::Workflows,
             SettingsPage::Workspaces,
         ] {

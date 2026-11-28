@@ -1,0 +1,25 @@
+{
+  "name": "shelbi-docs",
+  "version": "1.0.0",
+  "description": "Read and write the project's docs: plans, designs, decisions and project context.",
+  "author": {
+    "name": "Shelbi"
+  },
+  "homepage": "https://shelbi.dev",
+  "repository": "https://github.com/jlong/shelbi",
+  "license": "MIT",
+  "keywords": ["shelbi", "docs", "documentation", "plans"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Shelbi Docs",
+    "shortDescription": "Read and write the project's docs",
+    "longDescription": "Find project context, plans and decisions in the project's docs, and write plans and design docs there with `shelbi docs`.",
+    "developerName": "Shelbi",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://shelbi.dev",
+    "defaultPrompt": [
+      "Find the plan for this task in the docs."
+    ]
+  }
+}

@@ -203,7 +203,7 @@ fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext
         ("ctrl-5", SettingsPage::Orchestrator),
         ("ctrl-6", SettingsPage::Agents),
         ("ctrl-7", SettingsPage::Issues),
-        ("ctrl-8", SettingsPage::Wiki),
+        ("ctrl-8", SettingsPage::Docs),
         ("ctrl-9", SettingsPage::Workflows),
     ] {
         s.key(&crate::keys::test_keys::row_spec(key));
@@ -263,7 +263,7 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
         SettingsPage::Orchestrator,
         SettingsPage::Agents,
         SettingsPage::Issues,
-        SettingsPage::Wiki,
+        SettingsPage::Docs,
         SettingsPage::Workflows,
         SettingsPage::Workspaces,
     ] {
@@ -1683,33 +1683,33 @@ fn restart_orchestrator_asks_the_projects_daemon_once(cx: &mut TestAppContext) {
     );
 }
 
-// ---- Settings ▸ Wiki (`wiki-settings`) ---------------------------------------
+// ---- Settings ▸ Documentation (`docs-settings`) ---------------------------------------
 
-use crate::views::wiki_settings::WikiSettingsPage;
+use crate::views::docs_settings::DocsSettingsPage;
 
 impl Settings {
-    /// Settings on Wiki (⌃8), its page reading `home`'s files and asking
+    /// Settings on Documentation (⌃8), its page reading `home`'s files and asking
     /// a hub that answers from `status` (Init sets it up), recording what
     /// it's asked.
-    fn open_wiki(
+    fn open_docs(
         cx: &mut TestAppContext,
-        status: std::sync::Arc<std::sync::Mutex<shelbi_app::wiki::WikiStatus>>,
-        asked: std::sync::Arc<std::sync::Mutex<Vec<shelbi_app::wiki::WikiRequest>>>,
+        status: std::sync::Arc<std::sync::Mutex<shelbi_app::docs::DocsStatus>>,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<shelbi_app::docs::DocsRequest>>>,
     ) -> Settings {
-        use shelbi_app::wiki::{SyncState, WikiReply, WikiRequest};
+        use shelbi_app::docs::{SyncState, DocsReply, DocsRequest};
         let mut s = Settings::open(cx);
         s.open_settings();
         s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
-        let page = s.wiki();
-        let ask: shelbi_app::settings::wiki::Ask = std::sync::Arc::new(move |req: WikiRequest| {
+        let page = s.docs();
+        let ask: shelbi_app::settings::docs::Ask = std::sync::Arc::new(move |req: DocsRequest| {
             asked.lock().unwrap().push(req.clone());
             let mut st = status.lock().unwrap();
-            if matches!(req, WikiRequest::Init) {
+            if matches!(req, DocsRequest::Init) {
                 st.set_up = true;
                 st.state = SyncState::Synced;
-                st.root = "/home/u/.shelbi/projects/alpha/wiki".into();
+                st.root = "/home/u/.shelbi/projects/alpha/docs".into();
             }
-            WikiReply::Status(st.clone())
+            DocsReply::Status(st.clone())
         });
         s.update(|_, window, cx| {
             page.update(cx, |p, cx| {
@@ -1721,86 +1721,86 @@ impl Settings {
         s
     }
 
-    fn wiki(&self) -> Entity<WikiSettingsPage> {
+    fn docs(&self) -> Entity<DocsSettingsPage> {
         self.read(|w, cx| match &w.route {
-            Route::Settings(view) => view.read(cx).wiki(),
+            Route::Settings(view) => view.read(cx).docs(),
             _ => panic!("Settings is open"),
         })
     }
 }
 
 #[gpui::test]
-fn the_wiki_page_sets_up_the_wiki_and_saves_its_block(cx: &mut TestAppContext) {
-    use shelbi_app::wiki::{SyncOp, WikiRequest, WikiStatus};
-    use shelbi_core::{WikiSource, WikiSyncMode};
-    let _home = Home::with_project("wiki-page", "alpha");
-    let status = std::sync::Arc::new(std::sync::Mutex::new(WikiStatus::not_set_up()));
+fn the_docs_page_sets_up_the_docs_and_saves_its_block(cx: &mut TestAppContext) {
+    use shelbi_app::docs::{SyncOp, DocsRequest, DocsStatus};
+    use shelbi_core::{DocsSource, DocsSyncMode};
+    let _home = Home::with_project("docs-page", "alpha");
+    let status = std::sync::Arc::new(std::sync::Mutex::new(DocsStatus::not_set_up()));
     let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut s = Settings::open_wiki(cx, status.clone(), asked.clone());
-    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Wiki), Some(SettingsPage::Wiki)));
+    let mut s = Settings::open_docs(cx, status.clone(), asked.clone());
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Docs), Some(SettingsPage::Docs)));
     for selector in [
-        "settings-nav-wiki",
-        "settings-page-wiki",
-        "wiki-source",
-        "wiki-source-branch",
-        "wiki-source-folder",
-        "wiki-location-row",
-        "wiki-auto-sync",
-        "wiki-status",
-        "wiki-sync-button",
+        "settings-nav-docs",
+        "settings-page-docs",
+        "docs-source",
+        "docs-source-branch",
+        "docs-source-folder",
+        "docs-location-row",
+        "docs-auto-sync",
+        "docs-status",
+        "docs-sync-button",
     ] {
         assert!(s.drawn(selector), "{selector}");
     }
     // The wireframe's order: source, location, auto-sync, status.
     for pair in [
-        ["wiki-source-branch", "wiki-source-folder"],
-        ["wiki-source-folder", "wiki-location-row"],
-        ["wiki-location-row", "wiki-auto-sync"],
-        ["wiki-auto-sync", "wiki-status"],
+        ["docs-source-branch", "docs-source-folder"],
+        ["docs-source-folder", "docs-location-row"],
+        ["docs-location-row", "docs-auto-sync"],
+        ["docs-auto-sync", "docs-status"],
     ] {
         assert!(s.above(pair[0], pair[1]), "{} above {}", pair[0], pair[1]);
     }
-    let page = s.wiki();
+    let page = s.docs();
     let form = |s: &Settings| s.read(|_, cx| page.read(cx).form().clone());
-    assert!(!form(&s).live(), "no wiki yet");
-    assert_eq!(form(&s).button().0.label(), "Set up wiki");
+    assert!(!form(&s).live(), "no docs yet");
+    assert_eq!(form(&s).button().0.label(), "Set up docs");
 
     // A pick before setup is a draft: nothing is written.
-    s.click("wiki-source-folder");
+    s.click("docs-source-folder");
     s.saved();
-    assert_eq!(form(&s).source(), WikiSource::Folder);
-    assert!(shelbi_state::load_project("alpha").unwrap().wiki.is_none());
+    assert_eq!(form(&s).source(), DocsSource::Folder);
+    assert!(shelbi_state::load_project("alpha").unwrap().docs.is_none());
 
     // Set up writes the block and asks the hub.
-    s.click("wiki-sync-button");
+    s.click("docs-sync-button");
     s.saved();
-    let block = shelbi_state::load_project("alpha").unwrap().wiki.unwrap();
-    assert_eq!((block.source, block.path.as_deref()), (WikiSource::Folder, Some("docs")));
-    assert!(asked.lock().unwrap().contains(&WikiRequest::Init));
+    let block = shelbi_state::load_project("alpha").unwrap().docs.unwrap();
+    assert_eq!((block.source, block.path.as_deref()), (DocsSource::Folder, Some("docs")));
+    assert!(asked.lock().unwrap().contains(&DocsRequest::Init));
     assert!(form(&s).set_up());
     assert_eq!(form(&s).button().0.label(), "Sync now");
-    assert!(s.drawn("wiki-root"));
+    assert!(s.drawn("docs-root"));
 
     // The folder saves on Return; a path out of the repo is refused.
     let input = s.read(|_, cx| page.read(cx).input());
     s.enter_text(input.clone(), "../out");
-    assert!(s.drawn("wiki-location-error"));
-    assert_eq!(shelbi_state::load_project("alpha").unwrap().wiki.unwrap().path.as_deref(), Some("docs"));
+    assert!(s.drawn("docs-location-error"));
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().docs.unwrap().path.as_deref(), Some("docs"));
     s.enter_text(input, "handbook");
-    assert!(!s.drawn("wiki-location-error"));
-    assert_eq!(shelbi_state::load_project("alpha").unwrap().wiki.unwrap().path.as_deref(), Some("handbook"));
-    assert!(s.drawn("wiki-save-status"), "Saved to … shows");
+    assert!(!s.drawn("docs-location-error"));
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().docs.unwrap().path.as_deref(), Some("handbook"));
+    assert!(s.drawn("docs-save-status"), "Saved to … shows");
 
     // Auto-sync off saves at once.
-    s.click("wiki-auto-sync");
+    s.click("docs-auto-sync");
     s.saved();
-    assert_eq!(shelbi_state::load_project("alpha").unwrap().wiki.unwrap().sync, WikiSyncMode::Manual);
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().docs.unwrap().sync, DocsSyncMode::Manual);
 
     // Sync now asks the hub.
     asked.lock().unwrap().clear();
-    s.click("wiki-sync-button");
+    s.click("docs-sync-button");
     s.saved();
-    assert_eq!(asked.lock().unwrap().first(), Some(&WikiRequest::Sync(SyncOp::Now)));
+    assert_eq!(asked.lock().unwrap().first(), Some(&DocsRequest::Sync(SyncOp::Now)));
 }
 
 // ---- Settings ▸ Properties (`settings-properties-page`) ---------------------

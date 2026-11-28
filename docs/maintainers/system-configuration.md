@@ -41,19 +41,19 @@ not a warning (the desktop app's CLI installer and older packages don't carry
 it). If staging fails, the launch falls back to the v1 bootstrap. The plugin's
 own `README.md` documents its delivery contract and monitor lifetime.
 
-## The wiki plugin
+## The docs plugin
 
-A third bundle, `plugins/shelbi-wiki`, carries the `shelbi-wiki` skill: what the
-project's wiki is, when to read and write it, and the `shelbi wiki` commands.
+A third bundle, `plugins/shelbi-docs`, carries the `shelbi-docs` skill: what the
+project's docs are, when to read and write it, and the `shelbi docs` commands.
 Unlike the two above it goes to **every** agent, orchestrator and workers, on
 every runner. After an agent's own skills are mounted
-(`deploy_wiki_skill` in `crates/shelbi-orchestrator/src/workspace.rs`), Shelbi
-writes the skill as a real file to `.claude/skills/shelbi-wiki/` (Claude Code)
-and `.agents/skills/shelbi-wiki/` (Codex); an OpenCode worker gets it in
+(`deploy_docs_skill` in `crates/shelbi-orchestrator/src/workspace.rs`), Shelbi
+writes the skill as a real file to `.claude/skills/shelbi-docs/` (Claude Code)
+and `.agents/skills/shelbi-docs/` (Codex); an OpenCode worker gets it in
 `.shelbi/opencode/skills/` instead (`workspace/opencode.rs`). The name is
 reserved the same way as `update-shelbi-configuration`: a project skill of that
 name is suppressed with a warning, and a git-tracked one is never overwritten.
-Resolution (`crates/shelbi-orchestrator/src/wiki_plugin.rs`) is installed copy
+Resolution (`crates/shelbi-orchestrator/src/docs_plugin.rs`) is installed copy
 first, embedded copy otherwise, with no warning when the installed copy is
 simply absent.
 

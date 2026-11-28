@@ -445,7 +445,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_tracker_ownership_dispatch(entry, &text, out);
         sniff_claim_on_start_dispatch(entry, &text, out);
         sniff_orchestrator_changelog(entry, &text, out);
-        sniff_orchestrator_wiki(entry, &text, out);
+        sniff_orchestrator_docs(entry, &text, out);
         sniff_orchestrator_changelog_attachments(entry, &text, out);
         sniff_orchestrator_changelog_releases(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
@@ -461,7 +461,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
     } else if id.ends_with(SHARED_PREAMBLE_SURFACE_SUFFIX) {
         sniff_shared_preamble(entry, &text, out);
         sniff_shared_preamble_jobs(entry, &text, out);
-        sniff_shared_preamble_wiki(entry, &text, out);
+        sniff_shared_preamble_docs(entry, &text, out);
     } else if id.ends_with(".changelog-template") {
         sniff_changelog_template(entry, &text, out);
     } else if id.ends_with(".zenmode") {
@@ -777,6 +777,14 @@ fn sniff_agent_pr_body_path(entry: &InventoryEntry, text: &str, out: &mut Vec<Up
 /// command. The product no longer runs tmux — agents drive the session backend
 /// (`shelbi session snapshot` / `shelbi session send`) — so these passages are
 /// stale guidance pointing at a command that is gone.
+/// A project YAML's top-level `wiki:` block, the legacy name of `docs:`
+/// (auto-healed: renamed in place).
+pub(crate) const PROJECT_WIKI_KEY_CODE: &str = "PROJECT_WIKI_KEY_DEPRECATED";
+
+/// A project YAML with both a legacy `wiki:` block and a `docs:` one (needs
+/// judgment: which one is meant).
+pub(crate) const PROJECT_WIKI_KEY_BOTH_CODE: &str = "PROJECT_WIKI_KEY_CONFLICT";
+
 pub(crate) const TMUX_INSTRUCTION_AUTOHEAL_CODE: &str = "INSTRUCTIONS_TMUX_COMMAND";
 /// Same deprecation, but the surrounding passage has been edited so no exact
 /// known legacy form matches — the rewrite can't be applied mechanically without
@@ -1507,6 +1515,25 @@ fn sniff_project_registration(
                 "top-level `workers:` is the pre-rename name for `workspaces:`",
                 "Rename the key to `workspaces:` (same value).",
                 locate_key(text, "workers"),
+            )),
+            // The `docs:` block's name before Documentation was called that.
+            // Still read (an alias), but renamed so the file says `docs:`.
+            // Both at once is a merge only the user can make.
+            "wiki" if map.contains_key(Value::String("docs".into())) => out.push(finding(
+                entry,
+                Classification::NeedsJudgment,
+                PROJECT_WIKI_KEY_BOTH_CODE,
+                "the project has both a legacy `wiki:` block and a `docs:` block",
+                "Keep the block that says where the project's docs live as `docs:` and remove `wiki:`.",
+                locate_key(text, "wiki"),
+            )),
+            "wiki" => out.push(finding(
+                entry,
+                Classification::AutoHeal,
+                PROJECT_WIKI_KEY_CODE,
+                "top-level `wiki:` is the pre-rename name for `docs:`",
+                "Rename the key to `docs:` (same value).",
+                locate_key(text, "wiki"),
             )),
             k if REMOVED_PROJECT_KEYS.contains(&k) => {
                 sniff_removed_key(entry, text, key, v, out)
@@ -3274,55 +3301,198 @@ fn sniff_shared_preamble_jobs(entry: &InventoryEntry, text: &str, out: &mut Vec<
     ));
 }
 
-/// Heading of the wiki section in the shared preamble and in the orchestrator
-/// instructions (read and write the project's wiki with `shelbi wiki`; plans go
+/// Heading of the docs section in the shared preamble and in the orchestrator
+/// instructions (read and write the project's docs with `shelbi docs`; plans go
 /// there, never in the repo). The sniffers key on it and the healers append the
 /// shipped section under it, so the two can never disagree.
-pub(crate) const WIKI_SECTION_HEADING: &str = "## Wiki";
+pub(crate) const DOCS_SECTION_HEADING: &str = "## Docs";
 
-/// The command every wiki section names. A copy that mentions it anywhere
-/// already teaches the wiki in some form (moved, reworded), so it's left alone
+/// The command every docs section names. A copy that mentions it anywhere
+/// already teaches the docs in some form (moved, reworded), so it's left alone
 /// even without the heading.
-const WIKI_COMMAND_MARKER: &str = "shelbi wiki";
+const DOCS_COMMAND_MARKER: &str = "shelbi docs";
 
-/// The stable code for "the project's shared preamble predates the Wiki
+/// The stable code for "the project's shared preamble predates the Documentation
 /// section". An auto-heal: the shipped section is appended, never interleaved.
-pub(crate) const SHARED_PREAMBLE_WIKI_MISSING: &str = "SHARED_PREAMBLE_WIKI_MISSING";
+pub(crate) const SHARED_PREAMBLE_DOCS_MISSING: &str = "SHARED_PREAMBLE_DOCS_MISSING";
 
-/// The stable code for "the orchestrator instructions predate the Wiki rule"
-/// (plans go in the wiki via `shelbi wiki new Plans/<name>.md`). An auto-heal,
+/// The stable code for "the orchestrator instructions predate the Documentation rule"
+/// (plans go in the docs via `shelbi docs new Plans/<name>.md`). An auto-heal,
 /// appended like the Changelog rule.
-pub(crate) const ORCH_WIKI_RULE_MISSING: &str = "ORCH_WIKI_RULE_MISSING";
+pub(crate) const ORCH_DOCS_RULE_MISSING: &str = "ORCH_DOCS_RULE_MISSING";
 
-/// Whether a preamble or orchestrator copy already teaches the wiki: the
+/// The docs section's heading and command before Documentation was called
+/// that. A copy that still has them predates the rename: the
+/// `*_WIKI_SECTION` sniffers replace a shipped section in place, and hand an
+/// edited one (or a `shelbi wiki` mention elsewhere) to the orchestrator.
+const LEGACY_DOCS_SECTION_HEADING: &str = "## Wiki";
+const LEGACY_DOCS_MARKERS: &[&str] = &["shelbi wiki", "shelbi-wiki", "wiki:Plans/"];
+
+/// The shared preamble's section as it shipped before the rename (its body
+/// under [`LEGACY_DOCS_SECTION_HEADING`]), byte for byte.
+pub(crate) const LEGACY_PREAMBLE_DOCS_SECTION: &str = "\
+The project's wiki holds its plans, designs, decisions and other long-form
+context, shared by everyone on the project. Before starting work, read the plan
+your task names, or look for one with `shelbi wiki search \"<topic>\"`. Write any
+plan, design doc or decision record there (`shelbi wiki new Plans/<name>.md`),
+never as a file in the repo. Read and write it only through `shelbi wiki`; the
+hub commits and syncs every change. The `shelbi-wiki` skill has the commands and
+the rules.
+";
+
+/// The orchestrator instructions' section as it shipped before the rename.
+pub(crate) const LEGACY_ORCH_DOCS_SECTION: &str = "\
+The project's wiki holds its plans, designs, decisions and research, shared
+with the user and every workspace. Read and write it with `shelbi wiki` (the
+`shelbi-wiki` skill has the commands); the hub commits and syncs each change.
+
+- **Plans go in the wiki.** When you write a plan, or the user asks for one,
+  create it with `shelbi wiki new Plans/<name>.md`, never as a file in the repo.
+  Record each decision the user makes in the plan it belongs to.
+- **Read before you plan or dispatch.** `shelbi wiki search \"<topic>\"` finds an
+  existing plan to extend rather than start a second one.
+- **Name the plan in the issues you make from it** (`Plan: wiki:Plans/<name>.md`
+  at the end of the body), and still copy what the workspace needs into the body
+  (see `## Task body templates`).
+- When a plan's work lands, check its tasks off (`shelbi wiki check
+  Plans/<name>.md \"<task>\"`) so the plan stays true.
+";
+
+/// The stable code for "the shared preamble still has the shipped pre-rename
+/// `## Wiki` section". An auto-heal: that section is replaced in place by the
+/// shipped `## Docs` one, and nothing else in the file changes.
+pub(crate) const SHARED_PREAMBLE_WIKI_SECTION: &str = "SHARED_PREAMBLE_WIKI_SECTION";
+/// The same for a preamble whose `## Wiki` section was edited, or that names
+/// `shelbi wiki` elsewhere: needs judgment, to keep the user's wording.
+pub(crate) const SHARED_PREAMBLE_WIKI_SECTION_EDITED: &str = "SHARED_PREAMBLE_WIKI_SECTION_EDITED";
+/// The orchestrator instructions' counterparts of the two above.
+pub(crate) const ORCH_WIKI_RULE: &str = "ORCH_WIKI_RULE";
+pub(crate) const ORCH_WIKI_RULE_EDITED: &str = "ORCH_WIKI_RULE_EDITED";
+
+/// What a copy has of the docs section from before the rename.
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyDocs {
+    /// Nothing: no `## Wiki` heading and no `shelbi wiki`.
+    None,
+    /// The shipped section, unedited, at bytes `span` (heading through its
+    /// body's last non-blank line), and no legacy mention elsewhere.
+    Shipped { span: std::ops::Range<usize> },
+    /// An edited section, or a mention outside one.
+    Edited,
+}
+
+fn legacy_docs(text: &str, shipped: &str) -> LegacyDocs {
+    let mentions = |t: &str| LEGACY_DOCS_MARKERS.iter().any(|m| t.contains(m));
+    let mut offset = 0usize;
+    let mut start = None;
+    for line in text.split_inclusive('\n') {
+        if line.trim_end() == LEGACY_DOCS_SECTION_HEADING {
+            start = Some(offset);
+            break;
+        }
+        offset += line.len();
+    }
+    let Some(start) = start else {
+        return if mentions(text) { LegacyDocs::Edited } else { LegacyDocs::None };
+    };
+    let body = markdown_section(&text[start..], LEGACY_DOCS_SECTION_HEADING).unwrap_or("");
+    let heading_len = text[start..].split_inclusive('\n').next().map_or(0, str::len);
+    let end = start + heading_len + body.trim_end().len();
+    let rest = format!("{}{}", &text[..start], &text[end..]);
+    if body.trim() == shipped.trim() && !mentions(&rest) {
+        LegacyDocs::Shipped { span: start..end }
+    } else {
+        LegacyDocs::Edited
+    }
+}
+
+/// `text` with its shipped pre-rename section replaced by `section` (the
+/// shipped `## Docs` one), in place; `text` itself when it has none.
+fn replace_legacy_docs_section(text: &str, shipped: &str, section: &str) -> String {
+    match legacy_docs(text, shipped) {
+        LegacyDocs::Shipped { span } => format!("{}{}{}", &text[..span.start], section, &text[span.end..]),
+        _ => text.to_string(),
+    }
+}
+
+/// The healer's write-back for [`SHARED_PREAMBLE_WIKI_SECTION`].
+pub(crate) fn replace_preamble_wiki_section(text: &str) -> String {
+    replace_legacy_docs_section(text, LEGACY_PREAMBLE_DOCS_SECTION, &shipped_preamble_docs_section())
+}
+
+/// The healer's write-back for [`ORCH_WIKI_RULE`].
+pub(crate) fn replace_orchestrator_wiki_section(text: &str) -> String {
+    replace_legacy_docs_section(text, LEGACY_ORCH_DOCS_SECTION, &shipped_orchestrator_docs_section())
+}
+
+/// A finding for a copy that predates the rename, or `false` when it doesn't.
+fn sniff_legacy_docs(
+    entry: &InventoryEntry,
+    text: &str,
+    shipped: &str,
+    (auto_code, judgment_code): (&str, &str),
+    what: &str,
+    out: &mut Vec<UpgradeFinding>,
+) -> bool {
+    let legacy = legacy_docs(text, shipped);
+    let line = text
+        .lines()
+        .position(|l| l.trim_end() == LEGACY_DOCS_SECTION_HEADING || LEGACY_DOCS_MARKERS.iter().any(|m| l.contains(m)))
+        .map_or(1, |i| i + 1);
+    let location = Location { line, column: 1 };
+    match legacy {
+        LegacyDocs::None => return false,
+        LegacyDocs::Shipped { .. } => out.push(finding(
+            entry,
+            Classification::AutoHeal,
+            auto_code,
+            &format!("{what} still has the `## Wiki` section from before Documentation was called that"),
+            "Replace it with the shipped `## Docs` section (`shelbi docs`, the `shelbi-docs` skill, `docs:` links).",
+            location,
+        )),
+        LegacyDocs::Edited => out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            judgment_code,
+            &format!("{what} still teaches the wiki (`## Wiki`, `shelbi wiki`, `shelbi-wiki` or `wiki:` links), which is called Documentation now"),
+            "Rename it in the copy, keeping its wording: the section heading to `## Docs`, `shelbi wiki` to \
+             `shelbi docs`, the `shelbi-wiki` skill to `shelbi-docs`, and `wiki:Plans/…` links to \
+             `docs:Plans/…`. (The old command and links still work, as aliases.)",
+            location,
+        )),
+    }
+    true
+}
+
+/// Whether a preamble or orchestrator copy already teaches the docs: the
 /// heading line, or the command anywhere in the file. A user who rewrote or
 /// emptied the section keeps the heading, so their edit is never touched.
-fn has_wiki_section(text: &str) -> bool {
-    text.lines().any(|l| l.trim_end() == WIKI_SECTION_HEADING) || text.contains(WIKI_COMMAND_MARKER)
+fn has_docs_section(text: &str) -> bool {
+    text.lines().any(|l| l.trim_end() == DOCS_SECTION_HEADING) || text.contains(DOCS_COMMAND_MARKER)
 }
 
-/// `template`'s `## Wiki` section (heading and body).
-fn shipped_wiki_section(template: &str, what: &str) -> String {
-    let body = markdown_section(template, WIKI_SECTION_HEADING)
-        .unwrap_or_else(|| panic!("the shipped {what} carries a `## Wiki` section"));
-    format!("{WIKI_SECTION_HEADING}\n{}", body.trim_end())
+/// `template`'s `## Docs` section (heading and body).
+fn shipped_docs_section(template: &str, what: &str) -> String {
+    let body = markdown_section(template, DOCS_SECTION_HEADING)
+        .unwrap_or_else(|| panic!("the shipped {what} carries a `## Docs` section"));
+    format!("{DOCS_SECTION_HEADING}\n{}", body.trim_end())
 }
 
-/// The shipped shared preamble's `## Wiki` section.
-pub(crate) fn shipped_preamble_wiki_section() -> String {
-    shipped_wiki_section(shelbi_state::DEFAULT_SHARED_PREAMBLE, "shared preamble")
+/// The shipped shared preamble's `## Docs` section.
+pub(crate) fn shipped_preamble_docs_section() -> String {
+    shipped_docs_section(shelbi_state::DEFAULT_SHARED_PREAMBLE, "shared preamble")
 }
 
-/// The shipped orchestrator instructions' `## Wiki` section.
-pub(crate) fn shipped_orchestrator_wiki_section() -> String {
-    shipped_wiki_section(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, "orchestrator template")
+/// The shipped orchestrator instructions' `## Docs` section.
+pub(crate) fn shipped_orchestrator_docs_section() -> String {
+    shipped_docs_section(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, "orchestrator template")
 }
 
 /// Append `section` after a blank line, unless `text` is empty or already
-/// teaches the wiki. Purely additive: the original text is a byte prefix of
+/// teaches the docs. Purely additive: the original text is a byte prefix of
 /// the result.
-fn append_wiki_section(text: &str, section: &str) -> String {
-    if text.trim().is_empty() || has_wiki_section(text) {
+fn append_docs_section(text: &str, section: &str) -> String {
+    if text.trim().is_empty() || has_docs_section(text) {
         return text.to_string();
     }
     let mut out = text.to_string();
@@ -3337,40 +3507,44 @@ fn append_wiki_section(text: &str, section: &str) -> String {
     out
 }
 
-/// Append the shipped Wiki section to a shared preamble that lacks it (the
-/// healer's write-back; it shares [`has_wiki_section`] with the sniffer).
-pub(crate) fn append_preamble_wiki_section(text: &str) -> String {
-    append_wiki_section(text, &shipped_preamble_wiki_section())
+/// Append the shipped Documentation section to a shared preamble that lacks it (the
+/// healer's write-back; it shares [`has_docs_section`] with the sniffer).
+pub(crate) fn append_preamble_docs_section(text: &str) -> String {
+    append_docs_section(text, &shipped_preamble_docs_section())
 }
 
-/// Append the shipped Wiki rule to orchestrator instructions that lack it.
-pub(crate) fn append_orchestrator_wiki_section(text: &str) -> String {
-    append_wiki_section(text, &shipped_orchestrator_wiki_section())
+/// Append the shipped Documentation rule to orchestrator instructions that lack it.
+pub(crate) fn append_orchestrator_docs_section(text: &str) -> String {
+    append_docs_section(text, &shipped_orchestrator_docs_section())
 }
 
-/// Sniff an existing `agents/_shared/preamble.md` for the Wiki section: read
-/// the project's plans and context with `shelbi wiki`, and write plans there,
+/// Sniff an existing `agents/_shared/preamble.md` for the Documentation section: read
+/// the project's plans and context with `shelbi docs`, and write plans there,
 /// never in the repo.
 ///
 /// The section ships in the default preamble, which only reaches NEW projects.
 /// An **absence** sniff routed to [`Classification::AutoHeal`], like the Jobs
 /// section: the fix appends a self-contained section at the end and rewrites
-/// nothing the project wrote. A preamble with the heading or `shelbi wiki`
+/// nothing the project wrote. A preamble with the heading or `shelbi docs`
 /// anywhere never fires. Idempotent: after the heal the file carries the
 /// heading.
-fn sniff_shared_preamble_wiki(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
-    if text.trim().is_empty() || has_wiki_section(text) {
+fn sniff_shared_preamble_docs(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let codes = (SHARED_PREAMBLE_WIKI_SECTION, SHARED_PREAMBLE_WIKI_SECTION_EDITED);
+    if sniff_legacy_docs(entry, text, LEGACY_PREAMBLE_DOCS_SECTION, codes, "the shared agent preamble", out) {
+        return;
+    }
+    if text.trim().is_empty() || has_docs_section(text) {
         return;
     }
     out.push(finding(
         entry,
         Classification::AutoHeal,
-        SHARED_PREAMBLE_WIKI_MISSING,
-        "the shared agent preamble has no `## Wiki` section, so agents don't read the \
+        SHARED_PREAMBLE_DOCS_MISSING,
+        "the shared agent preamble has no `## Docs` section, so agents don't read the \
          project's plans before starting and write new plans into the repo",
-        "Append the shipped `## Wiki` section: read the plan a task names (or `shelbi wiki \
-         search`), write plans and design docs with `shelbi wiki new Plans/<name>.md` rather \
-         than as repo files, and use the `shelbi-wiki` skill for the commands.",
+        "Append the shipped `## Docs` section: read the plan a task names (or `shelbi docs \
+         search`), write plans and design docs with `shelbi docs new Plans/<name>.md` rather \
+         than as repo files, and use the `shelbi-docs` skill for the commands.",
         Location {
             line: text.lines().count().max(1),
             column: 1,
@@ -3378,22 +3552,26 @@ fn sniff_shared_preamble_wiki(entry: &InventoryEntry, text: &str, out: &mut Vec<
     ));
 }
 
-/// Sniff an orchestrator `instructions.md` for the Wiki rule: plans go in the
-/// wiki via `shelbi wiki new Plans/<name>.md`. An absence sniff routed to
+/// Sniff an orchestrator `instructions.md` for the Documentation rule: plans go in the
+/// docs via `shelbi docs new Plans/<name>.md`. An absence sniff routed to
 /// [`Classification::AutoHeal`], like the Changelog rule (append-only, never
-/// fires on a copy that has the heading or names `shelbi wiki` anywhere).
-fn sniff_orchestrator_wiki(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
-    if text.trim().is_empty() || has_wiki_section(text) {
+/// fires on a copy that has the heading or names `shelbi docs` anywhere).
+fn sniff_orchestrator_docs(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let codes = (ORCH_WIKI_RULE, ORCH_WIKI_RULE_EDITED);
+    if sniff_legacy_docs(entry, text, LEGACY_ORCH_DOCS_SECTION, codes, "the orchestrator instructions", out) {
+        return;
+    }
+    if text.trim().is_empty() || has_docs_section(text) {
         return;
     }
     out.push(finding(
         entry,
         Classification::AutoHeal,
-        ORCH_WIKI_RULE_MISSING,
-        "orchestrator instructions have no `## Wiki` rule, so plans end up in repo files or \
-         other tools instead of the project's wiki",
-        "Append the shipped `## Wiki` section: write plans with `shelbi wiki new \
-         Plans/<name>.md`, search the wiki before planning, name the plan in the issues made \
+        ORCH_DOCS_RULE_MISSING,
+        "orchestrator instructions have no `## Docs` rule, so plans end up in repo files or \
+         other tools instead of the project's docs",
+        "Append the shipped `## Docs` section: write plans with `shelbi docs new \
+         Plans/<name>.md`, search the docs before planning, name the plan in the issues made \
          from it, and check its tasks off as they land.",
         Location {
             line: text.lines().count().max(1),
@@ -4221,6 +4399,17 @@ mod tests {
             &mut out,
         );
         assert!(out.is_empty(), "acceptEdits must not fire: {out:?}");
+    }
+
+    #[test]
+    fn wiki_key_is_auto_heal_unless_docs_is_there_too() {
+        let fs = project_findings("wiki:\n  source: branch\n  sync: auto\n");
+        assert_eq!(find(&fs, PROJECT_WIKI_KEY_CODE).unwrap().classification, Classification::AutoHeal);
+        assert!(find(&fs, "PROJECT_UNKNOWN_KEY").is_none(), "{fs:?}");
+        let both = project_findings("wiki:\n  source: branch\ndocs:\n  source: folder\n");
+        assert!(find(&both, PROJECT_WIKI_KEY_CODE).is_none(), "{both:?}");
+        assert_eq!(find(&both, PROJECT_WIKI_KEY_BOTH_CODE).unwrap().classification, Classification::NeedsJudgment);
+        assert!(project_findings("docs:\n  source: branch\n").is_empty());
     }
 
     #[test]
@@ -7430,12 +7619,12 @@ Finalize by moving the card: `shelbi task move <task> --to done`.
 
         // The on-start pass never rewrites the project's own prose, and never
         // writes the hub-safety rules in itself. It only appends the shipped
-        // `## Wiki` and `## Jobs` sections (SHARED_PREAMBLE_WIKI_MISSING,
-        // SHARED_PREAMBLE_JOBS_MISSING, both additive), Wiki first.
+        // `## Docs` and `## Jobs` sections (SHARED_PREAMBLE_DOCS_MISSING,
+        // SHARED_PREAMBLE_JOBS_MISSING, both additive), Documentation first.
         run_for_project("demo");
         let after = std::fs::read_to_string(dir.join("preamble.md")).unwrap();
         assert!(after.starts_with(custom), "{after}");
-        assert_eq!(after, append_preamble_jobs_section(&append_preamble_wiki_section(custom)));
+        assert_eq!(after, append_preamble_jobs_section(&append_preamble_docs_section(custom)));
         assert!(!after.to_ascii_lowercase().contains("hub safety"), "{after}");
     }
 

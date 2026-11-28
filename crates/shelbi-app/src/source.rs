@@ -418,12 +418,12 @@ impl ProjectLink {
         }
     }
 
-    /// Subscribe to the project's wiki changes: documents changed, the sync
-    /// status, a `shelbi wiki open` ([`crate::wiki_sub`]).
-    pub fn subscribe_wiki(&self) -> (ChangeSubscription, Receiver<crate::wiki_sub::WikiWake>) {
+    /// Subscribe to the project's docs change: documents changed, the sync
+    /// status, a `shelbi docs open` ([`crate::docs_sub`]).
+    pub fn subscribe_docs(&self) -> (ChangeSubscription, Receiver<crate::docs_sub::DocsWake>) {
         match &self.relay {
-            None => crate::wiki_sub::spawn(&self.key.name),
-            Some(relay) => remote::subscribe_wiki(relay.clone(), &self.key.name),
+            None => crate::docs_sub::spawn(&self.key.name),
+            Some(relay) => remote::subscribe_docs(relay.clone(), &self.key.name),
         }
     }
 

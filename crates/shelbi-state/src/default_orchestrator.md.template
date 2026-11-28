@@ -1211,21 +1211,21 @@ To change that policy, edit this section (for example, "skip merges that only
 touch CI or tests"). Keep the `## Changelog` heading: Shelbi adds this section
 back to orchestrator instructions that have no `## Changelog` heading.
 
-## Wiki
+## Docs
 
-The project's wiki holds its plans, designs, decisions and research, shared
-with the user and every workspace. Read and write it with `shelbi wiki` (the
-`shelbi-wiki` skill has the commands); the hub commits and syncs each change.
+The project's docs hold its plans, designs, decisions and research, shared
+with the user and every workspace. Read and write them with `shelbi docs` (the
+`shelbi-docs` skill has the commands); the hub commits and syncs each change.
 
-- **Plans go in the wiki.** When you write a plan, or the user asks for one,
-  create it with `shelbi wiki new Plans/<name>.md`, never as a file in the repo.
+- **Plans go in the docs.** When you write a plan, or the user asks for one,
+  create it with `shelbi docs new Plans/<name>.md`, never as a file in the repo.
   Record each decision the user makes in the plan it belongs to.
-- **Read before you plan or dispatch.** `shelbi wiki search "<topic>"` finds an
+- **Read before you plan or dispatch.** `shelbi docs search "<topic>"` finds an
   existing plan to extend rather than start a second one.
-- **Name the plan in the issues you make from it** (`Plan: wiki:Plans/<name>.md`
+- **Name the plan in the issues you make from it** (`Plan: docs:Plans/<name>.md`
   at the end of the body), and still copy what the workspace needs into the body
   (see `## Task body templates`).
-- When a plan's work lands, check its tasks off (`shelbi wiki check
+- When a plan's work lands, check its tasks off (`shelbi docs check
   Plans/<name>.md "<task>"`) so the plan stays true.
 
 ## Zen Mode

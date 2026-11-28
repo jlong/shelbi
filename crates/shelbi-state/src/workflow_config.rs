@@ -95,7 +95,7 @@ use std::sync::Arc;
 use yaml_serde::Value;
 use shelbi_core::{
     default_project_statuses, AwarenessMode, ConfigMode, default_workflow, validate_workflow_name, GitConfig, Owner,
-    ProjectStatus, ProjectStatuses, ReviewServe, StatusCategory, TrackerName, Transition, WikiConfig, Workflow,
+    ProjectStatus, ProjectStatuses, ReviewServe, StatusCategory, TrackerName, Transition, DocsConfig, Workflow,
     WorkflowStatus,
 };
 
@@ -339,9 +339,9 @@ pub struct WorkflowConfig {
     /// The project YAML's own settings (Settings ▸ Properties), saved
     /// through the same project-file write.
     properties: Properties,
-    /// The project YAML's `wiki:` block (Settings ▸ Wiki, `shelbi wiki
+    /// The project YAML's `docs:` block (Settings ▸ Documentation, `shelbi docs
     /// init`), saved through the same project-file write. `None`: no block.
-    wiki: Option<WikiConfig>,
+    docs: Option<DocsConfig>,
     /// `None` when the project has no `agents/` directory: like the loader,
     /// agent references aren't checked then.
     agents: Option<Vec<String>>,
@@ -385,9 +385,9 @@ struct Disk {
     default_workflow: String,
     awareness: AwarenessMode,
     properties: Properties,
-    wiki: Option<WikiConfig>,
-    /// Why the file's `wiki:` block doesn't parse, if it doesn't.
-    wiki_unreadable: Option<String>,
+    docs: Option<DocsConfig>,
+    /// Why the file's `docs:` block doesn't parse, if it doesn't.
+    docs_unreadable: Option<String>,
     issue_tracker: IssueTracker,
     layout: ConfigMode,
     /// An in-repo project's `local.yaml`.
@@ -497,7 +497,7 @@ impl WorkflowConfig {
         let awareness = awareness_in(&project_text);
         let shared_tree = yaml_edit::parse(&project_text).unwrap_or(Value::Null);
         let properties = project_properties::read(&shared_tree);
-        let (wiki, wiki_unreadable) = wiki_in(&shared_tree);
+        let (docs, docs_unreadable) = docs_in(&shared_tree);
         let issue_tracker = project_properties::issue_tracker(&shared_tree);
         let layout = if local.is_some() || project_path.ends_with(Path::new(".shelbi").join("project.yaml")) {
             ConfigMode::InRepo
@@ -519,7 +519,7 @@ impl WorkflowConfig {
             default_workflow: default_workflow.clone(),
             awareness,
             properties: properties.clone(),
-            wiki: wiki.clone(),
+            docs: docs.clone(),
             agents,
             unreadable,
             disk: Arc::new(Disk {
@@ -533,8 +533,8 @@ impl WorkflowConfig {
                 default_workflow,
                 awareness,
                 properties,
-                wiki,
-                wiki_unreadable,
+                docs,
+                docs_unreadable,
                 issue_tracker,
                 layout,
                 local,
@@ -593,17 +593,17 @@ impl WorkflowConfig {
         &self.properties
     }
 
-    /// The project YAML's `wiki:` block, as edited (`None`: the project has
+    /// The project YAML's `docs:` block, as edited (`None`: the project has
     /// none).
-    pub fn wiki(&self) -> Option<&WikiConfig> {
-        self.wiki.as_ref()
+    pub fn docs(&self) -> Option<&DocsConfig> {
+        self.docs.as_ref()
     }
 
-    /// Why the file's `wiki:` block doesn't parse, if it doesn't. A save
-    /// leaves such a block alone unless [`set_wiki`](Self::set_wiki)
+    /// Why the file's `docs:` block doesn't parse, if it doesn't. A save
+    /// leaves such a block alone unless [`set_docs`](Self::set_docs)
     /// replaces it.
-    pub fn wiki_unreadable(&self) -> Option<&str> {
-        self.disk.wiki_unreadable.as_deref()
+    pub fn docs_unreadable(&self) -> Option<&str> {
+        self.disk.docs_unreadable.as_deref()
     }
 
     /// The project's issue tracker, as the project YAML sets it (read-only
@@ -941,15 +941,15 @@ impl WorkflowConfig {
         next
     }
 
-    /// Set (or, with `None`, remove) the project YAML's `wiki:` block.
-    /// Refuses a branch or path [`WikiConfig::validate`] refuses, with its
+    /// Set (or, with `None`, remove) the project YAML's `docs:` block.
+    /// Refuses a branch or path [`DocsConfig::validate`] refuses, with its
     /// message.
-    pub fn set_wiki(&self, wiki: Option<WikiConfig>) -> Result<Self> {
-        if let Some(cfg) = &wiki {
+    pub fn set_docs(&self, docs: Option<DocsConfig>) -> Result<Self> {
+        if let Some(cfg) = &docs {
             cfg.validate().map_err(|e| ConfigError::Invalid(e.to_string()))?;
         }
         let mut next = self.clone();
-        next.wiki = wiki;
+        next.docs = docs;
         Ok(next)
     }
 
@@ -1312,8 +1312,8 @@ impl WorkflowConfig {
         let properties_changed = self.properties != disk.properties;
         // A block that didn't parse reads as `None`: it changes only when
         // something replaces it.
-        let wiki_changed = self.wiki != disk.wiki;
-        if default_changed || awareness_changed || properties_changed || wiki_changed {
+        let docs_changed = self.docs != disk.docs;
+        if default_changed || awareness_changed || properties_changed || docs_changed {
             let raw = yaml_edit::parse(&disk.project_text)
                 .map_err(|e| file_err(&disk.project_path, e))?;
             let mut target = raw.clone();
@@ -1340,20 +1340,22 @@ impl WorkflowConfig {
                     .ok_or_else(|| file_err(&disk.project_path, "`orchestrator:` isn't a mapping"))?;
                 block.insert("awareness".into(), self.awareness.as_str().into());
             }
-            if wiki_changed {
-                match &self.wiki {
-                    Some(wiki) => {
-                        let block = yaml_serde::to_value(wiki).map_err(|e| file_err(&disk.project_path, e))?;
-                        map.insert("wiki".into(), block);
+            if docs_changed {
+                match &self.docs {
+                    Some(docs) => {
+                        let block = yaml_serde::to_value(docs).map_err(|e| file_err(&disk.project_path, e))?;
+                        map.insert("docs".into(), block);
                     }
                     None => {
-                        map.remove("wiki");
+                        map.remove("docs");
                     }
                 }
+                // A save writes the block under its current name only.
+                map.remove(LEGACY_DOCS_KEY);
             }
             let patched = yaml_edit::patch(&disk.project_text, &target)
                 .map_err(|e| file_err(&disk.project_path, e))?;
-            if properties_changed || wiki_changed {
+            if properties_changed || docs_changed {
                 // What `shelbi config lint` would say of the file as
                 // written: it must still load as this project.
                 self.lint_project(&patched.text, disk.local.as_ref().map(|l| l.text.as_str()))?;
@@ -1662,17 +1664,21 @@ fn awareness_in(project_text: &str) -> AwarenessMode {
         .unwrap_or_default()
 }
 
-/// The `wiki:` block of a project YAML's tree: the block (`None` with
-/// none), and why it doesn't parse when it doesn't (then `None` too).
-fn wiki_in(tree: &Value) -> (Option<WikiConfig>, Option<String>) {
-    match tree.get("wiki") {
+/// The `docs:` block of a project YAML's tree (or, in a file the config
+/// upgrade hasn't renamed yet, its legacy `wiki:` block): the block (`None`
+/// with none), and why it doesn't parse when it doesn't (then `None` too).
+fn docs_in(tree: &Value) -> (Option<DocsConfig>, Option<String>) {
+    match tree.get("docs").or_else(|| tree.get(LEGACY_DOCS_KEY)) {
         None | Some(Value::Null) => (None, None),
-        Some(block) => match yaml_serde::from_value::<WikiConfig>(block.clone()) {
+        Some(block) => match yaml_serde::from_value::<DocsConfig>(block.clone()) {
             Ok(cfg) => (Some(cfg), None),
-            Err(e) => (None, Some(format!("wiki: {e}"))),
+            Err(e) => (None, Some(format!("docs: {e}"))),
         },
     }
 }
+
+/// The `docs:` block's name before Documentation was called that.
+const LEGACY_DOCS_KEY: &str = "wiki";
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
     match fs::read_to_string(path) {

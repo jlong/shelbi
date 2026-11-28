@@ -128,7 +128,7 @@ cleanup_staged_asset() {
   fi
 }
 trap cleanup_staged_asset EXIT
-for plugin in update-shelbi-configuration shelbi-awareness shelbi-wiki; do
+for plugin in update-shelbi-configuration shelbi-awareness shelbi-docs; do
   ASSET_ROOT="$PLUGIN_PARENT/$plugin"
   echo "==> installing system plugin to $ASSET_ROOT"
   STAGED_ASSET_ROOT="$(mktemp -d "$PLUGIN_PARENT/.$plugin.XXXXXX")"
@@ -142,6 +142,9 @@ for plugin in update-shelbi-configuration shelbi-awareness shelbi-wiki; do
   STAGED_ASSET_ROOT=""
 done
 trap - EXIT
+# The docs plugin's name before Documentation was called that: retired, so an
+# upgraded install carries `shelbi-docs` alone.
+rm -rf "$PLUGIN_PARENT/shelbi-wiki"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "==> re-signing (macOS)"

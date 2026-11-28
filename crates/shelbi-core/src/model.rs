@@ -200,12 +200,14 @@ pub struct Project {
     /// `shelbi config lint` report it. See [`crate::releases`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub releases: Option<crate::releases::ReleasesConfig>,
-    /// Where the project's wiki lives and whether the hub syncs it on its
-    /// own. `None` (every existing project's) means no wiki until one is
+    /// Where the project's docs live and whether the hub syncs it on its
+    /// own. `None` (every existing project's) means no docs until one is
     /// asked for, which then gets the default `branch` mode. See
-    /// [`crate::wiki`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wiki: Option<crate::wiki::WikiConfig>,
+    /// [`crate::docs`]. Read from the legacy `wiki:` key too (the block's
+    /// name before Documentation was called that), which the config upgrade
+    /// renames to `docs:` on the hub's next boot.
+    #[serde(default, alias = "wiki", skip_serializing_if = "Option::is_none")]
+    pub docs: Option<crate::docs::DocsConfig>,
 
     // --- user-local -------------------------------------------------------
     pub repo: String,
@@ -279,6 +281,9 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "runners",
     "agents",
     "releases",
+    "docs",
+    // The `docs:` block's legacy name, so a project YAML the config upgrade
+    // hasn't renamed yet still routes it to the shared half.
     "wiki",
 ];
 
@@ -4576,7 +4581,7 @@ workspace_settings_template: /etc/shelbi/p.json
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
         };
         assert!(project.validate_workspaces().is_ok());
 
@@ -4677,7 +4682,7 @@ workspaces:
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
         }
     }
 
@@ -4983,7 +4988,7 @@ workspaces:
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
         }
     }
 
@@ -6457,7 +6462,7 @@ git:
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
         }
     }
 

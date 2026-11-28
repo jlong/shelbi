@@ -7,7 +7,7 @@ set -euo pipefail
 DIST_DIR="${1:-dist}"
 PLUGIN_REL="plugins/update-shelbi-configuration"
 AWARENESS_REL="plugins/shelbi-awareness"
-WIKI_REL="plugins/shelbi-wiki"
+DOCS_REL="plugins/shelbi-docs"
 ARCHIVE_FILES=(
   "$PLUGIN_REL/.claude-plugin/plugin.json"
   "$PLUGIN_REL/.codex-plugin/plugin.json"
@@ -16,9 +16,9 @@ ARCHIVE_FILES=(
   "$AWARENESS_REL/hooks/hooks.json"
   "$AWARENESS_REL/monitors/monitors.json"
   "$AWARENESS_REL/README.md"
-  "$WIKI_REL/.claude-plugin/plugin.json"
-  "$WIKI_REL/.codex-plugin/plugin.json"
-  "$WIKI_REL/skills/shelbi-wiki/SKILL.md"
+  "$DOCS_REL/.claude-plugin/plugin.json"
+  "$DOCS_REL/.codex-plugin/plugin.json"
+  "$DOCS_REL/skills/shelbi-docs/SKILL.md"
 )
 DEB_PREFIX="usr/share/shelbi"
 
@@ -29,6 +29,24 @@ fi
 
 normalize_listing() {
   sed -e 's#^\./##' -e 's#/$##'
+}
+
+# Plugins a package must no longer carry: `shelbi-wiki` is `shelbi-docs` now,
+# and shipping both would hand agents the skill twice.
+RETIRED_PLUGINS=(
+  "plugins/shelbi-wiki"
+)
+
+assert_listing_lacks_retired() {
+  local listing="$1"
+  local prefix="$2"
+  local retired
+  for retired in "${RETIRED_PLUGINS[@]}"; do
+    if grep -Fq "$prefix$retired" "$listing"; then
+      echo "error: package still carries the retired $retired" >&2
+      return 1
+    fi
+  done
 }
 
 assert_listing_contains() {
@@ -48,6 +66,7 @@ while IFS= read -r archive; do
   for expected in "${ARCHIVE_FILES[@]}"; do
     assert_listing_contains "$listing" "$expected"
   done
+  assert_listing_lacks_retired "$listing" ""
   rm -f "$listing"
 done < <(find "$DIST_DIR" -maxdepth 1 -type f -name 'shelbi_*.tar.gz' | sort)
 
@@ -70,6 +89,7 @@ while IFS= read -r deb; do
   for expected in "${ARCHIVE_FILES[@]}"; do
     assert_listing_contains "$listing" "$DEB_PREFIX/$expected"
   done
+  assert_listing_lacks_retired "$listing" "$DEB_PREFIX/"
   rm -f "$listing"
 done < <(find "$DIST_DIR" -maxdepth 1 -type f -name 'shelbi_*_amd64.deb' | sort)
 

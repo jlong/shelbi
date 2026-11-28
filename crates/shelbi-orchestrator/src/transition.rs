@@ -648,7 +648,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
             git: shelbi_core::GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
         }

@@ -54,7 +54,7 @@ impl PageLook for SettingsPage {
             SettingsPage::Properties => icons::LIST_BULLET,
             // The sidebar's Issues view's stack.
             SettingsPage::Issues => icons::RECTANGLE_STACK,
-            SettingsPage::Wiki => icons::BOOK_OPEN,
+            SettingsPage::Docs => icons::BOOK_OPEN,
         }
     }
 
@@ -69,7 +69,7 @@ impl PageLook for SettingsPage {
             SettingsPage::Orchestrator => "settings-nav-orchestrator",
             SettingsPage::Properties => "settings-nav-properties",
             SettingsPage::Issues => "settings-nav-issues",
-            SettingsPage::Wiki => "settings-nav-wiki",
+            SettingsPage::Docs => "settings-nav-docs",
         }
     }
 }
@@ -301,6 +301,6 @@ mod tests {
         assert_eq!(SettingsPage::Workspaces.icon(), icons::FOLDER);
         assert_eq!(SettingsPage::Workflows.icon(), icons::VIEW_COLUMNS);
         assert_eq!(SettingsPage::Issues.icon(), icons::RECTANGLE_STACK);
-        assert_eq!(SettingsPage::Wiki.icon(), icons::BOOK_OPEN);
+        assert_eq!(SettingsPage::Docs.icon(), icons::BOOK_OPEN);
     }
 }

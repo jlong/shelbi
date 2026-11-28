@@ -53,7 +53,7 @@ use super::config_upgrade::{
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
     CHANGELOG_TEMPLATE_PRIOR_DEFAULT, PR_TEMPLATE_MISSING,
-    ORCH_BODY_TITLE_HEADING_CODE, ORCH_CHANGELOG_RULE_MISSING, ORCH_HANDOFF_PATH_AUTOHEAL_CODE, ORCH_WIKI_RULE_MISSING, SHARED_PREAMBLE_WIKI_MISSING, append_orchestrator_wiki_section, append_preamble_wiki_section, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_JOBS_MISSING, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
+    ORCH_BODY_TITLE_HEADING_CODE, ORCH_CHANGELOG_RULE_MISSING, ORCH_HANDOFF_PATH_AUTOHEAL_CODE, ORCH_DOCS_RULE_MISSING, SHARED_PREAMBLE_DOCS_MISSING, append_orchestrator_docs_section, append_preamble_docs_section, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_JOBS_MISSING, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -329,15 +329,33 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
         heal_awareness_variants(entry, applied);
     }
 
-    // Append the `## Wiki` section to orchestrator instructions or a shared
+    // Append the `## Docs` section to orchestrator instructions or a shared
     // preamble that lack it. Additive like the Changelog rule and the Jobs
     // section below, and ahead of them so a file missing both ends with the
     // older section, as before; it re-reads the file.
-    if codes.contains(ORCH_WIKI_RULE_MISSING) {
-        heal_wiki_section(entry, applied, ORCH_WIKI_RULE_MISSING, append_orchestrator_wiki_section);
+    // Swap a shipped pre-rename `## Wiki` section for the `## Docs` one, in
+    // place (an edited one is the orchestrator's to rename).
+    if codes.contains(super::config_upgrade::ORCH_WIKI_RULE) {
+        heal_docs_section(
+            entry,
+            applied,
+            super::config_upgrade::ORCH_WIKI_RULE,
+            super::config_upgrade::replace_orchestrator_wiki_section,
+        );
     }
-    if codes.contains(SHARED_PREAMBLE_WIKI_MISSING) {
-        heal_wiki_section(entry, applied, SHARED_PREAMBLE_WIKI_MISSING, append_preamble_wiki_section);
+    if codes.contains(super::config_upgrade::SHARED_PREAMBLE_WIKI_SECTION) {
+        heal_docs_section(
+            entry,
+            applied,
+            super::config_upgrade::SHARED_PREAMBLE_WIKI_SECTION,
+            super::config_upgrade::replace_preamble_wiki_section,
+        );
+    }
+    if codes.contains(ORCH_DOCS_RULE_MISSING) {
+        heal_docs_section(entry, applied, ORCH_DOCS_RULE_MISSING, append_orchestrator_docs_section);
+    }
+    if codes.contains(SHARED_PREAMBLE_DOCS_MISSING) {
+        heal_docs_section(entry, applied, SHARED_PREAMBLE_DOCS_MISSING, append_preamble_docs_section);
     }
 
     // Append the orchestrator's `## Changelog` rule to instructions that lack
@@ -530,6 +548,17 @@ fn rewrite_registration(text: &str, codes: &BTreeSet<&str>) -> Option<(String, V
     {
         rename_top_key(map, "workers", "workspaces");
         changes.push(("PROJECT_WORKERS_KEY_DEPRECATED", "workers->workspaces".into()));
+    }
+
+    // Top-level `wiki:` -> `docs:` (position-preserving), the block's name
+    // before Documentation was called that. Detection routes a file that
+    // has both to needs-judgment; re-check so a `docs:` block is never lost.
+    if codes.contains(super::config_upgrade::PROJECT_WIKI_KEY_CODE)
+        && map.contains_key(vs("wiki"))
+        && !map.contains_key(vs("docs"))
+    {
+        rename_top_key(map, "wiki", "docs");
+        changes.push((super::config_upgrade::PROJECT_WIKI_KEY_CODE, "wiki->docs".into()));
     }
 
     // `display_name:` -> `name:`. Every auto-heal case converges on the same
@@ -1361,11 +1390,11 @@ fn heal_orchestrator_changelog(entry: &InventoryEntry, applied: &mut Vec<Applied
     );
 }
 
-/// Append the shipped `## Wiki` section (`append`, the orchestrator's or the
+/// Append the shipped `## Docs` section (`append`, the orchestrator's or the
 /// shared preamble's) to a file that lacks it, recording `code`. Additive
 /// only, and a no-op for a file that gained the section between detection
 /// and apply.
-fn heal_wiki_section(
+fn heal_docs_section(
     entry: &InventoryEntry,
     applied: &mut Vec<AppliedChange>,
     code: &str,
@@ -1383,7 +1412,7 @@ fn heal_wiki_section(
         eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
         return;
     }
-    record(applied, entry, code, path, "append-wiki-section".into());
+    record(applied, entry, code, path, "docs-section".into());
 }
 
 /// Append the shipped `## Jobs` section to a shared preamble that lacks it,
@@ -1660,6 +1689,60 @@ statuses:
         ));
         std::fs::create_dir_all(p.join("projects")).unwrap();
         p
+    }
+
+    #[test]
+    fn a_legacy_wiki_block_loads_and_boot_renames_it_to_docs() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        // A project from before Documentation was called that.
+        let legacy = "\
+name: demo
+repo: /tmp/demo
+machines:
+- name: hub
+  kind: local
+  work_dir: /tmp/demo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+wiki:
+  source: folder
+  path: handbook # where the team keeps it
+  sync: manual
+";
+        let path = home.join("projects/demo.yaml");
+        std::fs::write(&path, legacy).unwrap();
+        let expected = shelbi_core::DocsConfig {
+            source: shelbi_core::DocsSource::Folder,
+            branch: None,
+            path: Some("handbook".into()),
+            sync: shelbi_core::DocsSyncMode::Manual,
+        };
+        // It loads unchanged, the legacy block read as `docs:`.
+        assert_eq!(shelbi_state::load_project("demo").unwrap().docs.as_ref(), Some(&expected));
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(applied.iter().any(|c| c.code == super::super::config_upgrade::PROJECT_WIKI_KEY_CODE), "{applied:?}");
+
+        // On disk the block is `docs:` now, where `wiki:` was.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("wiki"), "{text}");
+        assert!(text.contains("docs:\n  source: folder\n"), "{text}");
+        assert_eq!(shelbi_state::load_project("demo").unwrap().docs.as_ref(), Some(&expected));
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        assert!(log.contains("PROJECT_WIKI_KEY_DEPRECATED"), "{log}");
+
+        // Idempotent.
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(apply_auto_heal(&["demo".to_string()], &report2).is_empty());
     }
 
     #[test]
@@ -2193,11 +2276,11 @@ zen:
         let orch_dir = home.join("projects/demo/agents/orchestrator");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let path = orch_dir.join("instructions.md");
-        // Carries `## Changelog` and `## Wiki` headings so those rules' appends
+        // Carries `## Changelog` and `## Docs` headings so those rules' appends
         // (their own tests below) don't touch the file this test checks is left
         // intact.
         let edited = "# Orchestrator\n\n## Reporting\n\nLead with my own custom summary line.\n\n\
-                      ## Changelog\n\nWrite one entry per merge.\n\n## Wiki\n\nNo wiki here.\n";
+                      ## Changelog\n\nWrite one entry per merge.\n\n## Docs\n\nNo docs here.\n";
         std::fs::write(&path, edited).unwrap();
 
         let report = detect(&["demo".to_string()]).unwrap();
@@ -2286,8 +2369,8 @@ zen:
         let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
         for text in [
             shelbi_state::DEFAULT_SHARED_PREAMBLE,
-            "# Notes\n\n## Jobs\n\nDon't use Shelbi jobs in this project.\n\n## Wiki\n\nNone.\n",
-            "# Notes\n\nWrap `cargo test` in `shelbi job run` when it takes long. Plans: `shelbi wiki`.\n",
+            "# Notes\n\n## Jobs\n\nDon't use Shelbi jobs in this project.\n\n## Docs\n\nNone.\n",
+            "# Notes\n\nWrap `cargo test` in `shelbi job run` when it takes long. Plans: `shelbi docs`.\n",
         ] {
             let (_home, path) = home_with_shared_preamble(&guard, text);
             let report = detect(&["demo".to_string()]).unwrap();
@@ -2297,31 +2380,31 @@ zen:
         }
     }
 
-    /// The `## Wiki` section reaches existing projects: appended to a shared
+    /// The `## Docs` section reaches existing projects: appended to a shared
     /// preamble and to orchestrator instructions that predate it, after the
     /// project's own text, disclosed, and idempotent.
     #[test]
-    fn a_preamble_or_orchestrator_without_the_wiki_section_gets_it_appended() {
+    fn a_preamble_or_orchestrator_without_the_docs_section_gets_it_appended() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
         for (code, original, section) in [
             (
-                SHARED_PREAMBLE_WIKI_MISSING,
+                SHARED_PREAMBLE_DOCS_MISSING,
                 shelbi_state::DEFAULT_SHARED_PREAMBLE
-                    .split("\n## Wiki")
+                    .split("\n## Docs")
                     .next()
                     .unwrap()
                     .trim_end()
                     .to_string(),
-                crate::commands::config_upgrade::shipped_preamble_wiki_section(),
+                crate::commands::config_upgrade::shipped_preamble_docs_section(),
             ),
             (
-                ORCH_WIKI_RULE_MISSING,
+                ORCH_DOCS_RULE_MISSING,
                 "# Orchestrator\n\n## Changelog\n\nWrite one entry per merge.".to_string(),
-                crate::commands::config_upgrade::shipped_orchestrator_wiki_section(),
+                crate::commands::config_upgrade::shipped_orchestrator_docs_section(),
             ),
         ] {
-            let (_home, path) = if code == SHARED_PREAMBLE_WIKI_MISSING {
+            let (_home, path) = if code == SHARED_PREAMBLE_DOCS_MISSING {
                 home_with_shared_preamble(&guard, &original)
             } else {
                 home_with_orchestrator_instructions(&guard, &original)
@@ -2341,7 +2424,7 @@ zen:
             let healed = std::fs::read_to_string(&path).unwrap();
             assert!(healed.starts_with(&original), "the project's text was rewritten: {healed}");
             assert!(healed.ends_with(&format!("\n\n{section}\n")), "{healed}");
-            assert!(section.contains("shelbi wiki new Plans/<name>.md"), "{section}");
+            assert!(section.contains("shelbi docs new Plans/<name>.md"), "{section}");
             assert!(section.contains("never as a file in the repo"), "{section}");
             let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
             assert!(log.contains(code), "no disclosure: {log}");
@@ -2354,28 +2437,102 @@ zen:
         }
     }
 
+    /// A project initialized before Documentation was called that has the
+    /// shipped `## Wiki` section: boot swaps it for the `## Docs` one in
+    /// place (so the file reads as a new project's), never appending a
+    /// second; an edited one goes to the orchestrator.
     #[test]
-    fn the_shipped_defaults_or_an_edited_wiki_section_are_left_alone() {
+    fn a_pre_rename_wiki_section_is_replaced_in_place_or_handed_over_when_edited() {
+        use crate::commands::config_upgrade::{
+            shipped_orchestrator_docs_section, shipped_preamble_docs_section, ORCH_WIKI_RULE, ORCH_WIKI_RULE_EDITED,
+            SHARED_PREAMBLE_WIKI_SECTION, SHARED_PREAMBLE_WIKI_SECTION_EDITED,
+        };
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        // The shipped files as they were: the `## Docs` section in its old words.
+        let old = |template: &str, section: String, legacy: &str| {
+            let out = template.replace(&section, legacy.trim_end());
+            assert_ne!(out, template, "the template carries its docs section");
+            out
+        };
+        let old_preamble = old(
+            shelbi_state::DEFAULT_SHARED_PREAMBLE,
+            shipped_preamble_docs_section(),
+            &format!("## Wiki\n{}", super::super::config_upgrade::LEGACY_PREAMBLE_DOCS_SECTION),
+        );
+        let old_orch = old(
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            shipped_orchestrator_docs_section(),
+            &format!("## Wiki\n{}", super::super::config_upgrade::LEGACY_ORCH_DOCS_SECTION),
+        );
+        for (preamble, text, current, code, edited_code) in [
+            (true, old_preamble, shelbi_state::DEFAULT_SHARED_PREAMBLE, SHARED_PREAMBLE_WIKI_SECTION, SHARED_PREAMBLE_WIKI_SECTION_EDITED),
+            (false, old_orch, shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, ORCH_WIKI_RULE, ORCH_WIKI_RULE_EDITED),
+        ] {
+            let seed = |text: &str| {
+                if preamble {
+                    home_with_shared_preamble(&guard, text)
+                } else {
+                    home_with_orchestrator_instructions(&guard, text)
+                }
+            };
+            let (_home, path) = seed(&text);
+            let report = detect(&["demo".to_string()]).unwrap();
+            assert!(
+                report.findings.iter().any(|f| f.code == code && f.classification == Classification::AutoHeal),
+                "{code}: {:?}",
+                report.findings.iter().map(|f| &f.code).collect::<Vec<_>>()
+            );
+            assert!(!has_code(&report, SHARED_PREAMBLE_DOCS_MISSING) && !has_code(&report, ORCH_DOCS_RULE_MISSING));
+            let applied = apply_auto_heal(&["demo".to_string()], &report);
+            assert!(applied.iter().any(|c| c.code == code), "{applied:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), current, "it reads as a new project's");
+            let report2 = detect(&["demo".to_string()]).unwrap();
+            assert!(!has_code(&report2, code) && !has_code(&report2, edited_code), "{report2:?}");
+
+            // Edited (or `shelbi wiki` named elsewhere): needs judgment, and
+            // the file is left as the user wrote it.
+            for edited in [
+                text.replace("designs, decisions and", "designs, decisions, and"),
+                format!("{current}\nRun `shelbi wiki tree` first.\n"),
+            ] {
+                assert_ne!(edited, text);
+                let (_home, path) = seed(&edited);
+                let report = detect(&["demo".to_string()]).unwrap();
+                assert!(
+                    report.findings.iter().any(|f| f.code == edited_code && f.classification == Classification::NeedsJudgment),
+                    "{edited_code}: {:?}",
+                    report.findings.iter().map(|f| &f.code).collect::<Vec<_>>()
+                );
+                assert!(!has_code(&report, code));
+                apply_auto_heal(&["demo".to_string()], &report);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+            }
+        }
+    }
+
+    #[test]
+    fn the_shipped_defaults_or_an_edited_docs_section_are_left_alone() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
         for text in [
             shelbi_state::DEFAULT_SHARED_PREAMBLE,
-            "# Notes\n\n## Jobs\n\nNo jobs.\n\n## Wiki\n\nWe keep plans in Notion.\n",
+            "# Notes\n\n## Jobs\n\nNo jobs.\n\n## Docs\n\nWe keep plans in Notion.\n",
         ] {
             let (_home, path) = home_with_shared_preamble(&guard, text);
             let report = detect(&["demo".to_string()]).unwrap();
-            assert!(!has_code(&report, SHARED_PREAMBLE_WIKI_MISSING), "{text}: {report:?}");
+            assert!(!has_code(&report, SHARED_PREAMBLE_DOCS_MISSING), "{text}: {report:?}");
             apply_auto_heal(&["demo".to_string()], &report);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "file was modified");
         }
         for text in [
             shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
             "# Orchestrator\n\n## Changelog\n\nOne per merge.\n\n## Planning\n\n\
-             Write plans with `shelbi wiki new`.\n",
+             Write plans with `shelbi docs new`.\n",
         ] {
             let (_home, path) = home_with_orchestrator_instructions(&guard, text);
             let report = detect(&["demo".to_string()]).unwrap();
-            assert!(!has_code(&report, ORCH_WIKI_RULE_MISSING), "{report:?}");
+            assert!(!has_code(&report, ORCH_DOCS_RULE_MISSING), "{report:?}");
             apply_auto_heal(&["demo".to_string()], &report);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "file was modified");
         }
@@ -2454,9 +2611,9 @@ zen:
         let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
         for edited in [
             "# Orchestrator\n\n## Changelog\n\nDon't write changelog entries in this project.\n\n\
-             ## Wiki\n\nNo wiki here.\n",
+             ## Docs\n\nNo docs here.\n",
             "# Orchestrator\n\n## Merging\n\nAfter a merge, run `shelbi changelog add` \
-             only for user-visible changes. Plans: `shelbi wiki`.\n",
+             only for user-visible changes. Plans: `shelbi docs`.\n",
         ] {
             let (_home, path) = home_with_orchestrator_instructions(&guard, edited);
 
@@ -2490,10 +2647,10 @@ zen:
         let orch_dir = home.join("projects/demo/agents/orchestrator");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let path = orch_dir.join("instructions.md");
-        // The `## Changelog` and `## Wiki` headings keep those rules' appends
+        // The `## Changelog` and `## Docs` headings keep those rules' appends
         // out of it.
         let edited = "# Orchestrator\n\nSample it with `tmux capture-pane -p -t <my-slot>`.\n\n\
-                      ## Changelog\n\nWrite one entry per merge.\n\n## Wiki\n\nNo wiki here.\n";
+                      ## Changelog\n\nWrite one entry per merge.\n\n## Docs\n\nNo docs here.\n";
         std::fs::write(&path, edited).unwrap();
 
         let report = detect(&["demo".to_string()]).unwrap();

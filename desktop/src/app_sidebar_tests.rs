@@ -1,5 +1,5 @@
 //! The Figma sidebar's window behavior (`dt-figma-sidebar`): the sidebar's
-//! chords (⌘O ⌘I ⌘L open the nav views, ⌃1 to ⌃9 the numbered rows, even
+//! chords (⌘O ⌘I ⌘L ⌘D open the nav views, ⌃1 to ⌃9 the numbered rows, even
 //! from a focused terminal), the sections collapsing and expanding and the
 //! project remembering it, the Zen pill, and the tab bar's Search and
 //! Toggle sidebar buttons.
@@ -38,6 +38,7 @@ fn the_nav_chords_open_their_views(cx: &mut TestAppContext) {
         ("cmd-o", View::Session("orch".into())),
         ("cmd-i", View::Issues),
         ("cmd-l", View::Changelog),
+        ("cmd-d", View::Docs),
     ] {
         h.key(&crate::keys::test_keys::app_spec(keystroke));
         assert_eq!(h.take_calls(), calls_of(CommandKind::ShowView(view)), "{keystroke}");
@@ -87,7 +88,7 @@ fn a_collapsed_sections_chord_still_opens_its_row(cx: &mut TestAppContext) {
 fn the_window_takes_the_sidebar_chords_from_a_terminal(cx: &mut TestAppContext) {
     let h = open(cx);
     let keymaps = h.window.read_with(&h.cx, |w, _| w.keymaps.clone());
-    for spec in ["super-o", "super-i", "super-l", "super-1", "super-9", "ctrl-1", "ctrl-9"] {
+    for spec in ["super-o", "super-i", "super-l", "super-d", "super-1", "super-9", "ctrl-1", "ctrl-9"] {
         let chord = crate::keys::app_chord(&crate::keys::test_keys::row_spec(spec));
         assert!(takes_from_terminal(&keymaps, chord), "{spec}");
     }

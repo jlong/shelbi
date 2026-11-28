@@ -454,7 +454,7 @@ fn icon_for(e: &Entry) -> (String, Color) {
 }
 
 /// Build the results band's content lines, one per row: a command, an
-/// issue, a wiki document, a Changelog entry or a "Show all" row, or a group's muted header.
+/// issue, a document, a Changelog entry or a "Show all" row, or a group's muted header.
 /// `selected` is the highlighted row when the results hold focus.
 fn build_row_lines(rows: &[ResultRow], row_width: usize, selected: Option<usize>) -> Vec<Line<'static>> {
     rows.iter()
@@ -472,8 +472,8 @@ fn build_row_lines(rows: &[ResultRow], row_width: usize, selected: Option<usize>
                     row_width,
                     is_selected,
                 ),
-                ResultRow::Item(ResultItem::Wiki(h)) => detail_line(
-                    shelbi_app::command_model::nav_glyph("Wiki"),
+                ResultRow::Item(ResultItem::Docs(h)) => detail_line(
+                    shelbi_app::command_model::nav_glyph("Documentation"),
                     palette().foreground,
                     &h.title,
                     &h.detail,
@@ -1925,10 +1925,10 @@ mod tests {
         type_in(&mut p, "login");
         // Wide enough for every chip (a narrower palette drops the ones
         // that don't fit).
-        let (buf, _) = draw(&p, 110, 30);
+        let (buf, _) = draw(&p, 130, 30);
         let text = dump(&buf);
         assert!(
-            text.contains("▐ All 4 ▌  Issues 2    Wiki 0    Changelog Entries 1    Commands 1"),
+            text.contains("▐ All 4 ▌  Issues 2    Documentation 0    Changelog Entries 1    Commands 1"),
             "the chips with their counts: {text}"
         );
         // The chosen chip is in the selection fill, its caps that fill over
