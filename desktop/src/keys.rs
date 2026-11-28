@@ -303,6 +303,7 @@ pub fn app_shortcuts() -> Vec<AppShortcut> {
     push("Orchestrator", nav_view_chord(&View::Session("orch".into())));
     push("Issues", nav_view_chord(&View::Issues));
     push("Changelog", nav_view_chord(&View::Changelog));
+    push("Documentation", nav_view_chord(&View::Docs));
     push("Project tabs 1 to 9", Some(KeyChord::new(Key::Char('1'), app_mods())));
     push("Sidebar rows 1 to 9", Some(KeyChord::new(Key::Char('1'), row_mods())));
     push("Copy", fixed_chord(AppCommand::Copy));
@@ -344,8 +345,8 @@ pub fn keys_stub_shortcuts() -> String {
 /// shares).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavChord {
-    /// ⌘O, ⌘I, ⌘L (Ctrl+Shift+O, I, L on Linux): the Orchestrator, Issues
-    /// and Changelog views.
+    /// ⌘O, ⌘I, ⌘L, ⌘D (Ctrl+Shift+O, I, L, D on Linux): the Orchestrator,
+    /// Issues, Changelog and Documentation views.
     View(View),
     /// ⌃1 to ⌃9 (Alt+1 to Alt+9 on Linux, [`row_mods`]): the sidebar row the
     /// hint numbers (reviews, then working workspaces), or a task panel's
@@ -359,7 +360,11 @@ pub enum NavChord {
 
 /// The nav views' chords, as `keys.yaml` chord strings in their macOS form
 /// ([`platform_chord`] spells them for Linux).
-const NAV_VIEW_CHORDS: &[(&str, &str)] = &[("orch", "super-o"), ("tasks", "super-i"), ("changelog", "super-l")];
+/// Documentation is ⌘D: Ctrl+Shift+D on Linux, never plain Ctrl+D, which a
+/// terminal needs for end-of-file and the diff view takes for half a page
+/// down.
+const NAV_VIEW_CHORDS: &[(&str, &str)] =
+    &[("orch", "super-o"), ("tasks", "super-i"), ("changelog", "super-l"), ("docs", "super-d")];
 
 /// The chord that opens `view` from anywhere in the window. `None` for a
 /// view without one (Machines).
@@ -450,7 +455,7 @@ pub fn tab_hotkey(n: u8) -> String {
 }
 
 /// Whether `chord` is one of the window's own chords, and what it opens.
-/// ⌃1 to ⌃9 are the sidebar's rows, ⌘1 to ⌘9 the tabs, ⌘O ⌘I ⌘L the nav
+/// ⌃1 to ⌃9 are the sidebar's rows, ⌘1 to ⌘9 the tabs, ⌘O ⌘I ⌘L ⌘D the nav
 /// views (Alt+1 to 9, Ctrl+Shift+1 to 9 and Ctrl+Shift+O, I, L on Linux).
 pub fn nav_chord(chord: &KeyChord) -> Option<NavChord> {
     let digit = match chord.code {
@@ -822,6 +827,10 @@ mod tests {
         assert_eq!(nav_chord(&chord("cmd-o", "o")), Some(NavChord::View(View::Session("orch".into()))));
         assert_eq!(nav_chord(&chord("cmd-i", "i")), Some(NavChord::View(View::Issues)));
         assert_eq!(nav_chord(&chord("cmd-l", "l")), Some(NavChord::View(View::Changelog)));
+        assert_eq!(nav_chord(&chord("cmd-d", "d")), Some(NavChord::View(View::Docs)));
+        // Plain Ctrl+D is a terminal's end-of-file and the diff view's half
+        // page down, on every platform.
+        assert_eq!(nav_chord(&chord_from_keystroke(&ks("ctrl-d", Some("d"))).unwrap()), None);
         assert_eq!(nav_chord(&chord("cmd-1", "1")), Some(NavChord::Tab(1)));
         assert_eq!(nav_chord(&chord("cmd-9", "9")), Some(NavChord::Tab(9)));
         assert_eq!(nav_chord(&chord("cmd-0", "0")), None);
@@ -839,6 +848,9 @@ mod tests {
         assert_eq!(nav_view_hotkey(&View::Session("orch".into())), label("⌘O", "Ctrl+Shift+O"));
         assert_eq!(nav_view_hotkey(&View::Issues), label("⌘I", "Ctrl+Shift+I"));
         assert_eq!(nav_view_hotkey(&View::Changelog), label("⌘L", "Ctrl+Shift+L"));
+        assert_eq!(nav_view_hotkey(&View::Docs), label("⌘D", "Ctrl+Shift+D"));
+        let docs = nav_view_chord(&View::Docs).unwrap();
+        assert_eq!(crate::menus::tree::keystroke(&docs).as_deref(), Some(if MAC { "cmd-d" } else { "ctrl-shift-d" }));
         assert_eq!(nav_view_hotkey(&View::Activity), None, "Activity is palette-only");
         assert_eq!(nav_view_hotkey(&View::Machines), None);
         assert_eq!(nav_view_hotkey(&View::Jobs), None, "Jobs is palette-only: no chord");

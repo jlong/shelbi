@@ -624,75 +624,96 @@ fn the_orchestrator_awareness_saves_to_the_project_yaml_alone() {
 }
 
 #[test]
-fn the_wiki_block_saves_to_the_project_yaml_and_round_trips() {
-    use shelbi_core::{WikiSource, WikiSyncMode};
+fn the_docs_block_saves_to_the_project_yaml_and_round_trips() {
+    use shelbi_core::{DocsSource, DocsSyncMode};
     let home = Home::new();
     let cfg = load();
-    assert_eq!(cfg.wiki(), None, "no block");
-    assert!(!cfg.set_wiki(None).unwrap().is_dirty(), "no change, no write");
+    assert_eq!(cfg.docs(), None, "no block");
+    assert!(!cfg.set_docs(None).unwrap().is_dirty(), "no change, no write");
 
-    let block = WikiConfig {
+    let block = DocsConfig {
         branch: Some("docs/planning".into()),
-        ..WikiConfig::default()
+        ..DocsConfig::default()
     };
-    let saved = save(&cfg.set_wiki(Some(block.clone())).unwrap());
+    let saved = save(&cfg.set_docs(Some(block.clone())).unwrap());
     assert_eq!(saved.written, vec![home.projects.join(format!("{PROJECT}.yaml"))]);
     let text = home.project_yaml();
     assert!(text.starts_with("## Project header.\n"), "the comments stay: {text}");
     assert!(
-        text.ends_with("wiki:\n  source: branch\n  branch: docs/planning\n  sync: auto\n"),
+        text.ends_with("docs:\n  source: branch\n  branch: docs/planning\n  sync: auto\n"),
         "{text}"
     );
-    assert_eq!(load().wiki(), Some(&block));
+    assert_eq!(load().docs(), Some(&block));
     let project = crate::load_project(PROJECT).unwrap();
-    assert_eq!(project.wiki.as_ref(), Some(&block), "the loader reads it");
+    assert_eq!(project.docs.as_ref(), Some(&block), "the loader reads it");
 
     // A change patches the block in place.
-    let folder = WikiConfig {
-        source: WikiSource::Folder,
+    let folder = DocsConfig {
+        source: DocsSource::Folder,
         path: Some("handbook".into()),
-        sync: WikiSyncMode::Manual,
+        sync: DocsSyncMode::Manual,
         ..block.clone()
     };
-    save(&load().set_wiki(Some(folder.clone())).unwrap());
-    assert_eq!(load().wiki(), Some(&folder));
+    save(&load().set_docs(Some(folder.clone())).unwrap());
+    assert_eq!(load().docs(), Some(&folder));
     assert!(home.project_yaml().contains("  source: folder\n"), "{}", home.project_yaml());
 
     // None takes the block out again.
-    save(&load().set_wiki(None).unwrap());
+    save(&load().set_docs(None).unwrap());
     assert_eq!(home.project_yaml(), PROJECT_YAML);
 }
 
 #[test]
-fn an_invalid_wiki_block_is_refused_with_its_field() {
-    let _home = Home::new();
+fn a_legacy_wiki_block_is_read_as_docs_and_a_save_renames_it() {
+    use shelbi_core::DocsSyncMode;
+    let home = Home::new();
+    let text = format!("{PROJECT_YAML}wiki:\n  source: branch\n  sync: auto\n");
+    fs::write(home.projects.join(format!("{PROJECT}.yaml")), &text).unwrap();
     let cfg = load();
-    let bad = WikiConfig {
-        path: Some("/etc".into()),
-        ..WikiConfig::default()
+    assert_eq!(cfg.docs(), Some(&DocsConfig::default()), "the block before the rename");
+    assert_eq!(cfg.docs_unreadable(), None);
+    // Saving it writes it under its current name only.
+    let manual = DocsConfig {
+        sync: DocsSyncMode::Manual,
+        ..DocsConfig::default()
     };
-    let err = cfg.set_wiki(Some(bad)).unwrap_err().to_string();
-    assert!(err.contains("wiki.path `/etc`") && err.contains("relative"), "{err}");
-    let bad = WikiConfig {
-        branch: Some("has space".into()),
-        ..WikiConfig::default()
-    };
-    assert!(cfg.set_wiki(Some(bad)).unwrap_err().to_string().contains("wiki.branch"));
+    save(&cfg.set_docs(Some(manual.clone())).unwrap());
+    let text = home.project_yaml();
+    assert!(!text.contains("wiki:"), "{text}");
+    assert!(text.ends_with("docs:\n  source: branch\n  sync: manual\n"), "{text}");
+    assert_eq!(load().docs(), Some(&manual));
 }
 
 #[test]
-fn a_wiki_block_that_doesnt_parse_says_why_and_is_left_alone() {
+fn an_invalid_docs_block_is_refused_with_its_field() {
+    let _home = Home::new();
+    let cfg = load();
+    let bad = DocsConfig {
+        path: Some("/etc".into()),
+        ..DocsConfig::default()
+    };
+    let err = cfg.set_docs(Some(bad)).unwrap_err().to_string();
+    assert!(err.contains("docs.path `/etc`") && err.contains("relative"), "{err}");
+    let bad = DocsConfig {
+        branch: Some("has space".into()),
+        ..DocsConfig::default()
+    };
+    assert!(cfg.set_docs(Some(bad)).unwrap_err().to_string().contains("docs.branch"));
+}
+
+#[test]
+fn a_docs_block_that_doesnt_parse_says_why_and_is_left_alone() {
     let home = Home::new();
-    let text = format!("{PROJECT_YAML}wiki:\n  source: git\n");
+    let text = format!("{PROJECT_YAML}docs:\n  source: git\n");
     fs::write(home.projects.join(format!("{PROJECT}.yaml")), &text).unwrap();
     let cfg = load();
-    assert_eq!(cfg.wiki(), None);
-    assert!(cfg.wiki_unreadable().unwrap().contains("unknown wiki source `git`"));
+    assert_eq!(cfg.docs(), None);
+    assert!(cfg.docs_unreadable().unwrap().contains("unknown docs source `git`"));
     // Another setting's save doesn't touch it.
-    assert!(!cfg.set_wiki(None).unwrap().is_dirty());
+    assert!(!cfg.set_docs(None).unwrap().is_dirty());
     // Replacing it writes a good block.
-    save(&cfg.set_wiki(Some(WikiConfig::default())).unwrap());
-    assert!(home.project_yaml().ends_with("wiki:\n  source: branch\n  sync: auto\n"), "{}", home.project_yaml());
+    save(&cfg.set_docs(Some(DocsConfig::default())).unwrap());
+    assert!(home.project_yaml().ends_with("docs:\n  source: branch\n  sync: auto\n"), "{}", home.project_yaml());
 }
 
 #[test]

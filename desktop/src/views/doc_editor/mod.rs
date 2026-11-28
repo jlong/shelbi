@@ -101,11 +101,11 @@ pub struct DocEditor {
     /// Each row's spans, for the text revision they were read at.
     code_spans: Option<(u64, Rc<Vec<Vec<SyntaxSpan>>>)>,
     /// Every text size, line height, gap and inset over the UI's own:
-    /// 1 (the task pane), or the Wiki's body size over [`Type::Base`]'s
+    /// 1 (the task pane), or the Documentation's body size over [`Type::Base`]'s
     /// ([`Self::set_body_size`]).
     scale: f32,
     /// Body text's line height over its size, or `None` for
-    /// [`Type::Base`]'s (scaled): the Wiki's 1.4
+    /// [`Type::Base`]'s (scaled): Documentation's 1.4
     /// ([`Self::set_body_line_height`]).
     body_line_height: Option<f32>,
     _subs: Vec<Subscription>,
@@ -582,7 +582,7 @@ impl DocEditor {
         let src = p.layout.hit(self.model.doc(), rel);
         if crate::keys::link_mod(&e.modifiers) {
             if let Some(url) = self.model.link_at(src) {
-                // A `wiki:` link opens the document in the Wiki.
+                // A `docs:` link opens the document in the Documentation.
                 crate::links::open(&url, window, cx);
                 return;
             }

@@ -59,21 +59,26 @@ pub enum ChangeNotification {
     /// client should place. Nested rather than flattened so the layout variants
     /// evolve independently of the top-level `change` tag.
     Layout { project: String, event: LayoutEvent },
-    /// Documents of `project`'s wiki changed: `paths` (wiki-relative), by
+    /// Documents of `project`'s docs changed: `paths` (docs-relative), by
     /// `source` (`local`, `agent` or `pull`). A client refreshes the tree and
-    /// any open document. A client too old for it skips the line.
-    Wiki {
+    /// any open document. A client too old for it skips the line. Each of
+    /// the three is read under its pre-rename name too (`wiki`,
+    /// `wiki-status`, `wiki-open`), from a hub older than the client.
+    #[serde(alias = "wiki")]
+    Docs {
         project: String,
         paths: Vec<String>,
         source: String,
     },
-    /// `project`'s wiki sync status is now `status` (`synced`, `syncing`,
+    /// `project`'s docs sync status is now `status` (`synced`, `syncing`,
     /// `pending`, `offline`, `conflict`, `error <detail>`).
-    WikiStatus { project: String, status: String },
-    /// Someone asked to see `project`'s wiki at `path` (its root when
-    /// `None`), wiki-relative: `shelbi wiki open`. A client showing the
-    /// project opens its Wiki there.
-    WikiOpen { project: String, path: Option<String> },
+    #[serde(alias = "wiki-status")]
+    DocsStatus { project: String, status: String },
+    /// Someone asked to see `project`'s docs at `path` (its root when
+    /// `None`), docs-relative: `shelbi docs open`. A client showing the
+    /// project opens its Documentation there.
+    #[serde(alias = "wiki-open")]
+    DocsOpen { project: String, path: Option<String> },
 }
 
 impl ChangeNotification {
@@ -85,9 +90,9 @@ impl ChangeNotification {
             ChangeNotification::Board { project } => project,
             ChangeNotification::Workspace { project, .. } => project,
             ChangeNotification::Layout { project, .. } => project,
-            ChangeNotification::Wiki { project, .. } => project,
-            ChangeNotification::WikiStatus { project, .. } => project,
-            ChangeNotification::WikiOpen { project, .. } => project,
+            ChangeNotification::Docs { project, .. } => project,
+            ChangeNotification::DocsStatus { project, .. } => project,
+            ChangeNotification::DocsOpen { project, .. } => project,
         }
     }
 
@@ -204,6 +209,22 @@ mod tests {
                 None => return None,
             }
         }
+    }
+
+    #[test]
+    fn docs_changes_read_under_their_old_wiki_names() {
+        let read = |line: &str| serde_json::from_str::<ChangeNotification>(line).unwrap();
+        let changed = ChangeNotification::Docs { project: "p".into(), paths: vec!["a.md".into()], source: "agent".into() };
+        assert_eq!(changed.to_line().trim(), r#"{"change":"docs","project":"p","paths":["a.md"],"source":"agent"}"#);
+        assert_eq!(read(r#"{"change":"wiki","project":"p","paths":["a.md"],"source":"agent"}"#), changed);
+        assert_eq!(
+            read(r#"{"change":"wiki-status","project":"p","status":"synced"}"#),
+            ChangeNotification::DocsStatus { project: "p".into(), status: "synced".into() }
+        );
+        assert_eq!(
+            read(r#"{"change":"wiki-open","project":"p","path":null}"#),
+            ChangeNotification::DocsOpen { project: "p".into(), path: None }
+        );
     }
 
     #[test]

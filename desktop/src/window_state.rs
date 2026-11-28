@@ -29,7 +29,8 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use shelbi_app::nav::DEFAULT_SIDEBAR_WIDTH;
+use shelbi_app::nav::{DEFAULT_SIDEBAR_WIDTH, LEGACY_DOCS_VIEW};
+use shelbi_app::View;
 use shelbi_app::source::ProjectKey;
 
 use crate::views::pane_width::DEFAULT_W;
@@ -334,10 +335,14 @@ pub struct ProjectViewState {
     pub workflow_filter: Option<String>,
     /// The sidebar sections collapsed (`ready`, `queued`, `workspaces`).
     pub collapsed_sections: Vec<String>,
-    /// The Wiki tree's open folders (wiki-relative paths).
-    pub wiki_expanded: Vec<String>,
-    /// The Wiki's open document.
-    pub wiki_doc: Option<String>,
+    /// The Documentation tree's open folders (docs-relative paths). Read
+    /// from `wiki_expanded` too, its name in a file saved before
+    /// Documentation was called that.
+    #[serde(alias = "wiki_expanded")]
+    pub docs_expanded: Vec<String>,
+    /// The Documentation's open document (`wiki_doc` in an older file).
+    #[serde(alias = "wiki_doc")]
+    pub docs_document: Option<String>,
 }
 
 impl ProjectViewState {
@@ -349,7 +354,24 @@ impl ProjectViewState {
 
     /// `project`'s saved view state, or the default.
     pub fn load(project: &ProjectKey) -> ProjectViewState {
-        Self::path(project).map(|p| load_json(&p)).unwrap_or_default()
+        Self::path(project).map(|p| load_json::<ProjectViewState>(&p)).unwrap_or_default().upgraded()
+    }
+
+    /// A state saved before Documentation was called that names its view
+    /// `wiki` (`view:wiki` as a row): read as `docs`, so the window lands
+    /// back on it.
+    fn upgraded(mut self) -> ProjectViewState {
+        let view = |v: &mut Option<String>| {
+            if v.as_deref() == Some(LEGACY_DOCS_VIEW) {
+                *v = Some(View::Docs.as_view_id());
+            }
+        };
+        view(&mut self.view);
+        view(&mut self.workspace_return);
+        if self.selected.as_deref() == Some(&format!("view:{LEGACY_DOCS_VIEW}")) {
+            self.selected = Some(format!("view:{}", View::Docs.as_view_id()));
+        }
+        self
     }
 
     /// Save it for `project`. Blocking disk IO: call it off the UI thread.
@@ -646,11 +668,31 @@ mod tests {
             workspace_return: Some("tasks".into()),
             workflow_filter: Some("task".into()),
             collapsed_sections: vec!["queued".into()],
-            wiki_expanded: vec!["Plans".into(), "Plans/Archive".into()],
-            wiki_doc: Some("Plans/a.md".into()),
+            docs_expanded: vec!["Plans".into(), "Plans/Archive".into()],
+            docs_document: Some("Plans/a.md".into()),
         };
         write_json(&path, &view).unwrap();
         assert_eq!(load_json::<ProjectViewState>(&path), view);
+    }
+
+    #[test]
+    fn a_view_state_saved_before_the_docs_rename_reads_as_docs() {
+        let dir = temp_dir("view-legacy");
+        let path = dir.join(VIEW_FILE_NAME);
+        std::fs::write(
+            &path,
+            r#"{"view":"wiki","selected":"view:wiki","workspace_return":"wiki","wiki_expanded":["Plans"],"wiki_doc":"Plans/a.md"}"#,
+        )
+        .unwrap();
+        let view = load_json::<ProjectViewState>(&path).upgraded();
+        assert_eq!(view.view.as_deref(), Some("docs"));
+        assert_eq!(view.selected.as_deref(), Some("view:docs"));
+        assert_eq!(view.workspace_return.as_deref(), Some("docs"));
+        assert_eq!(view.docs_expanded, ["Plans"]);
+        assert_eq!(view.docs_document.as_deref(), Some("Plans/a.md"));
+        // And it's saved under the new names.
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("wiki"), "{json}");
     }
 
     #[test]

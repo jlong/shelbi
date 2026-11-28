@@ -181,7 +181,7 @@ pub fn write_state(project: &str, write: StateWrite) -> ExecOutcome {
 }
 
 /// Run one of the app's requests ([`crate::far::Request`]) on this
-/// machine's daemon, started on demand (the wiki's reads and writes, which
+/// machine's daemon, started on demand (the docs' reads and writes, which
 /// the daemon is the single writer of). Blocking.
 pub fn app_request(project: &str, request: &crate::far::Request) -> Result<crate::far::Reply, ExecError> {
     let body = serde_json::to_value(request).map_err(|e| ExecError::Backend(e.to_string()))?;

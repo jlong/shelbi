@@ -698,7 +698,7 @@ mod tests {
     use crate::theme::style::Type;
     use crate::theme::Theme;
 
-    /// The Wiki's body rows (paragraphs, items, quotes) sit on lines 1.4
+    /// Documentation's body rows (paragraphs, items, quotes) sit on lines 1.4
     /// times their size at any body size; headings and code keep their
     /// scaled line heights, and the task body (no ratio) is unchanged.
     #[test]
@@ -713,16 +713,16 @@ mod tests {
         for size in [14.0, 16.0] {
             let scale = size / Type::Base.size();
             for row in body() {
-                let wiki = face(Field::Body, row, &theme, scale, Some(1.4));
-                assert_eq!(wiki.size, size);
-                assert_eq!(wiki.line_height, (size * 1.4).round(), "{:?} at {size}", row.kind);
+                let docs = face(Field::Body, row, &theme, scale, Some(1.4));
+                assert_eq!(docs.size, size);
+                assert_eq!(docs.line_height, (size * 1.4).round(), "{:?} at {size}", row.kind);
                 let task = face(Field::Body, row, &theme, scale, None);
                 assert_eq!(task.line_height, (Type::Base.line_height() * scale).round(), "{:?}", row.kind);
             }
             for row in other() {
-                let wiki = face(Field::Body, row, &theme, scale, Some(1.4));
+                let docs = face(Field::Body, row, &theme, scale, Some(1.4));
                 let task = face(Field::Body, row, &theme, scale, None);
-                assert_eq!(wiki.line_height, task.line_height, "{:?} at {size}", row.kind);
+                assert_eq!(docs.line_height, task.line_height, "{:?} at {size}", row.kind);
             }
             // The title keeps its own.
             let title = Doc::plain("Title");

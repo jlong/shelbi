@@ -45,6 +45,17 @@ const nextConfig: NextConfig = {
         permanent: true,
       },
       {
+        // The Wiki was renamed Documentation (`shelbi wiki` is `shelbi docs`).
+        source: "/docs/concepts/wiki",
+        destination: "/docs/concepts/docs",
+        permanent: true,
+      },
+      {
+        source: "/docs/cli/wiki",
+        destination: "/docs/cli/docs",
+        permanent: true,
+      },
+      {
         source: "/docs/concepts/columns",
         destination: "/docs/guides/getting-started/workflows",
         permanent: true,

@@ -877,7 +877,7 @@ fn lint_project(
                             ));
                         }
                         lint_releases(entry, text, &p, out);
-                        lint_wiki(entry, text, &p, out);
+                        lint_docs(entry, text, &p, out);
                         match p.validate_workspaces() {
                             Ok(()) => Some(p),
                             Err(e) => {
@@ -925,7 +925,7 @@ fn lint_project(
                             ));
                         }
                         lint_releases(shared_entry, shared, &p, out);
-                        lint_wiki(shared_entry, shared, &p, out);
+                        lint_docs(shared_entry, shared, &p, out);
                         match p.validate_workspaces() {
                             Ok(()) => Some(p),
                             Err(e) => {
@@ -1542,24 +1542,24 @@ fn lint_releases(entry: &InventoryEntry, text: &str, project: &Project, out: &mu
     }
 }
 
-/// A `wiki:` block whose branch git won't take or whose path leaves the
+/// A `docs:` block whose branch git won't take or whose path leaves the
 /// repo. Like `releases:`, it never fails the project's load; the hub won't
-/// set such a wiki up, and lint says why.
-fn lint_wiki(entry: &InventoryEntry, text: &str, project: &Project, out: &mut Vec<Diagnostic>) {
-    let Some(wiki) = &project.wiki else {
+/// set such docs up, and lint says why.
+fn lint_docs(entry: &InventoryEntry, text: &str, project: &Project, out: &mut Vec<Diagnostic>) {
+    let Some(docs) = &project.docs else {
         return;
     };
-    if let Err(e) = wiki.validate() {
+    if let Err(e) = docs.validate() {
         out.push(diag(
             entry,
             Severity::Error,
-            "PROJECT_WIKI_INVALID",
+            "PROJECT_DOCS_INVALID",
             e.to_string(),
             Some(
-                "Set wiki.branch to a branch name git takes (docs/planning by default) and wiki.path to a folder inside the repo, relative to its root (docs by default)."
+                "Set docs.branch to a branch name git takes (docs/planning by default) and docs.path to a folder inside the repo, relative to its root (docs by default)."
                     .into(),
             ),
-            locate_key(text, "wiki"),
+            locate_key(text, "docs"),
         ));
     }
 }

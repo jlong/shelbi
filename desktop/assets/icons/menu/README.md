@@ -28,7 +28,7 @@ A tab's context menu marks its Move to Window row, which opens a submenu:
 - `chevron-right.svg`: the Heroicons chevron-right, drawn on the 16pt grid
   with a 1.25pt stroke (the 24/outline path scaled by 2/3).
 
-The Wiki sidebar's tree draws its rows' marks on the same grid:
+The Documentation sidebar's tree draws its rows' marks on the same grid:
 
 - `chevron-right.svg` and `chevron-down.svg`: a closed and an open
   folder's disclosure (the Heroicons chevrons on the 16pt grid with a

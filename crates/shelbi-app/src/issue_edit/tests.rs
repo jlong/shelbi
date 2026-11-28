@@ -244,7 +244,7 @@ fn a_refused_save_with_no_new_copy_gives_up_and_says_so() {
     assert!(e.retry("T").is_some());
 }
 
-/// The 2026-11-27 `wiki` save: a body opening with `---` rules, acked by the
+/// The 2026-11-27 `docs` save: a body opening with `---` rules, acked by the
 /// daemon at the revision it was sent from because the tracker kept the body
 /// it had. The editor says so at once, never "changed elsewhere", and a retry
 /// replaces the text the store still holds, so it isn't refused as stale.

@@ -515,21 +515,21 @@ pub fn subscribe_layout(link: Arc<dyn RelayLink>, project: &str) -> (LayoutSubsc
     (LayoutSubscription::remote(stop, handle, open), rx)
 }
 
-/// Subscribe to `project`'s wiki changes on `link`'s host, from the far
-/// hub's `changes` lines ([`crate::wiki_sub`]).
-pub fn subscribe_wiki(
+/// Subscribe to `project`'s docs change on `link`'s host, from the far
+/// hub's `changes` lines ([`crate::docs_sub`]).
+pub fn subscribe_docs(
     link: Arc<dyn RelayLink>,
     project: &str,
-) -> (ChangeSubscription, Receiver<crate::wiki_sub::WikiWake>) {
+) -> (ChangeSubscription, Receiver<crate::docs_sub::DocsWake>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let open = OpenStream::default();
     let handles = {
         let (project, stop, open) = (project.to_string(), stop.clone(), open.clone());
-        spawn("shelbi-remote-wiki", move || {
+        spawn("shelbi-remote-docs", move || {
             let connected = AtomicBool::new(false);
             line_loop(&*link, &project, &stop, &open, &connected, |buf| {
-                crate::wiki_sub::drain_lines(buf, &project, &tx)
+                crate::docs_sub::drain_lines(buf, &project, &tx)
             })
         })
     };

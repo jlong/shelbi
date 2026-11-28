@@ -11,7 +11,7 @@
 //! header row ([`header_row`]: the project's name, then Search and Toggle
 //! sidebar),
 //! a remote window's host, then
-//! the nav (Orchestrator ⌘O, Issues ⌘I, Changelog ⌘L), the sections, then
+//! the nav (Orchestrator ⌘O, Issues ⌘I, Changelog ⌘L, Documentation ⌘D), the sections, then
 //! the footer: any status (the orchestrator's failure, the polling
 //! indicator, a version mismatch or a stale board), the unread-errors and
 //! Settings buttons, and the Zen pill.
@@ -671,7 +671,7 @@ pub fn nav_icon(view: &View) -> Icon {
         View::Session(_) => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
         View::Issues => icons::RECTANGLE_STACK,
         View::Changelog => icons::ROCKET_LAUNCH,
-        View::Wiki => icons::BOOK_OPEN,
+        View::Docs => icons::BOOK_OPEN,
         // Palette-only now (no sidebar row): the bolt the Figma Activity
         // frame draws, beside the Changelog's rocket there.
         View::Activity => icons::BOLT,
@@ -1831,7 +1831,7 @@ mod tests {
         let entries = layout(&model(), &BTreeSet::new());
         // Selectable: 4 nav, the four workspaces, then R-1, Q-1, Q-2.
         assert_eq!(selected_key(&entries, 0).as_deref(), Some("sidebar-nav-Orchestrator"));
-        assert_eq!(selected_key(&entries, 2).as_deref(), Some("sidebar-nav-Wiki"));
+        assert_eq!(selected_key(&entries, 2).as_deref(), Some("sidebar-nav-Documentation"));
         assert_eq!(selected_key(&entries, 4).as_deref(), Some("sidebar-ws-alpha"));
         assert_eq!(selected_key(&entries, 8).as_deref(), Some("sidebar-review-R-1"));
         assert_eq!(selected_key(&entries, 10).as_deref(), Some("sidebar-review-Q-2"));
@@ -1983,7 +1983,7 @@ mod tests {
         assert_eq!(nav_icon(&View::Session("orch".into())), icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS);
         assert_eq!(nav_icon(&View::Issues), icons::RECTANGLE_STACK);
         assert_eq!(nav_icon(&View::Changelog), icons::ROCKET_LAUNCH);
-        assert_eq!(nav_icon(&View::Wiki), icons::BOOK_OPEN);
+        assert_eq!(nav_icon(&View::Docs), icons::BOOK_OPEN);
         assert_eq!(nav_icon(&View::Activity), icons::BOLT);
         assert_eq!(nav_icon(&View::Jobs), icons::QUEUE_LIST);
         assert_eq!(nav_icon(&View::Reminders), icons::CLOCK);

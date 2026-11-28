@@ -106,7 +106,7 @@ use super::machine_form::{self, MachineFormEvent, MachineFormView};
 use super::machine_form_state;
 use super::orchestrator::OrchestratorPage;
 use super::issues_settings::IssuesSettingsPage;
-use super::wiki_settings::WikiSettingsPage;
+use super::docs_settings::DocsSettingsPage;
 use super::properties::PropertiesPage;
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
@@ -462,8 +462,8 @@ pub struct SettingsView {
     properties: Entity<PropertiesPage>,
     /// The project's Issues page.
     issues: Entity<IssuesSettingsPage>,
-    /// The project's Wiki page.
-    wiki: Entity<WikiSettingsPage>,
+    /// The project's Documentation page.
+    docs: Entity<DocsSettingsPage>,
     /// The Add machine / Configure machine dialog while it's open, and what
     /// had the keyboard before it (it gets it back).
     machine_form: Option<OpenForm>,
@@ -507,7 +507,7 @@ impl SettingsView {
         let orchestrator = cx.new(|cx| OrchestratorPage::new(handle, window, cx));
         let properties = cx.new(|cx| PropertiesPage::new(handle, window, cx));
         let issues = cx.new(|cx| IssuesSettingsPage::new(handle, window, cx));
-        let wiki = cx.new(|cx| WikiSettingsPage::new(handle, window, cx));
+        let docs = cx.new(|cx| DocsSettingsPage::new(handle, window, cx));
         let range = |r: &std::ops::RangeInclusive<u8>| *r.start() as i32..=*r.end() as i32;
         let initial = Translucency::default();
         let opacity_slider = cx.new(|cx| {
@@ -629,7 +629,7 @@ impl SettingsView {
             orchestrator,
             properties,
             issues,
-            wiki,
+            docs,
             machine_form: None,
             scroll: ScrollHandle::new(),
             scroll_to_statuses: false,
@@ -738,10 +738,10 @@ impl SettingsView {
         self.issues.clone()
     }
 
-    /// The Wiki page's view.
+    /// The Documentation page's view.
     #[cfg(test)]
-    pub(crate) fn wiki(&self) -> Entity<WikiSettingsPage> {
-        self.wiki.clone()
+    pub(crate) fn docs(&self) -> Entity<DocsSettingsPage> {
+        self.docs.clone()
     }
 
     /// The Workspaces page's view.
@@ -980,7 +980,7 @@ impl SettingsView {
                 SettingsPage::Orchestrator => self.orchestrator.update(cx, |p, _| p.reload_when_drawn()),
                 SettingsPage::Properties => self.properties.update(cx, |p, _| p.reload_when_drawn()),
                 SettingsPage::Issues => self.issues.update(cx, |p, _| p.reload_when_drawn()),
-                SettingsPage::Wiki => self.wiki.update(cx, |p, _| p.reload_when_drawn()),
+                SettingsPage::Docs => self.docs.update(cx, |p, _| p.reload_when_drawn()),
                 _ => {}
             }
             self.page = page;
@@ -2017,8 +2017,8 @@ impl Render for SettingsView {
             SettingsPage::Properties => page.child(self.properties.clone()),
             // Where the project's issues live: the tracker section.
             SettingsPage::Issues => page.child(self.issues.clone()),
-            // Where the project's wiki lives and its sync.
-            SettingsPage::Wiki => page.child(self.wiki.clone()),
+            // Where the project's docs live and its sync.
+            SettingsPage::Docs => page.child(self.docs.clone()),
             // The Terminal frame (2252:28494): the controls in a column the
             // picker's width, the Option helper a line per sentence; the
             // preview fills the rest of the page beside them.
@@ -2102,7 +2102,7 @@ impl Render for SettingsView {
                     | SettingsPage::Orchestrator
                     | SettingsPage::Properties
                     | SettingsPage::Issues
-                    | SettingsPage::Wiki
+                    | SettingsPage::Docs
             )
         });
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
@@ -2415,7 +2415,7 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
         SettingsPage::Orchestrator => "settings-page-orchestrator",
         SettingsPage::Properties => "settings-page-properties",
         SettingsPage::Issues => "settings-page-issues",
-        SettingsPage::Wiki => "settings-page-wiki",
+        SettingsPage::Docs => "settings-page-docs",
     }
 }
 

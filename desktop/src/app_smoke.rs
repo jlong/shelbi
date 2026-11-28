@@ -492,7 +492,7 @@ fn typing_in_the_palette_searches_issues_and_changelog_entries(cx: &mut TestAppC
     // The filter row, each chip with its count.
     assert!(h.cx.debug_bounds("palette-filters").is_some());
     let counts: Vec<(&str, usize)> = h.palette(|p| p.chips().iter().map(|c| (c.label, c.count)).collect());
-    assert_eq!(counts, [("All", 3), ("Issues", 2), ("Wiki", 0), ("Changelog Entries", 1), ("Commands", 0)]);
+    assert_eq!(counts, [("All", 3), ("Issues", 2), ("Documentation", 0), ("Changelog Entries", 1), ("Commands", 0)]);
     assert!(h.cx.debug_bounds("palette-projects").is_none(), "the Projects column steps aside");
     // Grouped under All, a heading over each kind, best match first.
     let issues = h.top_of("palette-heading-Issues");
@@ -513,7 +513,7 @@ fn typing_in_the_palette_searches_issues_and_changelog_entries(cx: &mut TestAppC
     h.key("up");
     assert!(h.palette(|p| p.filter_focused()));
     h.key("left");
-    assert_eq!(h.palette(|p| p.filter()), SearchFilter::Wiki);
+    assert_eq!(h.palette(|p| p.filter()), SearchFilter::Docs);
     h.key("left");
     assert_eq!(h.palette(|p| p.filter()), SearchFilter::Issues);
     h.key("down");

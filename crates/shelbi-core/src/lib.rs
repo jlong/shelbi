@@ -12,7 +12,7 @@ pub mod process_group;
 pub mod placeholders;
 pub mod pool;
 pub mod releases;
-pub mod wiki;
+pub mod docs;
 pub mod scaffold;
 pub mod session_health;
 pub mod shell;
@@ -66,7 +66,7 @@ pub use opencode::{
 };
 pub use process_group::signal_process_group;
 pub use releases::{ReleasesConfig, TagGlob};
-pub use wiki::{WikiConfig, WikiSource, WikiSyncMode};
+pub use docs::{DocsConfig, DocsSource, DocsSyncMode};
 pub use placeholders::{extract_placeholders, substitute_placeholders};
 pub use session_health::{
     classify as classify_session, HealthTransition, RealSessionProbe, SessionHealthTracker,

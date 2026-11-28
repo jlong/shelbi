@@ -34,8 +34,8 @@
 //!   and the poll intervals), with its validation and save.
 //! - [`tracker`]: the Issues page's form (where the project's issues live,
 //!   its connection's fields and agent rules, and Connect).
-//! - [`wiki`]: the Wiki page's form (where the project's wiki lives, its
-//!   auto-sync, and the hub's sync status with Sync now / Set up wiki).
+//! - [`docs`]: the Documentation page's form (where the project's docs live, its
+//!   auto-sync, and the hub's sync status with Sync now / Set up docs).
 //! - [`orchestrator`]: the Orchestrator page's event delivery radio
 //!   (`orchestrator.awareness:`) and its Restart orchestrator.
 //! - [`workspaces`] and [`workspace_form`]: the Workspaces page (the pool,
@@ -64,7 +64,7 @@ pub mod store;
 pub mod summary;
 pub mod terminal_preview;
 pub mod tracker;
-pub mod wiki;
+pub mod docs;
 pub mod workflow_builder;
 pub mod workflow_editor;
 pub mod workflow_graph;
@@ -97,9 +97,9 @@ pub enum SettingsPage {
     /// Where the project's issues live: its issue tracker (the local board,
     /// GitHub or Linear), that connection's fields and its agent rules.
     Issues,
-    /// Where the project's wiki lives (the `wiki:` block), its auto-sync,
+    /// Where the project's docs live (the `docs:` block), its auto-sync,
     /// and the hub's sync status.
-    Wiki,
+    Docs,
 }
 
 /// Whose settings a page edits.
@@ -123,7 +123,7 @@ impl SettingsPage {
             SettingsPage::Orchestrator => "Orchestrator",
             SettingsPage::Properties => "Properties",
             SettingsPage::Issues => "Issues",
-            SettingsPage::Wiki => "Wiki",
+            SettingsPage::Docs => "Documentation",
         }
     }
 
@@ -131,7 +131,7 @@ impl SettingsPage {
     /// the project tabs), the digit key in the TUI. Counted in the order the
     /// sidebar lists every page, as the Figma frame (2252:27532) numbers
     /// them: General 1 onward. Only nine keys exist, so a page past the
-    /// ninth (Workspaces, since Wiki joined) has no number. Both clients
+    /// ninth (Workspaces, since Documentation joined) has no number. Both clients
     /// offer every page, so the count is the same whichever client draws it.
     pub fn shortcut(self) -> Option<u8> {
         let at = pages().position(|p| p == self).expect("every page is in a section");
@@ -155,7 +155,7 @@ impl SettingsPage {
             | SettingsPage::Agents
             | SettingsPage::Orchestrator
             | SettingsPage::Issues
-            | SettingsPage::Wiki => Scope::Project,
+            | SettingsPage::Docs => Scope::Project,
         }
     }
 
@@ -171,7 +171,7 @@ impl SettingsPage {
             SettingsPage::Orchestrator => 1 << 6,
             SettingsPage::Properties => 1 << 7,
             SettingsPage::Issues => 1 << 8,
-            SettingsPage::Wiki => 1 << 9,
+            SettingsPage::Docs => 1 << 9,
         }
     }
 }
@@ -210,7 +210,7 @@ pub const SECTIONS: &[Section] = &[
             SettingsPage::Orchestrator,
             SettingsPage::Agents,
             SettingsPage::Issues,
-            SettingsPage::Wiki,
+            SettingsPage::Docs,
             SettingsPage::Workflows,
             SettingsPage::Workspaces,
         ],
@@ -238,7 +238,7 @@ impl PageSet {
             | SettingsPage::Orchestrator.bit()
             | SettingsPage::Properties.bit()
             | SettingsPage::Issues.bit()
-            | SettingsPage::Wiki.bit(),
+            | SettingsPage::Docs.bit(),
     );
 
     /// No page.
@@ -596,7 +596,7 @@ mod tests {
     fn the_pages_are_numbered_in_order() {
         let all: Vec<_> = pages().collect();
         // Properties leads the project section, then Orchestrator, Agents,
-        // Issues, Wiki, Workflows, Workspaces.
+        // Issues, Documentation, Workflows, Workspaces.
         assert_eq!(
             all,
             [
@@ -607,7 +607,7 @@ mod tests {
                 SettingsPage::Orchestrator,
                 SettingsPage::Agents,
                 SettingsPage::Issues,
-                SettingsPage::Wiki,
+                SettingsPage::Docs,
                 SettingsPage::Workflows,
                 SettingsPage::Workspaces,
             ]
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Orchestrator));
         assert_eq!(SettingsPage::for_shortcut(6), Some(SettingsPage::Agents));
         assert_eq!(SettingsPage::for_shortcut(7), Some(SettingsPage::Issues));
-        assert_eq!(SettingsPage::for_shortcut(8), Some(SettingsPage::Wiki));
+        assert_eq!(SettingsPage::for_shortcut(8), Some(SettingsPage::Docs));
         assert_eq!(SettingsPage::for_shortcut(9), Some(SettingsPage::Workflows));
         assert_eq!(SettingsPage::for_shortcut(10), None);
         assert_eq!(SettingsPage::for_shortcut(0), None);
@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(SettingsPage::Workflows.scope(), Scope::Project);
         assert_eq!(SettingsPage::Orchestrator.scope(), Scope::Project);
         assert_eq!(SettingsPage::Issues.scope(), Scope::Project);
-        assert_eq!(SettingsPage::Wiki.scope(), Scope::Project);
+        assert_eq!(SettingsPage::Docs.scope(), Scope::Project);
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 if a.shortcut().is_some() {

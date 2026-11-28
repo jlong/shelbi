@@ -14,7 +14,7 @@ members = [
     "crates/shelbi-client",
     "crates/shelbi-term",
     "crates/shelbi-session",
-    "crates/shelbi-wiki",
+    "crates/shelbi-docs",
 ]
 default-members = ["crates/shelbi-cli"]
 # `vendor/*` holds vendored third-party forks (e.g. `alacritty_terminal`, the
@@ -96,7 +96,7 @@ shelbi-proto = { path = "crates/shelbi-proto" }
 shelbi-client = { path = "crates/shelbi-client" }
 shelbi-term = { path = "crates/shelbi-term" }
 shelbi-session = { path = "crates/shelbi-session" }
-shelbi-wiki = { path = "crates/shelbi-wiki" }
+shelbi-docs = { path = "crates/shelbi-docs" }
 
 [profile.release]
 lto = "thin"

@@ -778,7 +778,7 @@ mod tests {
             [
                 ("All", 6, true),
                 ("Issues", 5, false),
-                ("Wiki", 0, false),
+                ("Documentation", 0, false),
                 ("Changelog Entries", 0, false),
                 ("Commands", 1, false)
             ]
@@ -828,7 +828,7 @@ mod tests {
         assert!(p.filter_focused());
         press(&mut p, key(Key::Right));
         press(&mut p, key(Key::Right));
-        assert_eq!(p.filter(), SearchFilter::Wiki);
+        assert_eq!(p.filter(), SearchFilter::Docs);
         press(&mut p, key(Key::Left));
         assert_eq!(p.filter(), SearchFilter::Issues);
         // Down (or Enter) hands the keys back to the results.

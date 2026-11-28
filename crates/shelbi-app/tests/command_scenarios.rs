@@ -204,9 +204,9 @@ impl Executor for Scenario {
                 self.client.focus_main();
                 Performed::Host(effect.clone())
             }
-            // The Wiki takes the main area; the host opens the document.
-            Effect::OpenWikiDoc { .. } => {
-                self.client.set_view(View::Wiki);
+            // The Documentation takes the main area; the host opens the document.
+            Effect::OpenDoc { .. } => {
+                self.client.set_view(View::Docs);
                 self.client.focus_main();
                 Performed::Host(effect.clone())
             }
@@ -311,7 +311,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::OpenEditor { .. } => "edit_targets_open_their_file_in_the_editor",
         CommandKind::OpenIssue { .. } => "a_searched_issue_opens_its_detail_over_the_view",
         CommandKind::OpenChangelogEntry { .. } => "a_searched_changelog_entry_opens_the_changelog_at_it",
-        CommandKind::OpenWikiDoc { .. } => "a_searched_wiki_document_opens_the_wiki_at_it",
+        CommandKind::OpenDoc { .. } => "a_searched_docs_document_opens_the_docs_at_it",
         CommandKind::ApproveReview { .. } => "approve_is_sent_at_once",
         CommandKind::RejectReview { .. } => "reject_asks_for_a_reason_then_sends_it",
         CommandKind::MoveIssue { .. }
@@ -692,17 +692,17 @@ fn a_searched_changelog_entry_opens_the_changelog_at_it() {
 }
 
 #[test]
-fn a_searched_wiki_document_opens_the_wiki_at_it() {
+fn a_searched_docs_document_opens_the_docs_at_it() {
     let mut s = Scenario::new();
-    let effect = s.invoke_search_result("action:open-wiki-doc:Plans/wiki.md");
+    let effect = s.invoke_search_result("action:open-docs-doc:Plans/docs.md");
     assert_eq!(
         effect,
-        Effect::OpenWikiDoc {
+        Effect::OpenDoc {
             project: PROJECT.into(),
-            path: "Plans/wiki.md".into()
+            path: "Plans/docs.md".into()
         }
     );
-    assert_eq!(s.client.view(), &View::Wiki);
+    assert_eq!(s.client.view(), &View::Docs);
     assert_eq!(s.client.focus(), Focus::Main);
     assert_eq!(s.last(), &Performed::Host(effect), "the host opens the document");
 }

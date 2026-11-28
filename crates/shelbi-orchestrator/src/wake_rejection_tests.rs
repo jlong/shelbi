@@ -56,7 +56,7 @@ fn test_project() -> Project {
         disk: shelbi_core::DiskConfig::default(),
         detected_shapes: Vec::new(),
         releases: None,
-        wiki: None,
+        docs: None,
     }
 }
 

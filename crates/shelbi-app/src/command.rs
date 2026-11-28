@@ -96,10 +96,10 @@ pub enum CommandKind {
     /// Show the Changelog scrolled to one entry (the palette's Changelog
     /// search results; never listed, only resolved from its id).
     OpenChangelogEntry { id: String },
-    /// Show the Wiki with one document open (the palette's wiki search
-    /// results, and a `wiki:Plans/foo.md` link in a task body; never listed,
+    /// Show the Documentation with one document open (the palette's docs search
+    /// results, and a `docs:Plans/foo.md` link in a task body; never listed,
     /// only resolved from its path).
-    OpenWikiDoc { path: String },
+    OpenDoc { path: String },
     // ---- issue mutations (the generic set; not surfaced in the tmux
     // palette today, carried here so the single-process TUI / desktop app
     // bind them from one definition) ------------------------------------
@@ -256,7 +256,7 @@ impl CommandKind {
                 project: p(),
                 id: id.clone(),
             },
-            CommandKind::OpenWikiDoc { path } => Effect::OpenWikiDoc {
+            CommandKind::OpenDoc { path } => Effect::OpenDoc {
                 project: p(),
                 path: path.clone(),
             },
@@ -464,7 +464,7 @@ fn view_description(view: &View) -> Option<&'static str> {
         }
         View::Issues => Some("Queue up and manage work for Shelbi"),
         View::Changelog => Some("See what has shipped"),
-        View::Wiki => Some("Read and write the project's docs"),
+        View::Docs => Some("Read and write the project's docs"),
         View::Activity => Some("See what's happened recently"),
         View::Machines => Some("See the machines running your agents"),
         View::Jobs => Some("See the jobs Shelbi is watching"),
@@ -482,7 +482,7 @@ fn view_hidden_until_query(view: &View) -> bool {
         View::Reminders => true,
         View::Issues
         | View::Changelog
-        | View::Wiki
+        | View::Docs
         | View::Activity
         | View::Machines
         | View::Jobs
@@ -978,8 +978,8 @@ impl CommandKind {
                 id: entry.to_string(),
             });
         }
-        if let Some(path) = id.strip_prefix("action:open-wiki-doc:") {
-            return Some(CommandKind::OpenWikiDoc { path: path.to_string() });
+        if let Some(path) = id.strip_prefix("action:open-docs-doc:") {
+            return Some(CommandKind::OpenDoc { path: path.to_string() });
         }
         if let Some(task) = id.strip_prefix("action:approve-review:") {
             return Some(CommandKind::ApproveReview {

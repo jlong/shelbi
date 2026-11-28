@@ -533,7 +533,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         | CommandKind::PrioritizeIssue { .. }
         | CommandKind::SetIssueWorkflow { .. }
         | CommandKind::DeleteIssue { .. } => Placement::Board,
-        CommandKind::OpenIssue { .. } | CommandKind::OpenChangelogEntry { .. } | CommandKind::OpenWikiDoc { .. } => {
+        CommandKind::OpenIssue { .. } | CommandKind::OpenChangelogEntry { .. } | CommandKind::OpenDoc { .. } => {
             Placement::Search
         }
     }
@@ -763,7 +763,7 @@ fn go_menu<'a, I: Iterator<Item = &'a Command>>(
     model: &CommandModel,
     by_place: &impl Fn(Placement) -> I,
 ) -> MenuSpec {
-    // The nav views, with the sidebar's chords (⌘O ⌘I ⌘L; the window takes
+    // The nav views, with the sidebar's chords (⌘O ⌘I ⌘L ⌘D; the window takes
     // them itself, the menu labels them).
     let mut items: Vec<MenuEntry> = by_place(Placement::GoView)
         .map(|c| match c.kind() {
@@ -1320,6 +1320,24 @@ mod tests {
         assert_eq!(rendered("ctrl-shift-up"), ("ctrl-shift-up".into(), "⌃⇧↑".into()));
         assert_eq!(rendered("alt-page-down"), ("alt-pagedown".into(), "⌥⇟".into()));
         assert_eq!(rendered("ctrl-esc"), ("ctrl-escape".into(), "⌃Esc".into()));
+    }
+
+    #[test]
+    fn go_documentation_carries_its_chord() {
+        let mut model = fixture();
+        model.views.push(ViewItem {
+            id: "view:docs".into(),
+            title: "Documentation".into(),
+            view: View::Docs,
+            decoration: None,
+        });
+        let tree = build(&model, &defaults(), WindowFacts::default());
+        let shortcut = find(&tree, "Documentation").shortcut.clone().unwrap();
+        let want = if MAC { ("cmd-d", "⌘D") } else { ("ctrl-shift-d", "⌃⇧D") };
+        assert_eq!(shortcut.keystroke, want.0);
+        if MAC {
+            assert_eq!(shortcut.display, want.1);
+        }
     }
 
     // The macOS spellings; Linux's are `linux_*` below.

@@ -1174,9 +1174,9 @@ fn apply_edit_on_github_refuses_a_save_over_a_body_it_hasnt_seen() {
 }
 
 /// A body that opens with (and holds) `---` rules, the shape that looks like a
-/// frontmatter fence: the one the 2026-11-27 `wiki` save carried.
+/// frontmatter fence: the one the 2026-11-27 `docs` save carried.
 const RULED_BODY: &str =
-    "---\n\n**Hold in review for John to check before merging**\n\n---\n\nUmbrella for the Wiki.\n\n---\n\n## Subtasks\n";
+    "---\n\n**Hold in review for John to check before merging**\n\n---\n\nUmbrella for the Documentation.\n\n---\n\n## Subtasks\n";
 
 fn edit_body(project: &str, body: &str, expect_body: Option<&str>) -> Result<ChangeNote, MutateError> {
     let mut sink = RecordingSink::default();
@@ -1205,9 +1205,9 @@ fn apply_edit_keeps_a_body_of_rules_byte_for_byte_on_the_filesystem() {
 
     let mut t = task(Column::backlog(), "t");
     t.branch = Some("feat/x".into());
-    shelbi_state::save_task("p", &t, "Umbrella for the Wiki.\n").unwrap();
+    shelbi_state::save_task("p", &t, "Umbrella for the Documentation.\n").unwrap();
 
-    edit_body("p", RULED_BODY, Some("Umbrella for the Wiki.\n")).unwrap();
+    edit_body("p", RULED_BODY, Some("Umbrella for the Documentation.\n")).unwrap();
     let after = shelbi_state::load_task("p", "t").unwrap();
     assert_eq!(after.body, RULED_BODY);
     assert_eq!(after.task.branch.as_deref(), Some("feat/x"), "the frontmatter is the file's own");
@@ -1270,9 +1270,9 @@ fn apply_edit_keeps_a_body_of_rules_byte_for_byte_on_github() {
     let home = fresh_home();
     std::env::set_var("SHELBI_HOME", &home);
     write_github_project_yaml("gh");
-    let stored = github_body_fake("Umbrella for the Wiki.", true);
+    let stored = github_body_fake("Umbrella for the Documentation.", true);
 
-    edit_body("gh", RULED_BODY, Some("Umbrella for the Wiki.")).unwrap();
+    edit_body("gh", RULED_BODY, Some("Umbrella for the Documentation.")).unwrap();
     assert_eq!(*stored.lock().unwrap(), RULED_BODY, "GitHub got the body as typed");
     let store = shelbi_state::issue_store_for("gh").unwrap();
     // A GitHub body is stored without its final newline.
@@ -1285,7 +1285,7 @@ fn apply_edit_keeps_a_body_of_rules_byte_for_byte_on_github() {
 }
 
 /// A tracker that answers a write and keeps the body it had (the 2026-11-27
-/// `wiki` save: `edited` on `events.log`, GitHub unchanged): the edit is refused
+/// `docs` save: `edited` on `events.log`, GitHub unchanged): the edit is refused
 /// with the reason, and nothing is reported as edited.
 #[test]
 fn apply_edit_refuses_a_body_the_tracker_did_not_keep() {
@@ -1293,15 +1293,15 @@ fn apply_edit_refuses_a_body_the_tracker_did_not_keep() {
     let home = fresh_home();
     std::env::set_var("SHELBI_HOME", &home);
     write_github_project_yaml("gh");
-    let stored = github_body_fake("Umbrella for the Wiki.", false);
+    let stored = github_body_fake("Umbrella for the Documentation.", false);
 
-    let err = edit_body("gh", RULED_BODY, Some("Umbrella for the Wiki.")).unwrap_err();
+    let err = edit_body("gh", RULED_BODY, Some("Umbrella for the Documentation.")).unwrap_err();
     assert!(matches!(err, MutateError::Backend(_)), "{err:?}");
     assert_eq!(
         err.to_string(),
         "the issue tracker didn't keep the description as sent: it still has the old one"
     );
-    assert_eq!(*stored.lock().unwrap(), "Umbrella for the Wiki.");
+    assert_eq!(*stored.lock().unwrap(), "Umbrella for the Documentation.");
     assert!(!events_log().contains("task=t edited"), "{}", events_log());
 
     shelbi_state::clear_test_gh_runner();

@@ -5160,7 +5160,7 @@ fn compose_and_mount_agent_context(
     if agent == shelbi_state::ORCHESTRATOR_AGENT {
         deploy_orchestrator_system_skill(host, worktree, &skills_src)?;
     }
-    deploy_wiki_skill(host, worktree, &skills_src)?;
+    deploy_docs_skill(host, worktree, &skills_src)?;
 
     // Best-effort: nudge the user toward the new agents/ layout the
     // first time a dispatch lands while a legacy CLAUDE.md is still on
@@ -5261,26 +5261,42 @@ fn deploy_orchestrator_system_skill(
     Ok(())
 }
 
-/// Mount Shelbi's `shelbi-wiki` skill for every agent, after the agent's own
+/// Mount Shelbi's `shelbi-docs` skill for every agent, after the agent's own
 /// skills (so the reserved name wins over a project skill of the same name):
-/// `.claude/skills/shelbi-wiki/` for Claude Code and `.agents/skills/
-/// shelbi-wiki/` for Codex. OpenCode workers get theirs in
+/// `.claude/skills/shelbi-docs/` for Claude Code and `.agents/skills/
+/// shelbi-docs/` for Codex. OpenCode workers get theirs in
 /// `.shelbi/opencode/skills/` instead ([`opencode`]).
-fn deploy_wiki_skill(host: &Host, worktree: &Path, role_skills: &Path) -> Result<()> {
-    let plugin = crate::wiki_plugin::resolve_wiki_plugin();
+fn deploy_docs_skill(host: &Host, worktree: &Path, role_skills: &Path) -> Result<()> {
+    let plugin = crate::docs_plugin::resolve_docs_plugin();
     for warning in &plugin.warnings {
         eprintln!("shelbi: warning: {warning}");
         tracing::warn!("{warning}");
     }
-    let reserved = crate::wiki_plugin::WIKI_PLUGIN_NAME;
-    warn_reserved_role_skill(role_skills, reserved, "Shelbi's wiki skill");
+    let reserved = crate::docs_plugin::DOCS_PLUGIN_NAME;
+    warn_reserved_role_skill(role_skills, reserved, "Shelbi's docs skill");
+    clear_legacy_docs_skill(host, worktree)?;
     mount_reserved_skill_copies(
         host,
         worktree,
         reserved,
         plugin.skill(),
-        "Shelbi's wiki skill is not mounted for Claude Code or Codex",
+        "Shelbi's docs skill is not mounted for Claude Code or Codex",
     )
+}
+
+/// Remove the copies of the docs skill an earlier Shelbi mounted under its
+/// pre-rename name ([`crate::docs_plugin::LEGACY_DOCS_PLUGIN_NAME`]), so an
+/// agent has `shelbi-docs` only, never both. A git-tracked one is the
+/// user's and stays.
+pub(crate) fn clear_legacy_docs_skill(host: &Host, worktree: &Path) -> Result<()> {
+    let legacy = crate::docs_plugin::LEGACY_DOCS_PLUGIN_NAME;
+    for rel in [format!(".claude/skills/{legacy}"), format!(".agents/skills/{legacy}")] {
+        let path = worktree.join(&rel);
+        if worktree_entry_exists(host, &path) && !git_tracks_path(host, worktree, &rel) {
+            remove_worktree_entry(host, &path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Warn when the agent's own `skills/` carries an entry under a name Shelbi
@@ -8335,7 +8351,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
         }
     }
 
@@ -12098,23 +12114,23 @@ statuses:
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Every agent gets Shelbi's `shelbi-wiki` skill, as a real file for Claude
+    /// Every agent gets Shelbi's `shelbi-docs` skill, as a real file for Claude
     /// Code (`.claude/skills/`) and Codex (`.agents/skills/`), owned by Shelbi
     /// so the next dispatch re-mounts it, and kept out of `git status`. A
     /// project skill of the reserved name is replaced, never written through.
     #[test]
-    fn every_agent_gets_the_wiki_skill_and_it_wins_the_reserved_name() {
+    fn every_agent_gets_the_docs_skill_and_it_wins_the_reserved_name() {
         let _g = crate::test_lock::acquire();
-        let tmp = agent_test_tmpdir("ctx-wiki-skill");
+        let tmp = agent_test_tmpdir("ctx-docs-skill");
         let home = tmp.join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
         install_default_agents_under_home(&home, "p");
         // The developer's own skills carry one under the reserved name.
         let skills_src = shelbi_state::agent_skills_dir("p", "developer").unwrap();
-        let impostor = skills_src.join("shelbi-wiki");
+        let impostor = skills_src.join("shelbi-docs");
         std::fs::create_dir_all(&impostor).unwrap();
-        std::fs::write(impostor.join("SKILL.md"), "---\nname: shelbi-wiki\n---\nmine\n").unwrap();
+        std::fs::write(impostor.join("SKILL.md"), "---\nname: shelbi-docs\n---\nmine\n").unwrap();
 
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
@@ -12124,26 +12140,35 @@ statuses:
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
         git(&["init", "-q"]);
+        // A worktree an earlier Shelbi mounted the skill into under its old
+        // name, `shelbi-wiki`: replaced by `shelbi-docs`, not kept beside it.
+        for rel in [".claude/skills/shelbi-wiki", ".agents/skills/shelbi-wiki"] {
+            std::fs::create_dir_all(worktree.join(rel)).unwrap();
+            std::fs::write(worktree.join(rel).join("SKILL.md"), "---\nname: shelbi-wiki\n---\nold\n").unwrap();
+        }
 
-        let skill = crate::wiki_plugin::resolve_wiki_plugin().skill().to_string();
+        let skill = crate::docs_plugin::resolve_docs_plugin().skill().to_string();
         for _ in 0..2 {
             compose_and_mount_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
-            for rel in [".claude/skills/shelbi-wiki", ".agents/skills/shelbi-wiki"] {
+            for rel in [".claude/skills/shelbi-docs", ".agents/skills/shelbi-docs"] {
                 let dir = worktree.join(rel);
                 assert!(!dir.symlink_metadata().unwrap().file_type().is_symlink(), "{rel} is Shelbi's copy");
                 assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), skill, "{rel}");
             }
-            assert!(read_owned_skills(&Host::Local, &worktree).unwrap().iter().any(|n| n == "shelbi-wiki"));
+            assert!(read_owned_skills(&Host::Local, &worktree).unwrap().iter().any(|n| n == "shelbi-docs"));
+            for rel in [".claude/skills/shelbi-wiki", ".agents/skills/shelbi-wiki"] {
+                assert!(!worktree.join(rel).exists(), "{rel} is gone");
+            }
         }
         // The agent's own source was never written through.
         assert_eq!(
             std::fs::read_to_string(impostor.join("SKILL.md")).unwrap(),
-            "---\nname: shelbi-wiki\n---\nmine\n"
+            "---\nname: shelbi-docs\n---\nmine\n"
         );
         // Other skills still mount beside it, and none of it shows in git.
         assert!(worktree.join(".claude/skills/debug.md").exists());
         let status = git(&["status", "--porcelain", "--untracked-files=all"]);
-        assert!(!status.contains("shelbi-wiki"), "{status}");
+        assert!(!status.contains("shelbi-docs"), "{status}");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -14240,7 +14265,7 @@ mod sync_worktree_git_tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
         }
     }
 
@@ -15512,7 +15537,7 @@ mod sync_worktree_freshcut_tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
         }
     }
 
@@ -15981,7 +16006,7 @@ mod sync_worktree_freshcut_tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
-            wiki: None,
+            docs: None,
         }
     }
 

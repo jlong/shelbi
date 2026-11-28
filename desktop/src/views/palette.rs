@@ -412,9 +412,9 @@ fn render_result<H: OverlayHost>(
             theme,
             cx,
         ),
-        ResultRow::Item(ResultItem::Wiki(hit)) => detail_row(
+        ResultRow::Item(ResultItem::Docs(hit)) => detail_row(
             index,
-            format!("palette-wiki-{}", hit.path),
+            format!("palette-docs-{}", hit.path),
             heroicon(icons::DOCUMENT_TEXT).text_color(theme.icon).into_any_element(),
             &hit.title,
             hit.detail.clone(),
@@ -499,7 +499,7 @@ fn name(label: &str, selected: bool, theme: &Theme) -> gpui::Div {
         .child(label.to_string())
 }
 
-/// An issue's, a wiki document's or a Changelog entry's row: its glyph (the
+/// An issue's, a document's or a Changelog entry's row: its glyph (the
 /// issue's status, a document, the Changelog's rocket), the title, then the
 /// detail (`in progress · #1931`, `Plans`, `Oct 28 · #1902`) at the right.
 #[allow(clippy::too_many_arguments)]

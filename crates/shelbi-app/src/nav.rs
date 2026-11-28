@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 /// What the main area is showing.
 ///
-/// `Issues`, `Changelog`, `Wiki`, `Activity`, `Machines`, `Jobs`, and `Reminders`
+/// `Issues`, `Changelog`, `Docs`, `Activity`, `Machines`, `Jobs`, and `Reminders`
 /// are native (in-process) views.
 /// [`View::Session`] is a terminal view bound to a session by name — the
 /// orchestrator chat, a workspace agent, or a review editor/diff session.
@@ -28,9 +28,9 @@ pub enum View {
     Issues,
     /// The project's changelog: what has shipped ([`crate::changelog`]).
     Changelog,
-    /// The project's wiki ([`crate::wiki`]): its tree takes the sidebar's
-    /// column ([`crate::wiki_tree`]) and the open document the main area.
-    Wiki,
+    /// The project's docs ([`crate::docs`]): its tree takes the sidebar's
+    /// column ([`crate::docs_tree`]) and the open document the main area.
+    Docs,
     Activity,
     Machines,
     /// The project's active awareness jobs ([`crate::jobs`]). Palette-only,
@@ -44,6 +44,11 @@ pub enum View {
     Session(String),
 }
 
+/// The Documentation view's id before it was called that (`view:wiki`), in
+/// saved view state, `keys.yaml` and older clients' messages. Read as
+/// [`View::Docs`]; never written.
+pub const LEGACY_DOCS_VIEW: &str = "wiki";
+
 impl View {
     /// The default view a client lands on for a project with no remembered
     /// view. The issues board is the most useful cold-start surface.
@@ -52,14 +57,14 @@ impl View {
     }
 
     /// Parse a sidebar-nav view name (the suffix of a `view:<name>` palette
-    /// id) into a [`View`]. The historical builtin names map to the native
+    /// id) into a [`View`]. [`LEGACY_DOCS_VIEW`] is read as `docs`. The historical builtin names map to the native
     /// views; anything else is a session view bound to that name (the
     /// orchestrator "chat" is `orch`).
     pub fn from_view_id(name: &str) -> View {
         match name {
             "tasks" => View::Issues,
             "changelog" => View::Changelog,
-            "wiki" => View::Wiki,
+            "docs" | LEGACY_DOCS_VIEW => View::Docs,
             "activity" => View::Activity,
             "machines" => View::Machines,
             "jobs" => View::Jobs,
@@ -75,7 +80,7 @@ impl View {
         match self {
             View::Issues => "tasks".to_string(),
             View::Changelog => "changelog".to_string(),
-            View::Wiki => "wiki".to_string(),
+            View::Docs => "docs".to_string(),
             View::Activity => "activity".to_string(),
             View::Machines => "machines".to_string(),
             View::Jobs => "jobs".to_string(),
@@ -463,7 +468,7 @@ mod tests {
         for v in [
             View::Issues,
             View::Changelog,
-            View::Wiki,
+            View::Docs,
             View::Activity,
             View::Machines,
             View::Jobs,
@@ -479,6 +484,9 @@ mod tests {
         assert_eq!(View::from_view_id("changelog"), View::Changelog);
         assert_eq!(View::from_view_id("jobs"), View::Jobs);
         assert_eq!(View::from_view_id("reminders"), View::Reminders);
+        assert_eq!(View::from_view_id("docs"), View::Docs);
+        // The id before the rename still opens it.
+        assert_eq!(View::from_view_id("wiki"), View::Docs);
         assert_eq!(View::from_view_id("orch"), View::Session("orch".into()));
     }
 

@@ -23,7 +23,7 @@ shelbi-session = { workspace = true }
 # desktop app both read their sidebar through it). shelbi-app is UI-toolkit
 # free and does not depend on this crate, so there is no cycle.
 shelbi-app = { workspace = true }
-shelbi-wiki = { workspace = true }
+shelbi-docs = { workspace = true }
 serde = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }

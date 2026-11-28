@@ -158,4 +158,4 @@ jobs:
           test -f /usr/share/shelbi/plugins/shelbi-awareness/.claude-plugin/plugin.json
           test -f /usr/share/shelbi/plugins/shelbi-awareness/hooks/hooks.json
           test -f /usr/share/shelbi/plugins/shelbi-awareness/monitors/monitors.json
-          test -f /usr/share/shelbi/plugins/shelbi-wiki/skills/shelbi-wiki/SKILL.md
+          test -f /usr/share/shelbi/plugins/shelbi-docs/skills/shelbi-docs/SKILL.md

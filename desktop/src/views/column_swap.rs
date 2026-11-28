@@ -4,8 +4,8 @@
 //! The column shows the navigation sidebar, or, while a review or a workspace
 //! is open, that one's panel in its place, as the TUI's review and workspace
 //! panels replace its sidebar; while Settings is open, the settings sidebar
-//! stands there the same way (`dt-settings-sections`), and while the Wiki
-//! shows, its tree (`wiki-desktop-tree`). Going in and coming back out are a push
+//! stands there the same way (`dt-settings-sections`), and while the Documentation
+//! shows, its tree (`docs-desktop-tree`). Going in and coming back out are a push
 //! between two levels of a navigation stack: the sidebar slides out to the
 //! left and fades while the panel slides in from the right and fades in, and
 //! the reverse on the way back. With Reduce Motion on, the two crossfade in
@@ -35,7 +35,7 @@ pub enum Occupant {
     Review,
     Workspace,
     Settings,
-    Wiki,
+    Docs,
 }
 
 impl Occupant {
@@ -44,7 +44,7 @@ impl Occupant {
     fn position(self) -> f32 {
         match self {
             Occupant::Sidebar => 0.0,
-            Occupant::Review | Occupant::Workspace | Occupant::Settings | Occupant::Wiki => 1.0,
+            Occupant::Review | Occupant::Workspace | Occupant::Settings | Occupant::Docs => 1.0,
         }
     }
 }
@@ -107,7 +107,7 @@ pub struct Frame {
     pub review: Option<Layer>,
     pub workspace: Option<Layer>,
     pub settings: Option<Layer>,
-    pub wiki: Option<Layer>,
+    pub docs: Option<Layer>,
     /// A swap is still running: request another frame.
     pub animating: bool,
 }
@@ -119,7 +119,7 @@ impl Frame {
             review: layer.filter(|_| panel == Occupant::Review),
             workspace: layer.filter(|_| panel == Occupant::Workspace),
             settings: layer.filter(|_| panel == Occupant::Settings),
-            wiki: layer.filter(|_| panel == Occupant::Wiki),
+            docs: layer.filter(|_| panel == Occupant::Docs),
             animating,
         }
     }
@@ -330,7 +330,7 @@ pub struct Column {
     pub review: Option<Layer>,
     pub workspace: Option<Layer>,
     pub settings: Option<Layer>,
-    pub wiki: Option<Layer>,
+    pub docs: Option<Layer>,
 }
 
 /// The leading column for `frame`, or `None` when there is none (the sidebar
@@ -343,9 +343,9 @@ pub fn column(frame: &Frame, collapsed: bool, user_cols: u16, dragged_cols: Opti
     let sidebar = frame.sidebar.filter(|_| !collapsed);
     // The settings sidebar is a sidebar: it collapses with the app's.
     let settings = frame.settings.filter(|_| !collapsed);
-    // So is the Wiki's tree.
-    let wiki = frame.wiki.filter(|_| !collapsed);
-    if sidebar.is_none() && frame.review.is_none() && frame.workspace.is_none() && settings.is_none() && wiki.is_none() {
+    // So is the Documentation's tree.
+    let docs = frame.docs.filter(|_| !collapsed);
+    if sidebar.is_none() && frame.review.is_none() && frame.workspace.is_none() && settings.is_none() && docs.is_none() {
         return None;
     }
     let width_cols = if collapsed {
@@ -359,7 +359,7 @@ pub fn column(frame: &Frame, collapsed: bool, user_cols: u16, dragged_cols: Opti
         review: frame.review,
         workspace: frame.workspace,
         settings,
-        wiki,
+        docs,
     })
 }
 
