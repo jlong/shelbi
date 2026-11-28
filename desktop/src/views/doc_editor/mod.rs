@@ -538,7 +538,8 @@ impl DocEditor {
         let src = p.layout.hit(self.model.doc(), rel);
         if crate::keys::link_mod(&e.modifiers) {
             if let Some(url) = self.model.link_at(src) {
-                cx.open_url(&url);
+                // A `wiki:` link opens the document in the Wiki.
+                crate::links::open(&url, window, cx);
                 return;
             }
         }
@@ -1082,5 +1083,24 @@ impl EntityInputHandler for DocEditor {
         let p = self.painted.as_ref()?;
         let src = p.layout.hit(self.model.doc(), point - p.bounds.origin);
         Some(self.model.to_utf16(src))
+    }
+}
+
+#[cfg(test)]
+mod mods_tests {
+    use super::editing_mods_in;
+
+    fn mods(control: bool, platform: bool) -> gpui::Modifiers {
+        gpui::Modifiers { control, platform, ..Default::default() }
+    }
+
+    #[test]
+    fn save_is_cmd_s_on_macos_and_ctrl_s_on_linux() {
+        // (cmd, alt, ctrl, shift): `cmd` is what the `"s" if cmd` Save arm reads.
+        assert!(editing_mods_in("s", &mods(false, true), true).0);
+        assert!(!editing_mods_in("s", &mods(true, false), true).0);
+        assert!(editing_mods_in("s", &mods(true, false), false).0);
+        // Ctrl still moves by word on Linux rather than commanding.
+        assert_eq!(editing_mods_in("left", &mods(true, false), false), (false, true, false, false));
     }
 }

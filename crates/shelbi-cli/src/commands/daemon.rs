@@ -21,6 +21,8 @@
 //!   and the `refresh-board` hub verb.
 //! - [`poller`] — the per-project workspace-poller manager (one poller per open
 //!   project).
+//! - [`wiki`] — the per-project wiki manager (one wiki service per open
+//!   project with a wiki: the wiki's single writer and sync clock).
 //! - [`lifecycle`] — `stop`, `restart`, and `status` without a supervisor, plus the
 //!   `retire_supervisor_units` upgrade step [`serve`] calls on startup.
 
@@ -30,6 +32,7 @@ mod lifecycle;
 mod poller;
 mod serve;
 mod session_health;
+mod wiki;
 
 use anyhow::Result;
 

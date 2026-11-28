@@ -21,6 +21,7 @@ shelbi-orchestrator = { workspace = true }
 shelbi-tui = { workspace = true }
 shelbi-palette = { workspace = true }
 shelbi-app = { workspace = true }
+shelbi-wiki = { workspace = true }
 shelbi-proto = { workspace = true }
 shelbi-client = { workspace = true }
 shelbi-session = { workspace = true }

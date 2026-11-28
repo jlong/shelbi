@@ -94,7 +94,7 @@ pub struct SidebarModel {
     pub orchestrator_status: Option<String>,
 }
 
-/// A fixed nav builtin (Chat / Issues / Changelog).
+/// A fixed nav builtin (Chat / Issues / Wiki / Changelog).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NavItem {
@@ -462,6 +462,10 @@ pub fn default_nav_items() -> Vec<NavItem> {
         NavItem {
             label: "Issues".into(),
             view: View::Issues,
+        },
+        NavItem {
+            label: "Wiki".into(),
+            view: View::Wiki,
         },
         NavItem {
             label: "Changelog".into(),
@@ -1869,10 +1873,11 @@ mod tests {
         assert_eq!(model.zen_mode, ZenModeState::On);
         assert_eq!(model.unread_errors, 4);
         // Activity and Machines live in the command palette; the nav is
-        // Chat / Issues / Changelog.
-        assert_eq!(model.nav.len(), 3);
+        // Chat / Issues / Wiki / Changelog.
+        assert_eq!(model.nav.len(), 4);
         assert_eq!(model.nav[1].view, View::Issues);
-        assert_eq!(model.nav[2].view, View::Changelog);
+        assert_eq!(model.nav[2].view, View::Wiki);
+        assert_eq!(model.nav[3].view, View::Changelog);
         for palette_only in [View::Machines, View::Activity, View::Jobs, View::Reminders] {
             assert!(
                 !model.nav.iter().any(|n| n.view == palette_only),
@@ -1948,6 +1953,7 @@ mod tests {
             [
                 "nav:Orchestrator",
                 "nav:Issues",
+                "nav:Wiki",
                 "nav:Changelog",
                 "blank",
                 "section:Workspaces",
@@ -1964,9 +1970,10 @@ mod tests {
         );
         let targets: Vec<SidebarTarget> = rows.iter().filter_map(SidebarRow::target).collect();
         assert_eq!(targets[0], SidebarTarget::View(View::Session("orch".into())));
-        assert_eq!(targets[3], SidebarTarget::Workspace("alpha".into()));
-        assert_eq!(targets[5], SidebarTarget::Review("T-3".into()));
-        assert_eq!(targets.len(), 7, "headers and blanks are not selectable");
+        assert_eq!(targets[2], SidebarTarget::View(View::Wiki));
+        assert_eq!(targets[4], SidebarTarget::Workspace("alpha".into()));
+        assert_eq!(targets[6], SidebarTarget::Review("T-3".into()));
+        assert_eq!(targets.len(), 8, "headers and blanks are not selectable");
     }
 
     #[test]
@@ -2017,14 +2024,14 @@ mod tests {
         let skeleton = SidebarModel::skeleton("demo");
         assert_eq!(skeleton.project_label, "demo");
         let rows = skeleton.rows();
-        assert_eq!(rows.len(), 5);
-        assert_eq!(rows[4], SidebarRow::Loading);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[5], SidebarRow::Loading);
 
         let mut broken = SidebarModel::skeleton("demo");
         broken.board_loading = false;
         broken.config_error = Some("demo.yaml: bad".into());
         assert_eq!(
-            broken.rows()[3..],
+            broken.rows()[4..],
             [
                 SidebarRow::Blank,
                 SidebarRow::Section("Workspaces".into()),

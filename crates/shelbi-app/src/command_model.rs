@@ -20,11 +20,12 @@ use crate::overlay::palette::{project_indicator, ProjectEntry};
 use crate::view::SidebarModel;
 
 /// The nav glyph for a nav label: the twemoji the sidebar and the palette
-/// show (💬 / 📋 / 🚀 / ⚡ / 🖥), or `•` for a label with none.
+/// show (💬 / 📋 / 📖 / 🚀 / ⚡ / 🖥), or `•` for a label with none.
 pub fn nav_glyph(label: &str) -> &'static str {
     match label {
         "Orchestrator" => "💬",
         "Issues" => "📋",
+        "Wiki" => "📖",
         "Changelog" => "🚀",
         "Activity" => "⚡",
         "Machines" => "🖥",
@@ -560,6 +561,7 @@ mod tests {
     #[test]
     fn nav_glyphs_match_the_sidebar() {
         assert_eq!(nav_glyph("Issues"), "📋");
+        assert_eq!(nav_glyph("Wiki"), "📖");
         assert_eq!(nav_glyph("Changelog"), "🚀");
         assert_eq!(nav_glyph("Machines"), "🖥");
         assert_eq!(nav_glyph("Other"), "•");

@@ -116,6 +116,9 @@ pub enum Request {
     /// Move the project's local issues into this connection before it's
     /// switched to (the move card's Import), where the project lives.
     MoveIssues(crate::tracker_connect::TrackerChoice),
+    /// A read or write of the project's wiki, which the hub where the
+    /// project lives is the single writer of ([`crate::wiki`]).
+    Wiki(crate::wiki::WikiRequest),
 }
 
 /// The far daemon's answer to a [`Request`].
@@ -137,6 +140,7 @@ pub enum Reply {
     ImportPreview(Result<crate::tracker_connect::ImportPreview, String>),
     LocalIssues(Result<usize, String>),
     MovedIssues(Result<crate::tracker_connect::Moved, crate::tracker_connect::MoveFailed>),
+    Wiki(crate::wiki::WikiReply),
 }
 
 /// The far paths a path Cmd+clicked in a far terminal may name: as

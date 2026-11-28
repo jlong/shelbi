@@ -33,6 +33,7 @@ pub(crate) mod session;
 mod settings;
 mod sidebar;
 mod stray_output;
+mod wiki;
 mod workspace;
 pub(crate) mod terminal_view;
 
@@ -175,12 +176,22 @@ enum SettingsMsg {
     Tracker(String, Box<settings::issues::TrackerDone>),
     /// Workflows' Sync now, for a project.
     StatusesSynced(String, shelbi_app::tracker_connect::StatusSync),
+    /// A piece of the Wiki page's work, for a project and the page's
+    /// generation.
+    Wiki(String, u64, Box<shelbi_app::settings::wiki::WikiDone>),
 }
 
 /// The tracker service for a project (Settings ▸ Issues, Workflows' Sync
 /// now): this machine's in production, a test's fake.
 pub(crate) type TrackerServiceFor =
     Arc<dyn Fn(&str) -> shelbi_app::settings::tracker::TrackerService + Send + Sync>;
+
+/// Where the Wiki page's work goes for a project (Settings ▸ Wiki): its
+/// config store and its hub wiki service. This machine's in production, a
+/// test's fake.
+pub(crate) type WikiPortsFor = Arc<
+    dyn Fn(&str) -> (shelbi_app::settings::store::Store, shelbi_app::settings::wiki::Ask) + Send + Sync,
+>;
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
 type SettingsReader = Arc<dyn Fn(Option<&str>) -> GeneralSummary + Send + Sync>;
@@ -676,6 +687,17 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.kanban.poll_load_more() {
             state.dirty = true;
             corpus_landed = true;
+        }
+        if state.poll_wiki() {
+            state.dirty = true;
+        }
+        // A Wiki `e`: hand the terminal to $EDITOR on the document's copy, and
+        // save it through the hub when the editor exits.
+        if let Some(edit) = state.wiki.as_mut().and_then(|w| w.take_edit()) {
+            state.toast.dismiss();
+            let outcome = run_wiki_editor(&mut term, &edit.file);
+            state.reported_main = None;
+            state.wiki_edit_returned(edit, outcome);
         }
         if state.poll_changelog() {
             state.dirty = true;
@@ -1613,6 +1635,8 @@ struct ShellState {
     workflows_reader: WorkflowsReader,
     /// The Issues page's and Sync now's service.
     tracker_service: TrackerServiceFor,
+    /// The Wiki page's store and hub.
+    wiki_ports: WikiPortsFor,
     /// Detects General's installed tools (disk in production; a fixture in
     /// tests).
     tools_reader: ToolsReader,
@@ -1667,6 +1691,9 @@ struct ShellState {
     /// after handling input: it hands the terminal to the editor and waits, then
     /// restores the shell (the TUI's half of the palette's `edit:*` commands).
     pending_editor: Option<PathBuf>,
+    /// The Wiki of the current project (the sidebar's Wiki row), built the
+    /// first time it shows; a project switch drops it.
+    wiki: Option<wiki::WikiPage>,
     /// The line to open [`Self::pending_editor`] at (the diff's `Ctrl-g`).
     pending_editor_line: Option<u32>,
     /// A remote session to open. The run loop takes it like
@@ -1823,6 +1850,15 @@ impl ShellState {
             move_issues: Arc::new(shelbi_app::tracker_connect::fixture::moved),
         });
         #[cfg(not(test))]
+        let wiki_ports: WikiPortsFor = Arc::new(|project: &str| {
+            let name = project.to_string();
+            let ask: shelbi_app::settings::wiki::Ask =
+                Arc::new(move |req| shelbi_app::wiki::ask_local(&name, req));
+            (shelbi_app::settings::store::Local::store(project), ask)
+        });
+        #[cfg(test)]
+        let wiki_ports: WikiPortsFor = Arc::new(|_: &str| tests::refusing_wiki_ports());
+        #[cfg(not(test))]
         let orchestrator_restarter: OrchestratorRestarter =
             Arc::new(|project| shelbi_app::settings::orchestrator::restart(project, None));
         #[cfg(test)]
@@ -1956,6 +1992,7 @@ impl ShellState {
             orchestrator_restarter,
             workflows_reader,
             tracker_service,
+            wiki_ports,
             tools_reader,
             panel_tools,
             keys_store,
@@ -1975,6 +2012,7 @@ impl ShellState {
             full_redraw: false,
             job: None,
             pending_editor: None,
+            wiki: None,
             pending_editor_line: None,
             pending_remote: None,
             palette_inputs: Arc::new(DiskPaletteInputs),
@@ -2223,7 +2261,8 @@ impl ShellState {
         let hidden = self.overlay.is_some()
             || self.settings_open()
             || self.acknowledgements_open()
-            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_));
+            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_))
+            || self.wiki_tree_shown();
         (!hidden && contains(self.sidebar_rect, x, y)).then_some((x, y))
     }
 
@@ -2365,10 +2404,15 @@ impl ShellState {
                 self.review = None;
                 self.workspace = None;
                 self.client.set_view(v.clone());
+                let wiki = v == View::Wiki;
                 self.main_view = MainView::Native(v);
                 // Focus moved to the main area up front, in `show` — so the
                 // keyboard drives the board / feed / machines list immediately,
-                // the same as opening a session.
+                // the same as opening a session. The Wiki's keys start in its
+                // tree, which takes the sidebar's column.
+                if wiki {
+                    self.open_wiki();
+                }
             }
             RowTarget::Review(id) => {
                 // Review has no `View` variant (it is a transient interface, not a
@@ -2474,18 +2518,118 @@ impl ShellState {
     /// arrived and the names of the workspaces whose change carried one (so the
     /// shown-workspace idle attach can be retried). No-op before the workers are
     /// started.
-    fn drain_change_wakes(&self) -> (bool, Vec<String>) {
+    fn drain_change_wakes(&mut self) -> (bool, Vec<String>) {
+        use shelbi_app::changes::ChangeWake;
         let mut changed = false;
         let mut woke = Vec::new();
+        let mut wiki = Vec::new();
         if let Some(w) = self.workers.as_ref() {
             while let Ok(wake) = w.change_rx.try_recv() {
-                changed = true;
-                if let shelbi_app::changes::ChangeWake::Workspace(ws) = wake {
-                    woke.push(ws);
+                // A wiki change refreshes the Wiki, not the board.
+                changed |= !wake.is_wiki();
+                match wake {
+                    ChangeWake::Workspace(ws) => woke.push(ws),
+                    wake if wake.is_wiki() => wiki.push(wake),
+                    _ => {}
                 }
             }
         }
+        for wake in wiki {
+            self.wiki_woke(wake);
+        }
         (changed, woke)
+    }
+
+    // --- Wiki (wiki-tui) ----------------------------------------------------
+
+    /// Whether the Wiki's tree stands in the sidebar's column.
+    fn wiki_tree_shown(&self) -> bool {
+        matches!(self.main_view, MainView::Native(View::Wiki))
+            && self.wiki.as_ref().is_some_and(|w| w.tree_open)
+    }
+
+    /// The current project's Wiki, built (over the project's hub) if it
+    /// isn't yet.
+    fn ensure_wiki(&mut self) -> Option<&mut wiki::WikiPage> {
+        let project = self.client.project()?.to_string();
+        if self.wiki.as_ref().is_none_or(|w| w.project() != project) {
+            let (_, ask) = (self.wiki_ports)(&project);
+            self.wiki = Some(wiki::WikiPage::new(project, ask));
+        }
+        self.wiki.as_mut()
+    }
+
+    /// The Wiki row opened: its tree takes the sidebar's column, with the
+    /// keys.
+    fn open_wiki(&mut self) {
+        if let Some(page) = self.ensure_wiki() {
+            page.open();
+        }
+        self.client.focus_sidebar();
+        self.dirty = true;
+    }
+
+    /// Carry out what a Wiki key or click asked for.
+    fn apply_wiki_step(&mut self, step: wiki::WikiStep) {
+        match step {
+            wiki::WikiStep::Stay => {}
+            wiki::WikiStep::Back => {
+                // The nav comes back, on the Wiki row; the document stays.
+                if let Some(page) = self.wiki.as_mut() {
+                    page.tree_open = false;
+                }
+                self.client.focus_sidebar();
+                if let Some(view) = self.sidebar_view() {
+                    let count = view.selectable_count();
+                    let at = (0..count).find(|&i| view.target_at(i) == Some(RowTarget::Native(View::Wiki)));
+                    if let Some(i) = at {
+                        self.client.select(i, count);
+                    }
+                }
+            }
+            wiki::WikiStep::FocusDoc => self.client.focus_main(),
+            wiki::WikiStep::FocusTree => {
+                if let Some(page) = self.wiki.as_mut() {
+                    page.tree_open = true;
+                }
+                self.client.focus_sidebar();
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// A `wiki` or `wiki-status` change from the hub.
+    fn wiki_woke(&mut self, wake: shelbi_app::changes::ChangeWake) {
+        let Some(page) = self.wiki.as_mut() else {
+            return;
+        };
+        match wake {
+            shelbi_app::changes::ChangeWake::Wiki { paths } => page.changed(&paths),
+            shelbi_app::changes::ChangeWake::WikiStatus { .. } => page.status_changed(),
+            _ => {}
+        }
+    }
+
+    /// Fold in the Wiki's finished hub work, and while it shows keep the
+    /// hub pulling often. `true` when something landed.
+    fn poll_wiki(&mut self) -> bool {
+        let shown = matches!(self.main_view, MainView::Native(View::Wiki));
+        let Some(page) = self.wiki.as_mut() else {
+            return false;
+        };
+        if shown {
+            page.tick(Instant::now());
+        }
+        page.poll()
+    }
+
+    /// A Wiki edit the editor is done with.
+    fn wiki_edit_returned(&mut self, edit: wiki::WikiEdit, editor: Result<(), String>) {
+        match self.wiki.as_mut() {
+            Some(page) => page.finish_edit(edit, editor),
+            None => self.status = Some(format!("The wiki closed; your copy of {} is at {}", edit.path, edit.file.display())),
+        }
+        self.dirty = true;
     }
 
     /// The freshest snapshot from the current project's refresher, or `None`. A
@@ -2584,6 +2728,7 @@ impl ShellState {
         self.changelog = changelog::ChangelogPage::new();
         self.changelog_issue_rx = None;
         self.issue_read_from = None;
+        self.wiki = None;
         // An open review / workspace interface belongs to the project we left: it
         // renders over the sidebar column and main area regardless of
         // `main_view`, so drop it (detaching its content view) along with any
@@ -2651,7 +2796,15 @@ impl ShellState {
                 // A restored session view keeps sidebar focus — a switch lands
                 // the user on the sidebar (see `ClientState::switch_project`).
             }
-            RowTarget::Native(v) => self.main_view = MainView::Native(v),
+            RowTarget::Native(v) => {
+                let wiki = v == View::Wiki;
+                self.main_view = MainView::Native(v);
+                if wiki {
+                    if let Some(page) = self.ensure_wiki() {
+                        page.open();
+                    }
+                }
+            }
             RowTarget::Review(id) => self.main_view = MainView::Review(id),
             // `view_to_row_target` never yields a machine-toggle target (it has
             // no `View`), so this arm is only for exhaustiveness.
@@ -2981,7 +3134,12 @@ impl ShellState {
             workflows: &k.input.workflows,
             default_workflow_name: &k.input.default_workflow_name,
         };
-        SearchCorpus::new(issue_docs(&k.tasks, &k.input.project_statuses, rules), self.changelog.entries())
+        // The wiki is asked as each query is searched (the hub greps it).
+        let wiki = self
+            .client
+            .project()
+            .map(|project| shelbi_app::overlay::palette_search::WikiSearch::over((self.wiki_ports)(project).1));
+        SearchCorpus::new(issue_docs(&k.tasks, &k.input.project_statuses, rules), self.changelog.entries()).with_wiki(wiki)
     }
 
     /// Hand the open palette's search what the shell holds now (a board or
@@ -3387,7 +3545,10 @@ impl ShellState {
             self.start_editor_work();
             self.start_agent_work();
         }
-        let Some(load) = self.settings.begin_page_load(project.as_deref(), force) else {
+        let load = self.settings.begin_page_load(project.as_deref(), force);
+        // The Wiki page reads through its own work.
+        self.start_wiki_work();
+        let Some(load) = load else {
             return;
         };
         let tx = self.settings_tx.clone();
@@ -3795,6 +3956,27 @@ impl ShellState {
         }
     }
 
+    /// Start the Wiki page's waiting work (its reads, a save, Sync now, Set
+    /// up) off the UI thread, in order on one thread. Each result comes back
+    /// under the page's project and generation, so one for a project no
+    /// longer shown is dropped.
+    fn start_wiki_work(&mut self) {
+        let Some((project, generation, work)) = self.settings.take_wiki_work() else {
+            return;
+        };
+        let (store, ask) = (self.wiki_ports)(&project);
+        let tx = self.settings_tx.clone();
+        let spawned = std::thread::Builder::new().name("shelbi-shell-wiki".into()).spawn(move || {
+            for item in work {
+                let done = item.run(store.as_ref(), &ask);
+                let _ = tx.send(SettingsMsg::Wiki(project.clone(), generation, Box::new(done)));
+            }
+        });
+        if let Err(e) = spawned {
+            self.status = Some(format!("Couldn't start the wiki's work: {e}"));
+        }
+    }
+
     /// Workflows' Sync now off the UI thread.
     fn sync_statuses(&mut self, project: String) {
         let service = (self.tracker_service)(&project);
@@ -3981,6 +4163,10 @@ impl ShellState {
                     }
                     self.apply_settings_action(action);
                 }
+                SettingsMsg::Wiki(project, generation, done) => {
+                    let action = self.settings.wiki_done(&project, generation, *done);
+                    self.apply_settings_action(action);
+                }
                 SettingsMsg::StatusesSynced(project, sync) => {
                     let action = self.settings.statuses_synced(&project, sync);
                     self.request_refresh();
@@ -4126,6 +4312,7 @@ impl ShellState {
             SettingsAction::SaveOrchestrator(save) => self.save_orchestrator(*save),
             SettingsAction::RestartOrchestrator(ticket, project) => self.restart_orchestrator(ticket, project),
             SettingsAction::SaveProperties(save) => self.save_properties(*save),
+            SettingsAction::WikiWork => self.start_wiki_work(),
         }
         self.dirty = true;
     }
@@ -4657,6 +4844,15 @@ impl ShellState {
                 self.show_view_effect(View::Changelog);
                 self.changelog.reveal(&id);
             }
+            // The palette's wiki result: the Wiki, that document open (its
+            // row selected) and the keys on it.
+            Effect::OpenWikiDoc { path, .. } => {
+                self.show_view_effect(View::Wiki);
+                if let Some(page) = self.ensure_wiki() {
+                    page.reveal(&path);
+                }
+                self.client.focus_main();
+            }
             Effect::OpenEditor { target } => self.open_editor(&target),
             Effect::OpenSettings => self.open_settings(),
             // Contact Us, over everything, from the name and email given last.
@@ -4783,6 +4979,7 @@ impl ShellState {
         match v {
             View::Issues
             | View::Changelog
+            | View::Wiki
             | View::Activity
             | View::Machines
             | View::Jobs
@@ -5847,6 +6044,14 @@ impl ShellState {
     }
 
     fn handle_sidebar_key(&mut self, k: KeyEvent) {
+        // The Wiki's tree, standing in the nav's place, takes the keys.
+        if self.wiki_tree_shown() {
+            if let Some(page) = self.wiki.as_mut() {
+                let step = page.handle_tree_key(k);
+                self.apply_wiki_step(step);
+            }
+            return;
+        }
         // The sidebar keymap's open-Settings key (`,` by default).
         let open_settings = crate::keymap::chord_from_event(k)
             .and_then(|c| self.keymaps.sidebar.dispatch(c))
@@ -5933,6 +6138,14 @@ impl ShellState {
             MainView::Native(View::Changelog) => {
                 let step = self.changelog.handle_key(k);
                 self.apply_changelog_step(step);
+                self.dirty = true;
+                return;
+            }
+            MainView::Native(View::Wiki) => {
+                if let Some(page) = self.ensure_wiki() {
+                    let step = page.handle_doc_key(k);
+                    self.apply_wiki_step(step);
+                }
                 self.dirty = true;
                 return;
             }
@@ -6274,6 +6487,25 @@ impl ShellState {
             }
             return;
         }
+        if self.wiki_tree_shown() && contains(self.sidebar_rect, m.column, m.row) {
+            if let Some(page) = self.wiki.as_mut() {
+                let step = match m.kind {
+                    MouseEventKind::Down(MouseButton::Left) => page.click_tree(m.column, m.row),
+                    MouseEventKind::ScrollUp => {
+                        page.tree.move_up();
+                        wiki::WikiStep::Stay
+                    }
+                    MouseEventKind::ScrollDown => {
+                        page.tree.move_down();
+                        wiki::WikiStep::Stay
+                    }
+                    _ => return,
+                };
+                self.client.focus_sidebar();
+                self.apply_wiki_step(step);
+            }
+            return;
+        }
         if contains(self.sidebar_rect, m.column, m.row) {
             self.handle_sidebar_mouse(m);
             return;
@@ -6477,6 +6709,17 @@ impl ShellState {
             }
             MainView::Native(View::Activity) => {
                 crate::handlers::activity::handle_activity_mouse(&mut self.activity, m);
+                self.dirty = true;
+                return;
+            }
+            MainView::Native(View::Wiki) => {
+                if let Some(page) = self.wiki.as_mut() {
+                    match m.kind {
+                        MouseEventKind::ScrollUp => page.scroll_by(-3),
+                        MouseEventKind::ScrollDown => page.scroll_by(3),
+                        _ => {}
+                    }
+                }
                 self.dirty = true;
                 return;
             }
@@ -6753,6 +6996,9 @@ where
     let is_workspace = matches!(main_view, MainView::Workspace(_));
     // Either sidebar-column interface suppresses the nav sidebar and the shell's
     // bottom status band (each carries its own column + status line).
+    // The Wiki's tree stands in the nav's place the same way; the status
+    // band stays (the document doesn't carry one).
+    let is_wiki_tree = state.wiki_tree_shown();
     let is_panel = is_review || is_workspace;
     // Settings stands over all of it: its sidebar in the column, its page in
     // the main area. What's under it isn't drawn (its sessions keep running).
@@ -6775,6 +7021,7 @@ where
     let jobs = &mut state.jobs;
     let reminders = &mut state.reminders;
     let changelog = &mut state.changelog;
+    let wiki = &mut state.wiki;
     let onboarding = &mut state.onboarding;
     let sessions = &state.sessions;
 
@@ -6822,7 +7069,7 @@ where
             // interface is open: then that panel takes the sidebar's column
             // (rendered at the frame level below), so there are only two columns,
             // panel and content (`rt-review-screen-hangs-on-connecting`).
-            if !is_panel && !is_settings && !is_ack {
+            if !is_panel && !is_wiki_tree && !is_settings && !is_ack {
                 if let Some(view) = &sidebar_view {
                     view.render(buf, content_rect, selection, !focus_main, &sidebar_chrome);
                 }
@@ -6874,6 +7121,11 @@ where
                         cursor = cur;
                     }
                 }
+                MainView::Native(View::Wiki) => {
+                    if let Some(page) = wiki.as_mut() {
+                        page.render_doc(buf, main_rect);
+                    }
+                }
                 MainView::Native(_) => {} // drawn above
                 MainView::Review(id) => {
                     // The interface itself renders at the frame level below; this
@@ -6914,6 +7166,13 @@ where
             let cur = r.render(frame, content_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
+            }
+        }
+
+        // The Wiki's tree, into the sidebar's column.
+        if is_wiki_tree && !is_settings && !is_ack {
+            if let Some(page) = wiki.as_mut() {
+                page.render_tree(frame, content_rect, !focus_main);
             }
         }
 
@@ -7112,6 +7371,7 @@ fn view_to_row_target(view: &View) -> RowTarget {
     match view {
         View::Issues
         | View::Changelog
+        | View::Wiki
         | View::Activity
         | View::Machines
         | View::Jobs
@@ -7470,6 +7730,25 @@ fn enter_terminal_modes() -> io::Result<()> {
 /// this thread, so nothing competes with the editor for keys. An app
 /// `editor:` opens the file in the app instead (`open -a`), leaving the
 /// screen as it is.
+/// Run `$EDITOR` (else `$VISUAL`, else vi: `shelbi wiki edit`'s rule) on a
+/// Wiki document's copy and wait for it, the terminal handed over meanwhile.
+fn run_wiki_editor(term: &mut Terminal<CrosstermBackend<io::Stdout>>, file: &std::path::Path) -> Result<(), String> {
+    let argv = shelbi_app::wiki::editor_argv(
+        file,
+        std::env::var("EDITOR").ok().as_deref(),
+        std::env::var("VISUAL").ok().as_deref(),
+    );
+    restore_terminal();
+    let outcome = std::process::Command::new(&argv[0]).args(&argv[1..]).status();
+    let _ = enter_terminal_modes();
+    let _ = term.clear();
+    match outcome {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{} exited with {status}", argv[0])),
+        Err(e) => Err(format!("couldn't start the editor `{}`: {e}", argv[0])),
+    }
+}
+
 fn run_editor(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     path: &std::path::Path,
@@ -7536,6 +7815,8 @@ mod tests {
     mod new_task;
     // Shelbi's own diff in a review and a workspace (`tests/diff_view.rs`).
     mod diff_view;
+    // The Wiki: its nav row, tree, document and editor (`tests/wiki.rs`).
+    mod wiki;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {
@@ -12358,7 +12639,7 @@ mod tests {
         let mut st = settings_state();
         st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
         st.dispatch_effect(Effect::OpenSettings);
-        type_key(&mut st, '8');
+        type_key(&mut st, '9');
         settle_workflows(&mut st);
         st
     }
@@ -13146,6 +13427,154 @@ mod tests {
         })
     }
 
+    /// A config store that refuses everything and a hub that answers
+    /// nothing: the Wiki page's ports unless a test gives it its own.
+    pub(super) fn refusing_wiki_ports() -> (shelbi_app::settings::store::Store, shelbi_app::settings::wiki::Ask) {
+        use shelbi_app::settings::store::{ConfigStore, WriteFailure};
+        struct Refusing;
+        impl ConfigStore for Refusing {
+            fn write(&self, _: &shelbi_state::config_write::Plan) -> Result<(), WriteFailure> {
+                Err(WriteFailure::Failed("tests write no ~/.shelbi".into()))
+            }
+            fn workflows(&self) -> Result<WorkflowConfig, String> {
+                Err("tests read no ~/.shelbi".into())
+            }
+            fn agents(&self) -> Result<shelbi_state::agents_config::AgentsConfig, String> {
+                Err("tests read no ~/.shelbi".into())
+            }
+        }
+        let ask: shelbi_app::settings::wiki::Ask = Arc::new(|_| {
+            shelbi_app::wiki::WikiReply::failed(shelbi_app::wiki::FailureKind::Failed, "tests reach no hub")
+        });
+        (Arc::new(Refusing), ask)
+    }
+
+    /// The Wiki page over the test home's project files, and a hub that
+    /// answers from `status` (Init sets it up) and records what it's asked.
+    fn fake_wiki_ports(
+        status: Arc<std::sync::Mutex<shelbi_app::wiki::WikiStatus>>,
+        asked: Arc<std::sync::Mutex<Vec<shelbi_app::wiki::WikiRequest>>>,
+    ) -> WikiPortsFor {
+        use shelbi_app::wiki::{SyncState, WikiReply, WikiRequest};
+        Arc::new(move |project: &str| {
+            let (status, asked) = (status.clone(), asked.clone());
+            let ask: shelbi_app::settings::wiki::Ask = Arc::new(move |req: WikiRequest| {
+                asked.lock().unwrap().push(req.clone());
+                let mut s = status.lock().unwrap();
+                if matches!(req, WikiRequest::Init) {
+                    s.set_up = true;
+                    s.state = SyncState::Synced;
+                    s.root = "/home/u/.shelbi/projects/proj/wiki".into();
+                }
+                WikiReply::Status(s.clone())
+            });
+            (shelbi_app::settings::store::Disk::store(project), ask)
+        })
+    }
+
+    #[test]
+    fn the_wiki_page_sets_up_the_wiki_edits_its_block_and_syncs_now() {
+        use settings::wiki::Item;
+        use shelbi_app::wiki::{SyncOp, WikiRequest, WikiStatus};
+        use shelbi_core::{WikiSource, WikiSyncMode};
+        let _home = agents_home("wiki");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        let status = Arc::new(std::sync::Mutex::new(WikiStatus::not_set_up()));
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        st.wiki_ports = fake_wiki_ports(status.clone(), asked.clone());
+        st.dispatch_effect(Effect::OpenSettings);
+        // Its number (after Issues) opens it.
+        type_key(&mut st, '8');
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Wiki);
+        settle_agents(&mut st, "the config and the status load", |st| {
+            let f = st.settings.wiki().form();
+            f.config().is_some() && f.hub().is_some()
+        });
+        press(&mut st, KeyCode::Tab);
+        let text = capture_screen(&mut st, "settings-wiki-not-set-up");
+        for want in [
+            "📖  Wiki               8",
+            "Where this project's wiki lives",
+            "(•) Orphan branch",
+            "( ) Repo folder",
+            "Branch",
+            "docs/planning",
+            "[x] Auto-sync",
+            "Not set up. This project has no wiki yet.",
+            "[ Set up wiki ]",
+        ] {
+            assert!(text.contains(want), "missing {want:?}:\n{text}");
+        }
+
+        // → picks the folder (a draft: nothing is written before setup).
+        let cursor_to = |st: &mut ShellState, item: Item| {
+            for _ in 0..20 {
+                let p = st.settings.wiki();
+                let at = p.items().iter().position(|i| *i == item).unwrap();
+                match at.cmp(&p.cursor()) {
+                    std::cmp::Ordering::Equal => return,
+                    std::cmp::Ordering::Greater => press(st, KeyCode::Down),
+                    std::cmp::Ordering::Less => press(st, KeyCode::Up),
+                }
+            }
+            panic!("the cursor never reached {item:?}");
+        };
+        cursor_to(&mut st, Item::Source(WikiSource::Branch));
+        press(&mut st, KeyCode::Right);
+        assert_eq!(st.settings.wiki().form().source(), WikiSource::Folder);
+        assert!(shelbi_state::load_project("proj").unwrap().wiki.is_none());
+
+        // Set up writes the block and asks the hub.
+        cursor_to(&mut st, Item::Button);
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the wiki is set up", |st| st.settings.wiki().form().set_up());
+        let block = shelbi_state::load_project("proj").unwrap().wiki.unwrap();
+        assert_eq!((block.source, block.path.as_deref()), (WikiSource::Folder, Some("docs")));
+        assert!(asked.lock().unwrap().contains(&WikiRequest::Init));
+        let text = capture_screen(&mut st, "settings-wiki-set-up");
+        assert!(text.contains("● Synced") && text.contains("[ Sync now ]"), "{text}");
+
+        // The folder field: a path out of the repo is refused, a good one saves.
+        cursor_to(&mut st, Item::Location);
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.wiki().typing());
+        press(&mut st, KeyCode::End);
+        for _ in 0..4 {
+            press(&mut st, KeyCode::Backspace);
+        }
+        for c in "../out".chars() {
+            type_key(&mut st, c);
+        }
+        press(&mut st, KeyCode::Enter);
+        let text = capture_screen(&mut st, "settings-wiki-refused");
+        assert!(text.contains("inside the repo"), "{text}");
+        assert_eq!(shelbi_state::load_project("proj").unwrap().wiki.unwrap().path.as_deref(), Some("docs"));
+        press(&mut st, KeyCode::Enter);
+        press(&mut st, KeyCode::End);
+        for _ in 0..6 {
+            press(&mut st, KeyCode::Backspace);
+        }
+        for c in "handbook".chars() {
+            type_key(&mut st, c);
+        }
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the folder saves", |st| !st.settings.wiki().form().saving());
+        assert_eq!(shelbi_state::load_project("proj").unwrap().wiki.unwrap().path.as_deref(), Some("handbook"));
+
+        // Space turns Auto-sync off.
+        cursor_to(&mut st, Item::AutoSync);
+        type_key(&mut st, ' ');
+        settle_agents(&mut st, "auto-sync saves", |st| !st.settings.wiki().form().saving());
+        assert_eq!(shelbi_state::load_project("proj").unwrap().wiki.unwrap().sync, WikiSyncMode::Manual);
+
+        // Sync now asks the hub.
+        asked.lock().unwrap().clear();
+        cursor_to(&mut st, Item::Button);
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the sync lands", |st| !st.settings.wiki().form().syncing());
+        assert!(asked.lock().unwrap().contains(&WikiRequest::Sync(SyncOp::Now)));
+    }
+
     /// Move the Issues page's cursor onto `item`.
     fn cursor_to(st: &mut ShellState, item: settings::issues::Item) {
         for _ in 0..40 {
@@ -13339,7 +13768,7 @@ mod tests {
         st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
         st.tracker_service = recording_tracker(Arc::new(std::sync::Mutex::new(Vec::new())));
         st.dispatch_effect(Effect::OpenSettings);
-        type_key(&mut st, '8');
+        type_key(&mut st, '9');
         settle_agents(&mut st, "the workflows load", |st| {
             st.settings.workflows().state().is_some_and(|s| s.config().is_some())
         });
@@ -13630,8 +14059,10 @@ workspaces:
         st.pool_service = shelbi_orchestrator::pool_admin::workspace_service_with(ops);
         st.dispatch_effect(Effect::OpenSettings);
         settle_settings(&mut st);
-        type_key(&mut st, '9');
-        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workspaces, "9 opens Workspaces");
+        // The tenth page has no number key: the sidebar reaches it.
+        let open = st.settings.request(settings::Leave::Page(shelbi_app::settings::SettingsPage::Workspaces));
+        st.apply_settings_action(open);
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workspaces);
         assert!(
             wait_until(Duration::from_secs(5), || {
                 st.poll_settings();
@@ -14509,7 +14940,7 @@ workspaces:
         let counts: Vec<(&str, usize)> = p.inner().chips().iter().map(|c| (c.label, c.count)).collect();
         assert_eq!(
             counts,
-            [("All", 2), ("Issues", 1), ("Changelog Entries", 1), ("Commands", 0)],
+            [("All", 2), ("Issues", 1), ("Wiki", 0), ("Changelog Entries", 1), ("Commands", 0)],
             "the issue and the sample's Settings polish pass entry"
         );
         press(&mut st, KeyCode::Enter);
@@ -14526,7 +14957,9 @@ workspaces:
         st.show(RowTarget::Native(View::Issues));
         st.open_palette();
         search_palette(&mut st, "faster board");
-        // Under the Changelog Entries filter (Tab twice), Enter opens it.
+        // Under the Changelog Entries filter (Tab three times: Issues, Wiki,
+        // Changelog Entries), Enter opens it.
+        press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Enter);

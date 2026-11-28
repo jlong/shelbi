@@ -178,7 +178,7 @@ fn each_page_shows_its_controls(cx: &mut TestAppContext) {
     assert_eq!(s.drawn("settings-option-Meta"), crate::keys::MAC);
     assert!(!s.drawn("settings-open-keys") && !s.drawn("settings-theme-Auto"));
 
-    s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
+    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
     assert!(s.drawn("settings-page-workflows") && s.drawn("settings-workflows"));
     assert!(s.drawn("workflows-new") && s.drawn("statuses-new") && s.drawn("statuses-edit-yaml"));
     assert!(s.drawn("status-categories"));
@@ -196,14 +196,15 @@ fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext
     );
     s.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
-    // ⌃4 to ⌃9 are the project's pages in sidebar order.
+    // ⌃4 to ⌃9 are the project's pages in sidebar order (the tenth,
+    // Workspaces, has none).
     for (key, page) in [
         ("ctrl-4", SettingsPage::Properties),
         ("ctrl-5", SettingsPage::Orchestrator),
         ("ctrl-6", SettingsPage::Agents),
         ("ctrl-7", SettingsPage::Issues),
-        ("ctrl-8", SettingsPage::Workflows),
-        ("ctrl-9", SettingsPage::Workspaces),
+        ("ctrl-8", SettingsPage::Wiki),
+        ("ctrl-9", SettingsPage::Workflows),
     ] {
         s.key(&crate::keys::test_keys::row_spec(key));
         assert_eq!(s.page(), Some(page), "{key}");
@@ -262,6 +263,7 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
         SettingsPage::Orchestrator,
         SettingsPage::Agents,
         SettingsPage::Issues,
+        SettingsPage::Wiki,
         SettingsPage::Workflows,
         SettingsPage::Workspaces,
     ] {
@@ -276,7 +278,7 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     );
     s.key("enter");
     assert_eq!(s.page(), Some(SettingsPage::Workspaces));
-    for _ in 0..6 {
+    for _ in 0..7 {
         s.key("up");
     }
     s.key("enter");
@@ -1378,11 +1380,11 @@ use crate::views::workflows_state::tests::Home;
 use shelbi_state::workflow_config::WorkflowConfig;
 
 impl Settings {
-    /// Settings on Workflows (⌃8), its page loaded from `home`'s files.
+    /// Settings on Workflows (⌃9), its page loaded from `home`'s files.
     fn open_workflows(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
+        s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
         let page = s.workflows();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.settle();
@@ -1679,6 +1681,126 @@ fn restart_orchestrator_asks_the_projects_daemon_once(cx: &mut TestAppContext) {
         s.read(|_, cx| page.read(cx).form().restart_status().clone()),
         shelbi_app::settings::orchestrator::RestartStatus::Restarted
     );
+}
+
+// ---- Settings ▸ Wiki (`wiki-settings`) ---------------------------------------
+
+use crate::views::wiki_settings::WikiSettingsPage;
+
+impl Settings {
+    /// Settings on Wiki (⌃8), its page reading `home`'s files and asking
+    /// a hub that answers from `status` (Init sets it up), recording what
+    /// it's asked.
+    fn open_wiki(
+        cx: &mut TestAppContext,
+        status: std::sync::Arc<std::sync::Mutex<shelbi_app::wiki::WikiStatus>>,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<shelbi_app::wiki::WikiRequest>>>,
+    ) -> Settings {
+        use shelbi_app::wiki::{SyncState, WikiReply, WikiRequest};
+        let mut s = Settings::open(cx);
+        s.open_settings();
+        s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
+        let page = s.wiki();
+        let ask: shelbi_app::settings::wiki::Ask = std::sync::Arc::new(move |req: WikiRequest| {
+            asked.lock().unwrap().push(req.clone());
+            let mut st = status.lock().unwrap();
+            if matches!(req, WikiRequest::Init) {
+                st.set_up = true;
+                st.state = SyncState::Synced;
+                st.root = "/home/u/.shelbi/projects/alpha/wiki".into();
+            }
+            WikiReply::Status(st.clone())
+        });
+        s.update(|_, window, cx| {
+            page.update(cx, |p, cx| {
+                p.set_ports(shelbi_app::settings::store::Disk::store("alpha"), ask);
+                p.visit(window, cx);
+            })
+        });
+        s.saved();
+        s
+    }
+
+    fn wiki(&self) -> Entity<WikiSettingsPage> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).wiki(),
+            _ => panic!("Settings is open"),
+        })
+    }
+}
+
+#[gpui::test]
+fn the_wiki_page_sets_up_the_wiki_and_saves_its_block(cx: &mut TestAppContext) {
+    use shelbi_app::wiki::{SyncOp, WikiRequest, WikiStatus};
+    use shelbi_core::{WikiSource, WikiSyncMode};
+    let _home = Home::with_project("wiki-page", "alpha");
+    let status = std::sync::Arc::new(std::sync::Mutex::new(WikiStatus::not_set_up()));
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = Settings::open_wiki(cx, status.clone(), asked.clone());
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Wiki), Some(SettingsPage::Wiki)));
+    for selector in [
+        "settings-nav-wiki",
+        "settings-page-wiki",
+        "wiki-source",
+        "wiki-source-branch",
+        "wiki-source-folder",
+        "wiki-location-row",
+        "wiki-auto-sync",
+        "wiki-status",
+        "wiki-sync-button",
+    ] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    // The wireframe's order: source, location, auto-sync, status.
+    for pair in [
+        ["wiki-source-branch", "wiki-source-folder"],
+        ["wiki-source-folder", "wiki-location-row"],
+        ["wiki-location-row", "wiki-auto-sync"],
+        ["wiki-auto-sync", "wiki-status"],
+    ] {
+        assert!(s.above(pair[0], pair[1]), "{} above {}", pair[0], pair[1]);
+    }
+    let page = s.wiki();
+    let form = |s: &Settings| s.read(|_, cx| page.read(cx).form().clone());
+    assert!(!form(&s).live(), "no wiki yet");
+    assert_eq!(form(&s).button().0.label(), "Set up wiki");
+
+    // A pick before setup is a draft: nothing is written.
+    s.click("wiki-source-folder");
+    s.saved();
+    assert_eq!(form(&s).source(), WikiSource::Folder);
+    assert!(shelbi_state::load_project("alpha").unwrap().wiki.is_none());
+
+    // Set up writes the block and asks the hub.
+    s.click("wiki-sync-button");
+    s.saved();
+    let block = shelbi_state::load_project("alpha").unwrap().wiki.unwrap();
+    assert_eq!((block.source, block.path.as_deref()), (WikiSource::Folder, Some("docs")));
+    assert!(asked.lock().unwrap().contains(&WikiRequest::Init));
+    assert!(form(&s).set_up());
+    assert_eq!(form(&s).button().0.label(), "Sync now");
+    assert!(s.drawn("wiki-root"));
+
+    // The folder saves on Return; a path out of the repo is refused.
+    let input = s.read(|_, cx| page.read(cx).input());
+    s.enter_text(input.clone(), "../out");
+    assert!(s.drawn("wiki-location-error"));
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().wiki.unwrap().path.as_deref(), Some("docs"));
+    s.enter_text(input, "handbook");
+    assert!(!s.drawn("wiki-location-error"));
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().wiki.unwrap().path.as_deref(), Some("handbook"));
+    assert!(s.drawn("wiki-save-status"), "Saved to … shows");
+
+    // Auto-sync off saves at once.
+    s.click("wiki-auto-sync");
+    s.saved();
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().wiki.unwrap().sync, WikiSyncMode::Manual);
+
+    // Sync now asks the hub.
+    asked.lock().unwrap().clear();
+    s.click("wiki-sync-button");
+    s.saved();
+    assert_eq!(asked.lock().unwrap().first(), Some(&WikiRequest::Sync(SyncOp::Now)));
 }
 
 // ---- Settings ▸ Properties (`settings-properties-page`) ---------------------
@@ -3923,11 +4045,12 @@ use shelbi_app::settings::workspaces::fixtures::{write_pool, POOL};
 use shelbi_app::settings::workspaces::{probe_key, Intent, Load};
 
 impl Settings {
-    /// Settings on Workspaces (⌃9), its page loaded from the test's home.
+    /// Settings on Workspaces (its nav row: the tenth page has no chord),
+    /// its page loaded from the test's home.
     fn open_workspaces(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
+        s.click("settings-nav-workspaces");
         s.load_workspaces();
         s
     }
@@ -3991,9 +4114,11 @@ fn workspaces_sits_last_after_workflows_on_its_own_chord(cx: &mut TestAppContext
     let workflows = s.bounds("settings-nav-workflows").unwrap();
     let workspaces = s.bounds("settings-nav-workspaces").unwrap();
     assert!(label.bottom() < issues.top() && issues.bottom() < workflows.top() && workflows.bottom() < workspaces.top());
-    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
+    s.click("settings-nav-workspaces");
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workspaces), Some(SettingsPage::Workspaces)));
     assert!(s.drawn("settings-page-workspaces") && s.drawn("workspaces-heading"));
+    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
+    assert_eq!(s.page(), Some(SettingsPage::Workflows), "⌃9 is Workflows'; Workspaces has no chord");
     s.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     assert_eq!(s.page(), Some(SettingsPage::Terminal), "⌃3 stays Terminal's");
     s.click("settings-nav-workspaces");
@@ -4010,7 +4135,7 @@ fn the_workspaces_page_lists_the_pool_then_its_machines(cx: &mut TestAppContext)
     write_pool("alpha", POOL);
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
+    s.click("settings-nav-workspaces");
     assert!(s.drawn("workspaces-loading"), "loading until the read lands");
     s.load_workspaces();
     assert!(!s.drawn("workspaces-loading"));
@@ -4063,7 +4188,7 @@ fn a_remote_that_cant_be_reached_keeps_its_configuration(cx: &mut TestAppContext
     assert!(s.drawn("machine-dir-Build server") && s.drawn("machine-configure-Build server"));
     assert!(s.drawn("workspace-row-charlie"), "its workspaces stay listed");
     assert_eq!(status(&s), "Unreachable");
-    s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
+    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
     assert_eq!(s.page(), Some(SettingsPage::Workflows), "the rest of Settings carries on");
 }
 
@@ -4472,7 +4597,7 @@ fn the_keyboard_moves_through_the_form(cx: &mut TestAppContext) {
     s.key("shift-tab");
     s.key("shift-tab");
     assert!(s.form_focused(MachineField::Name));
-    s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
+    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
     assert_eq!(s.page(), Some(SettingsPage::Workspaces), "the sidebar's chords wait for the form");
     assert!(s.machine_form().is_some());
 }
@@ -5018,7 +5143,7 @@ fn the_dialog_holds_the_keyboard_until_it_closes(cx: &mut TestAppContext) {
     s.key("shift-tab");
     assert_eq!(s.dialog_focus(), Ctl::Submit);
     // The settings sidebar's chords wait.
-    s.key(&crate::keys::test_keys::row_spec("ctrl-8"));
+    s.key(&crate::keys::test_keys::row_spec("ctrl-9"));
     assert_eq!(s.page(), Some(SettingsPage::Workspaces));
     assert!(s.dialog().is_some());
     // The machine picker from the keyboard.

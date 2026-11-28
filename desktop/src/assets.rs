@@ -417,6 +417,11 @@ heroicons! {
     ARROWS_RIGHT_LEFT = "arrows-right-left";
     CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS = "chat-bubble-oval-left-ellipsis";
     RECTANGLE_STACK = "rectangle-stack";
+    /// The Wiki's nav item and Settings ▸ Wiki.
+    BOOK_OPEN = "book-open";
+    /// The Wiki sidebar's New Document and New Folder.
+    DOCUMENT_PLUS = "document-plus";
+    FOLDER_PLUS = "folder-plus";
     WRENCH_SCREWDRIVER = "wrench-screwdriver";
     VIEW_COLUMNS = "view-columns";
     /// Settings ▸ Properties (the Navigation component's State=Settings,
@@ -484,8 +489,16 @@ heroicons! {
         X_MARK_MENU = "x-mark";
         /// The terminal's Jump to bottom pill, beside its X-Small label.
         ARROW_DOWN_MENU = "arrow-down";
-        /// A menu row that opens a submenu (a tab's Move to Window).
+        /// A menu row that opens a submenu (a tab's Move to Window), and a
+        /// closed folder's disclosure in the Wiki tree.
         CHEVRON_RIGHT_MENU = "chevron-right";
+        /// An open folder's disclosure in the Wiki tree (not a dropdown's
+        /// chevron, which is `style::DROPDOWN_CHEVRON`).
+        DISCLOSURE_OPEN_MENU = "chevron-down";
+        /// The Wiki tree's folders (closed and open) and documents.
+        FOLDER_MENU = "folder";
+        FOLDER_OPEN_MENU = "folder-open";
+        DOCUMENT_TEXT_MENU = "document-text";
     }
     @large {
         FOLDER_LARGE = "folder";

@@ -191,6 +191,7 @@ mod tests {
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             releases: None,
+            wiki: None,
             git: GitConfig {
                 branch_prefix: prefix.map(str::to_string),
                 ..Default::default()
