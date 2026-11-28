@@ -394,7 +394,7 @@ impl NewTaskDialog {
             // Status's glyph sits in the Left Icon slot, ahead of the label;
             // the chevron in the Right Icon slot at the far side.
             let glyph = (menu == Menu::Status)
-                .then(|| style::left_slot(ButtonSize::Base, style::status_icon_large(m.status_category, theme)));
+                .then(|| style::left_slot(ButtonSize::Base, style::status_icon(m.status_category, theme)));
             let value = value.to_string();
             let button = base
                 .w_full()

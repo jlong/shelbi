@@ -857,7 +857,7 @@ fn value_picker(
     let c = style::button_colors(kind, theme);
     let face = |b: Stateful<Div>| {
         b.min_w_0()
-            .children(icon.map(|cat| style::left_slot(size, style::status_icon_large(cat, theme))))
+            .children(icon.map(|cat| style::left_slot(size, style::status_icon(cat, theme))))
             .child(div().min_w_0().truncate().when(pending, |d| d.opacity(0.6)).child(value))
             .child(style::dropdown_slot(size, c.icon))
     };

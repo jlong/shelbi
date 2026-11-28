@@ -1168,7 +1168,7 @@ pub(super) fn picker_button(
     let size = if small { ButtonSize::Small } else { ButtonSize::Base };
     let chevron = style::button_colors(ButtonKind::Secondary, theme).icon;
     style::button_base(id, ButtonKind::Secondary, size, false, theme)
-        .children(icon.map(|c| style::left_slot(size, style::status_icon_large(c, theme))))
+        .children(icon.map(|c| style::left_slot(size, style::status_icon(c, theme))))
         .child(div().flex_1().min_w_0().truncate().child(label.into()))
         .child(style::dropdown_slot(size, chevron))
 }
