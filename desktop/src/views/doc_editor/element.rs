@@ -70,6 +70,7 @@ impl Element for DocElement {
         let doc = e.model.doc().clone();
         let field = e.field;
         let scale = e.scale;
+        let body_line_height = e.body_line_height;
         let marked = e.model.marked();
         let theme = e.theme(cx);
         let shared: Shared = Rc::new(RefCell::new(None));
@@ -86,7 +87,7 @@ impl Element for DocElement {
                 hidden: &hidden,
                 spans: &spans,
             };
-            let l = layout::layout(&doc, field, width, marked.clone(), code, scale, &theme, window, cx);
+            let l = layout::layout(&doc, field, width, marked.clone(), code, scale, body_line_height, &theme, window, cx);
             let h = l.height;
             *out.borrow_mut() = Some(Rc::new(l));
             size(width, h)
@@ -189,7 +190,7 @@ impl Element for DocElement {
                 let line = shape(&placeholder, ty, scale, theme.muted, window);
                 let _ = line.paint(
                     o + point(r.left, r.top),
-                    px((ty.line_height() * scale).round()),
+                    r.line_height,
                     TextAlign::Left,
                     None,
                     window,

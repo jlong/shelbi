@@ -104,6 +104,10 @@ pub struct DocEditor {
     /// 1 (the task pane), or the Wiki's body size over [`Type::Base`]'s
     /// ([`Self::set_body_size`]).
     scale: f32,
+    /// Body text's line height over its size, or `None` for
+    /// [`Type::Base`]'s (scaled): the Wiki's 1.4
+    /// ([`Self::set_body_line_height`]).
+    body_line_height: Option<f32>,
     _subs: Vec<Subscription>,
     _blink: Task<()>,
 }
@@ -186,6 +190,7 @@ impl DocEditor {
             code: CodeHighlights::default(),
             code_spans: None,
             scale: 1.0,
+            body_line_height: None,
             _subs: subs,
             _blink: blink,
         }
@@ -205,6 +210,22 @@ impl DocEditor {
             self.goal_x = None;
             cx.notify();
         }
+    }
+
+    /// Set body text (paragraphs, list items, quotes) on lines `ratio` times
+    /// its size, at any body size. Headings, code and the title keep theirs.
+    pub fn set_body_line_height(&mut self, ratio: f32, cx: &mut Context<Self>) {
+        if self.body_line_height != Some(ratio) {
+            self.body_line_height = Some(ratio);
+            self.goal_x = None;
+            cx.notify();
+        }
+    }
+
+    /// What [`Self::set_body_line_height`] set.
+    #[cfg(test)]
+    pub fn body_line_height(&self) -> Option<f32> {
+        self.body_line_height
     }
 
     /// What [`Self::set_body_size`] set: the sizes over the UI's.

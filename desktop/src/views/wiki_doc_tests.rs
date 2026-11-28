@@ -11,7 +11,7 @@ use shelbi_app::wiki::{Author, WikiCommit, WikiRequest};
 use shelbi_app::wiki_doc::SAVE_AFTER;
 use shelbi_app::wiki_sub::WikiWake;
 
-use super::doc::{DocAction, DocMenu};
+use super::doc::{DocAction, DocMenu, BODY_LINE_HEIGHT};
 use crate::elements::terminal::metrics::DEFAULT_FONT_SIZE;
 use crate::elements::terminal::settings::TerminalSettings;
 use crate::theme::style::Type;
@@ -314,6 +314,9 @@ fn the_document_reads_at_the_terminal_font_size_and_follows_it(cx: &mut TestAppC
     t.open_doc();
     // The body is the terminal's size; everything else scales from it.
     assert_eq!(t.scale(), 18.0 / Type::Base.size());
+    // Its body text sits on lines 1.4 times its size.
+    let editor = t.read(|v| v.doc_editor()).expect("the editor shows");
+    assert_eq!(editor.read_with(&t.cx, |e, _| e.body_line_height()), Some(BODY_LINE_HEIGHT));
     let at_18 = t.body_height();
 
     // ⌘+ / Settings move the global: the open document follows at once.
